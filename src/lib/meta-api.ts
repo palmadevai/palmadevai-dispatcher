@@ -1,85 +1,77 @@
 /**
- * Meta WhatsApp Cloud API wrapper.
+ * Meta WhatsApp Cloud API — thin facade.
  *
- * F1.2.a (skeleton): STUB — no hace llamadas reales. Retorna mock success
- * para que el dispatcher worker pueda ser invocado en smoke tests sin
- * tocar la cuota Meta del cliente.
+ * Real implementation lives in `src/dispatch/send-whatsapp.ts`. This module
+ * keeps the historical `createMetaApiClient(logger)` interface so callers
+ * (index.ts, tests, future channels) stay imports-stable. The dispatcher
+ * worker calls `sendWhatsApp` directly for the hot path.
  *
- * F1.2.b (próximo PR): implementación real con undici dispatcher pool +
- * biz_opaque_callback_data (ADR-011 idempotency) + multi-phone picker
- * (ADR-013) + classifyError() (ADR-009 DLQ).
- *
- * Ver spec.md §5.3 (dispatch worker pseudocode) + decisions.md ADR-011.
+ * `ping()` is a healthcheck stub. Real Meta connectivity check would GET
+ * /{phone_number_id} but that requires picking a phone_number_id first; we
+ * don't want /health to depend on per-client config. Returns true unconditionally;
+ * the dispatcher worker discovers Meta issues on the actual send path and
+ * surfaces them via classifyMetaError + /admin/observability metrics.
  */
 import { env } from '../env.js';
 import type { Logger } from './logger.js';
+import {
+  sendWhatsApp as sendWhatsAppReal,
+  type SendWhatsAppInput,
+  type SendWhatsAppResult,
+} from '../dispatch/send-whatsapp.js';
 
-/**
- * Payload mínimo para el send (lo que el dispatcher pasa).
- * Extender en F1.2.b con: template_name, language, components[].variables,
- * media_id, etc.
- */
 export interface SendMessageInput {
-  to_phone_e164: string;     // ej "+5491150000000"
-  from_phone_number_id: string; // Meta phone_number_id (sticky o default)
-  client_ref: string;        // delivery.client_ref, va en biz_opaque_callback_data
-  template_name?: string;
-  language?: string;
-  // body real va acá — placeholder hasta F1.2.b
-  payload?: Record<string, unknown>;
+  to_phone_e164: string;
+  from_phone_number_id: string;
+  client_ref: string;
+  template_name: string;
+  language: string;
+  components: unknown[];
 }
 
-/**
- * Respuesta del send. F1.2.b real shape:
- * { ok: true, message_id: 'wamid.XXX', accepted_at: ISO }
- * O bien: { ok: false, error_code: number, error_subcode?, error_message }
- */
 export interface SendMessageResult {
   ok: boolean;
   message_id?: string;
-  error_code?: number;
-  error_subcode?: number;
+  error_code?: string;
   error_message?: string;
   http_status?: number;
 }
 
 export interface MetaApiClient {
   sendMessage(input: SendMessageInput): Promise<SendMessageResult>;
-  /** Healthcheck stub — F1.2.b chequea Meta connectivity con GET /v17.0/me */
   ping(): Promise<boolean>;
 }
 
-export function createMetaApiClient(logger: Logger): MetaApiClient {
-  const apiVersion = env.META_GRAPH_API_VERSION;
-  const baseUrl = `https://graph.facebook.com/${apiVersion}`;
+function adapt(result: SendWhatsAppResult): SendMessageResult {
+  return {
+    ok: result.ok,
+    message_id: result.message_id,
+    error_code: result.error_code,
+    error_message: result.error_message,
+    http_status: result.http_status,
+  };
+}
 
-  // TODO F1.2.b: undici pool con keep-alive, retries por categoría de error,
-  // rate-limit aware via Meta retry-after headers.
-  void baseUrl;
+export function createMetaApiClient(logger: Logger): MetaApiClient {
+  logger.debug(
+    { api_version: env.META_GRAPH_API_VERSION },
+    'meta-api facade initialized',
+  );
 
   return {
     async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-      // STUB: log + retorna mock success. NO toca la API de Meta.
-      logger.warn(
-        {
-          stub: true,
-          to: input.to_phone_e164,
-          from_phone: input.from_phone_number_id,
-          client_ref: input.client_ref,
-        },
-        'STUB sendMessage — no real Meta API call (F1.2.b will implement)',
-      );
-      // Mock message_id usa el prefijo "stub_" para que sea trivial filtrarlos
-      // de bot.message_events en post-mortems.
-      return {
-        ok: true,
-        message_id: `stub_${input.client_ref}_${Date.now()}`,
-        http_status: 200,
+      const payload: SendWhatsAppInput = {
+        phone_number_id: input.from_phone_number_id,
+        to: input.to_phone_e164,
+        template_name: input.template_name,
+        template_lang: input.language,
+        components: input.components,
+        biz_opaque_callback_data: input.client_ref,
       };
+      const result = await sendWhatsAppReal(payload);
+      return adapt(result);
     },
-
     async ping(): Promise<boolean> {
-      // STUB: en F1.2.b haremos GET /v17.0/{phone_number_id} con timeout 2s.
       return true;
     },
   };
