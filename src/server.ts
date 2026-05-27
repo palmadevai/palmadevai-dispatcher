@@ -88,7 +88,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
       // Por ahora: hardcoded 3 (dispatcher + recovery + metrics-flush).
       bullmq_workers_count: 3,
       uptime_ms: Date.now() - startTimestamp,
-      stub_mode: true,
+      stub_mode: env.STUB_MODE,
     };
     return reply.code(healthy ? 200 : 503).send(body);
   });

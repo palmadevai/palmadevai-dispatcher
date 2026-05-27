@@ -59,7 +59,21 @@ const schema = z.object({
   // HOSTNAME = consumer_name dentro del Consumer Group (BullMQ + Redis
   // Streams). Cada replica del worker tiene PEL separada por consumer_name.
   // En docker-compose, el HOSTNAME viene del container; fallback "dispatcher-0".
-  HOSTNAME: z.string().default('dispatcher-0'),
+  // Zod min(1) impide cadena vacía — docker-compose con `HOSTNAME: ${HOSTNAME:-}`
+  // pasaría empty string, que rompía silenciosamente XREADGROUP (rutea a
+  // consumer sin nombre, no entrega). Si llega empty/missing, default "dispatcher-0".
+  HOSTNAME: z
+    .string()
+    .transform((v) => (v === '' ? 'dispatcher-0' : v))
+    .default('dispatcher-0'),
+
+  // STUB_MODE: si true, los workers loguean intención pero NO ejecutan side
+  // effects reales (no Meta POST, no DLQ insert, no metrics flush). Default
+  // false (= F1.2.b real). Útil para development local sin tocar Meta API.
+  STUB_MODE: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 const parsed = schema.safeParse(process.env);

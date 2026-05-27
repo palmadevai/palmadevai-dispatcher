@@ -31,35 +31,44 @@ después portás el cambio acá. Drift entre repos = bug.
   mientras `main` esté adelante del último tag.
 - Convenciones de tipos: `feat`, `fix`, `hotfix`, `docs`, `chore`, `refactor`.
 
-## Estado actual: F1.2.a (skeleton)
+## Estado actual: F1.2.b (real logic, v0.2.0+)
 
-Boot scaffold. Los 3 workers (dispatcher, recovery, metrics-flush) están en
-modo STUB:
+Worker implementation completa. Los 3 workers ejecutan side effects reales:
 
-- **dispatcher**: BullMQ Worker arranca, recibe jobs del queue 'campaigns',
-  loguea + ACK + return `{ skipped: 'stub' }`. NO procesa delivery.
-- **recovery**: setInterval 5min loguea output de `XPENDING`. NO hace XCLAIM.
-- **metrics-flush**: setInterval 30s loguea snapshot del MetricsCollector.
-  NO INSERT a `bot.dispatcher_metrics`.
+- **dispatcher**: XREADGROUP loop → SELECT FOR UPDATE SKIP LOCKED →
+  resolveDeliveryContext → pickPhone (ADR-013) → sendMessage con
+  biz_opaque_callback_data (ADR-011) → classifyError + retry ZSET o DLQ
+  (ADR-009) → UPDATE deliveries → XACK.
+- **recovery**: cron 5min — XPENDING + XCLAIM idle>5min + safety net
+  Postgres (zombies status=pending queued_at<now-5min) + dead letter 1h.
+- **metrics-flush**: cron 30s — INSERT `bot.dispatcher_metrics` con
+  histograms p50/p95/p99 via simple-statistics.
 
-Lo que SÍ funciona:
-- Zod env validation (fail-fast en boot).
-- Redis + Postgres conexión + healthcheck.
-- BullMQ Worker registrado al queue (rate limiter activo).
-- Redis Stream + Consumer Group MKSTREAM idempotente.
-- Fastify `/health` (pinga Redis + Postgres con timeout 2s).
-- Bull Board en `/admin/queues` (con auth opcional via header).
-- Graceful shutdown SIGTERM/SIGINT.
+Plus: Fastify `/health` (pinga Redis + Postgres timeout 2s + reporta
+STUB_MODE real), Bull Board `/admin/queues` (auth opcional X-Cockpit-Auth),
+HTTP listener :8080 (Docker healthcheck consume), graceful shutdown
+SIGTERM/SIGINT con flush in-flight, retry ZSET promoter tick 5s.
 
-## F1.2.b (próximo PR, NO acá)
+### STUB_MODE env (development only)
 
-Implementación real del worker:
-1. dispatcher: SELECT FOR UPDATE SKIP LOCKED, pickPhone (ADR-013),
-   sendMessage con biz_opaque_callback_data (ADR-011), classifyError + DLQ
-   (ADR-009), UPDATE deliveries, Redis PUBLISH para SSE (ADR-005).
-2. recovery: XCLAIM real + re-enqueue + Postgres safety net.
-3. metrics-flush: INSERT `bot.dispatcher_metrics` (migration 051).
-4. meta-api.ts: undici pool + retries clasificados.
+Setear `STUB_MODE=true` en `.env` para que workers loguean intención sin
+ejecutar side effects (no Meta POST, no DLQ insert, no metrics flush).
+Default `false`. El health endpoint reporta `stub_mode: env.STUB_MODE`.
+
+### Smoke A2 verificado 2026-05-27 (lab palmadevai)
+
+8 etapas end-to-end: XREADGROUP consume → SELECT FOR UPDATE SKIP LOCKED
+con range ±1ms en queued_at → resolveDeliveryContext (campaign+contact+
+template) → pickPhoneForContact sticky → POST Meta Graph API → classifyError
+→ retry schedule ZSET con backoff exponencial → XACK. WA real bloqueado
+externamente por aprobación Meta de template; arquitectura validada.
+
+4 bugs encontrados durante smoke A2 + fixeados en v0.2.1:
+- `server.ts` stub_mode ahora derive de `env.STUB_MODE` (no hardcoded).
+- `env.ts` HOSTNAME refuerza default vs empty string (compose drift).
+- `dispatcher.ts` + `recovery.ts` queued_at usan BETWEEN ±1ms en SELECTs +
+  re-pinean al valor exacto del DB para UPDATEs subsiguientes.
+- Compose `93-dispatcher` HOSTNAME default ahora `dispatcher-0` (no empty).
 
 ## Convenciones específicas
 
