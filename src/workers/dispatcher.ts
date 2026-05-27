@@ -200,7 +200,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
   async function processJob(job: StreamJob): Promise<void> {
     metricsCollector.recordDequeue();
-    const { streamId, deliveryId, queuedAt } = job;
+    const { streamId, deliveryId } = job;
+    // queuedAt: el del stream tiene precisión de millis (JS Date roundtrip);
+    // se re-pinea al valor exacto del DB después del SELECT FOR UPDATE para
+    // que los UPDATEs siguientes hagan exact match contra la row con µs reales.
+    let queuedAt: Date = job.queuedAt;
 
     let retryError: Error | null = null;
     // Per-task carry (NOT closure-level — each processJob has its own). Set
@@ -212,12 +216,21 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     try {
       await sql.begin(async (tx: TransactionSql) => {
         // 1. SELECT FOR UPDATE SKIP LOCKED (ADR-015).
+        // queued_at se usa para partition pruning (timestamptz partition key).
+        // Range ±1ms cubre microsecond-precision rows: postgres.js serializa JS
+        // Date a milliseconds y pierde los µs, lo que rompía exact match si el
+        // enqueuer usó `now()` (default Postgres → 6 digits) — bug reportado en
+        // smoke A2 2026-05-27, ver techdebt-dispatcher-smoke-bugs-2026-05-27.
         const locked = await tx<
-          Array<{ id: number; status: string; retry_count: number; campaign_id: string }>
+          Array<{ id: number; status: string; retry_count: number; campaign_id: string; queued_at: Date }>
         >`
-          SELECT id::bigint AS id, status, retry_count, campaign_id::text AS campaign_id
+          SELECT id::bigint AS id, status, retry_count,
+                 campaign_id::text AS campaign_id,
+                 queued_at
           FROM bot.campaign_deliveries
-          WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+          WHERE id = ${deliveryId}
+            AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
+                              AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           FOR UPDATE SKIP LOCKED
         `;
         if (locked.length === 0) {
@@ -226,6 +239,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         }
         const row = locked[0];
         if (!row) return;
+        // Re-pin queuedAt al valor exacto del DB para todos los UPDATEs
+        // subsiguientes de esta TX. JS Date pierde precision µs → si seguimos
+        // usando el queuedAt del stream los WHERE id+queued_at fallan
+        // silenciosamente (UPDATE 0). Ver techdebt-dispatcher-smoke-bugs-2026-05-27.
+        queuedAt = row.queued_at;
         if (row.status !== 'pending') {
           logger.debug(
             { deliveryId, status: row.status },

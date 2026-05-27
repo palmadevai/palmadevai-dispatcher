@@ -176,22 +176,26 @@ async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promis
           const deliveryId = Number(deliveryIdRaw);
           const queuedAt = queuedAtRaw ? new Date(queuedAtRaw) : new Date();
 
-          const updated = await sql<Array<{ campaign_id: string }>>`
+          // Range ±1ms para tolerar precision drift JS Date ↔ µs Postgres
+          // (ver techdebt-dispatcher-smoke-bugs-2026-05-27). RETURNING queued_at
+          // captura el valor exacto del DB para moveToDLQ.
+          const updated = await sql<Array<{ campaign_id: string; queued_at: Date }>>`
             UPDATE bot.campaign_deliveries SET
               status = 'failed',
               failed_at = COALESCE(failed_at, now()),
               failure_reason = COALESCE(failure_reason, 'pel_timeout_1h')
             WHERE id = ${deliveryId}
-              AND queued_at = ${queuedAt}
+              AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
+                                AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
               AND status = 'pending'
-            RETURNING campaign_id::text AS campaign_id
+            RETURNING campaign_id::text AS campaign_id, queued_at
           `;
 
           const updatedRow = updated[0];
           if (updatedRow) {
             await moveToDLQ(sql, logger, {
               deliveryId,
-              queuedAt,
+              queuedAt: updatedRow.queued_at,
               campaignId: updatedRow.campaign_id,
               errorCategory: 'worker_crash_loop',
               errorMessage: 'PEL idle > 1h — worker presumed dead',
