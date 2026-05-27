@@ -1,0 +1,35 @@
+{
+  "name": "@palmadevai/dispatcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outbound dispatch worker (BullMQ + Redis Streams + Meta WA Cloud API) for the campaigns feature of palmadevai-apps. Stack 93-dispatcher.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --watch --import tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bull-board/api": "^6.0.0",
+    "@bull-board/fastify": "^6.0.0",
+    "bullmq": "^5.21.0",
+    "fastify": "^5.0.0",
+    "ioredis": "^5.4.0",
+    "pino": "^9.5.0",
+    "postgres": "^3.4.5",
+    "simple-statistics": "^7.8.3",
+    "undici": "^6.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "pino-pretty": "^11.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

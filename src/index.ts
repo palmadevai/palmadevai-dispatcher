@@ -1,0 +1,130 @@
+/**
+ * Entry point — boot order:
+ *   1. env validated (zod fail-fast).
+ *   2. metricsCollector instantiated.
+ *   3. Redis Stream + Consumer Group ensured (XGROUP CREATE MKSTREAM, ignore
+ *      BUSYGROUP).
+ *   4. 3 workers started (dispatcher, recovery, metrics-flush — all STUB
+ *      mode in F1.2.a).
+ *   5. Fastify server starts (/health + /admin/queues).
+ *   6. SIGTERM/SIGINT handlers for graceful shutdown.
+ */
+import { env } from './env.js';
+import { logger } from './lib/logger.js';
+import { bullmqConnection, rawRedis } from './lib/redis.js';
+import { sql } from './lib/postgres.js';
+import { createMetaApiClient } from './lib/meta-api.js';
+import { MetricsCollector } from './observability/metrics-collector.js';
+import { startDispatcher } from './workers/dispatcher.js';
+import { startRecovery } from './workers/recovery.js';
+import { startMetricsFlush } from './workers/metrics-flush.js';
+import { startServer } from './server.js';
+
+async function ensureStreamAndGroup(): Promise<void> {
+  try {
+    await rawRedis.call(
+      'XGROUP',
+      'CREATE',
+      env.CAMPAIGNS_STREAM,
+      env.CAMPAIGNS_GROUP,
+      '$',
+      'MKSTREAM',
+    );
+    logger.info(
+      { stream: env.CAMPAIGNS_STREAM, group: env.CAMPAIGNS_GROUP },
+      'XGROUP CREATE ok (stream + group created)',
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('BUSYGROUP')) {
+      logger.info(
+        { stream: env.CAMPAIGNS_STREAM, group: env.CAMPAIGNS_GROUP },
+        'XGROUP already exists (idempotent)',
+      );
+    } else {
+      throw err;
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  logger.info(
+    {
+      node_env: env.NODE_ENV,
+      client_slug: env.CLIENT_SLUG,
+      domain: env.DOMAIN,
+      hostname_consumer: env.HOSTNAME,
+      concurrency: env.DISPATCHER_CONCURRENCY,
+      stub_mode: true,
+    },
+    'palmadevai-dispatcher boot start',
+  );
+
+  const metricsCollector = new MetricsCollector();
+  const metaApi = createMetaApiClient(logger);
+
+  // 1. Asegurar stream + consumer group antes de levantar el worker BullMQ.
+  await ensureStreamAndGroup();
+
+  // 2. Workers (stubs en F1.2.a).
+  const dispatcherWorker = startDispatcher({
+    connection: bullmqConnection,
+    sql,
+    logger,
+    metaApi,
+    metricsCollector,
+  });
+
+  const recoveryHandle = startRecovery({
+    rawRedis,
+    sql,
+    logger,
+  });
+
+  const metricsFlushHandle = startMetricsFlush({
+    rawRedis,
+    sql,
+    logger,
+    metricsCollector,
+  });
+
+  // 3. HTTP server (healthcheck + Bull Board).
+  const server = await startServer({
+    bullmqConnection,
+    rawRedis,
+    sql,
+    logger,
+  });
+
+  logger.info('dispatcher fully booted (skeleton/STUB mode — see F1.2.b for real logic)');
+
+  // 4. Graceful shutdown.
+  const shutdown = async (signal: string): Promise<void> => {
+    logger.info({ signal }, 'shutdown signal received — closing workers + connections');
+    try {
+      clearInterval(recoveryHandle);
+      clearInterval(metricsFlushHandle);
+      await dispatcherWorker.close();
+      await server.close();
+      await rawRedis.quit();
+      await sql.end({ timeout: 5 });
+      logger.info('shutdown complete');
+      process.exit(0);
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, 'error during shutdown');
+      process.exit(1);
+    }
+  };
+
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+}
+
+main().catch((err) => {
+  logger.fatal({ err: (err as Error).message, stack: (err as Error).stack }, 'fatal boot error');
+  process.exit(1);
+});

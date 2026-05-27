@@ -1,0 +1,3 @@
+# Force LF line endings across all files; prevents CRLF drift on Windows
+# clones (mismo patrón que palmadevai-{infra,apps,web,cockpit,chat-site}).
+* text=auto eol=lf
