@@ -76,7 +76,8 @@ export async function moveToDLQ(
         error_message = COALESCE(error_message, ${entry.errorMessage ?? null}),
         failure_reason = COALESCE(failure_reason, ${entry.errorCategory})
     WHERE id = ${entry.deliveryId}
-      AND queued_at = ${entry.queuedAt}
+      AND queued_at BETWEEN ${entry.queuedAt}::timestamptz - INTERVAL '1 millisecond'
+                        AND ${entry.queuedAt}::timestamptz + INTERVAL '1 millisecond'
       AND status IN ('pending', 'suppressed', 'accepted', 'sent')
   `;
 

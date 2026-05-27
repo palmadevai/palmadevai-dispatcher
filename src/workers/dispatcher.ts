@@ -200,11 +200,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
   async function processJob(job: StreamJob): Promise<void> {
     metricsCollector.recordDequeue();
-    const { streamId, deliveryId } = job;
-    // queuedAt: el del stream tiene precisión de millis (JS Date roundtrip);
-    // se re-pinea al valor exacto del DB después del SELECT FOR UPDATE para
-    // que los UPDATEs siguientes hagan exact match contra la row con µs reales.
-    let queuedAt: Date = job.queuedAt;
+    const { streamId, deliveryId, queuedAt } = job;
+    // queuedAt llega con precisión de ms (JS Date roundtrip). Todos los
+    // WHERE id+queued_at usan BETWEEN ±1ms para tolerar el drift contra rows
+    // con µs reales (postgres `now()` default). Ver
+    // techdebt-dispatcher-smoke-bugs-2026-05-27.
 
     let retryError: Error | null = null;
     // Per-task carry (NOT closure-level — each processJob has its own). Set
@@ -222,11 +222,9 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // enqueuer usó `now()` (default Postgres → 6 digits) — bug reportado en
         // smoke A2 2026-05-27, ver techdebt-dispatcher-smoke-bugs-2026-05-27.
         const locked = await tx<
-          Array<{ id: number; status: string; retry_count: number; campaign_id: string; queued_at: Date }>
+          Array<{ id: number; status: string; retry_count: number; campaign_id: string }>
         >`
-          SELECT id::bigint AS id, status, retry_count,
-                 campaign_id::text AS campaign_id,
-                 queued_at
+          SELECT id::bigint AS id, status, retry_count, campaign_id::text AS campaign_id
           FROM bot.campaign_deliveries
           WHERE id = ${deliveryId}
             AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
@@ -239,11 +237,6 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         }
         const row = locked[0];
         if (!row) return;
-        // Re-pin queuedAt al valor exacto del DB para todos los UPDATEs
-        // subsiguientes de esta TX. JS Date pierde precision µs → si seguimos
-        // usando el queuedAt del stream los WHERE id+queued_at fallan
-        // silenciosamente (UPDATE 0). Ver techdebt-dispatcher-smoke-bugs-2026-05-27.
-        queuedAt = row.queued_at;
         if (row.status !== 'pending') {
           logger.debug(
             { deliveryId, status: row.status },
@@ -265,7 +258,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               error_code = 'no_phone',
               error_message = 'audience contact has no phone for whatsapp channel',
               failure_reason = 'phone_invalid'
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           // ack-only path (handled at end);
           return;
@@ -276,7 +269,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             UPDATE bot.campaign_deliveries SET
               status = 'suppressed', suppressed_at = now(),
               failure_reason = ${'campaign_' + ctx.campaign.status}
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           // ack-only path (handled at end);
           return;
@@ -286,7 +279,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             UPDATE bot.campaign_deliveries SET
               status = 'suppressed', suppressed_at = now(),
               failure_reason = 'opt_out'
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           // ack-only path (handled at end);
           return;
@@ -344,7 +337,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               accepted_at = now(),
               meta_message_id = ${result.message_id},
               wa_phone_number_id = ${phone.id}
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           // 7. Bump sent_today.
           await tx`
@@ -388,7 +381,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               error_code = '131049',
               error_message = 'Meta frequency cap (cross-brand 2/24h)',
               failure_reason = 'meta_freq_cap_131049'
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           metricsCollector.recordError('freq_cap_131049');
           // ack-only path (handled at end);
@@ -413,7 +406,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               error_code = ${result.error_code ?? null},
               error_message = ${result.error_message ?? null},
               failure_reason = ${classification.category}
-            WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
           if (classification.shouldPauseCampaign && classification.pauseReason) {
             await tx`
@@ -442,7 +435,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // Retriable — bump retry_count, throw to trigger backoff scheduling.
         await tx`
           UPDATE bot.campaign_deliveries SET retry_count = retry_count + 1
-          WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+          WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
         `;
         const err = new Error(
           `Meta send failed: ${result.error_code ?? '?'} ${result.error_message ?? ''}`,
@@ -565,7 +558,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           failed_at = COALESCE(failed_at, now()),
           error_message = COALESCE(error_message, ${err.message}),
           failure_reason = COALESCE(failure_reason, ${category})
-        WHERE id = ${deliveryId} AND queued_at = ${queuedAt}
+        WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           AND status NOT IN ('delivered', 'read', 'replied')
         RETURNING campaign_id::text AS campaign_id
       `;
