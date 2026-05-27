@@ -140,7 +140,8 @@ export async function resolveDeliveryContext(
     JOIN bot.campaigns cm ON cm.id = d.campaign_id
     JOIN bot.message_templates t ON t.id = cm.template_id
     WHERE d.id = ${deliveryId}
-      AND d.queued_at = ${queuedAt}
+      AND d.queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
+                          AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
     LIMIT 1
   `;
 
