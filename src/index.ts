@@ -55,23 +55,25 @@ async function main(): Promise<void> {
       domain: env.DOMAIN,
       hostname_consumer: env.HOSTNAME,
       concurrency: env.DISPATCHER_CONCURRENCY,
-      stub_mode: true,
+      stub_mode: false,
     },
-    'palmadevai-dispatcher boot start',
+    'palmadevai-dispatcher boot start (F1.2.b real logic)',
   );
 
   const metricsCollector = new MetricsCollector();
+  // metaApi facade is preserved for non-hot-path callers and health/ping uses.
+  // The dispatcher hot path uses sendWhatsApp() directly.
   const metaApi = createMetaApiClient(logger);
+  void metaApi;
 
-  // 1. Asegurar stream + consumer group antes de levantar el worker BullMQ.
+  // 1. Asegurar stream + consumer group antes de levantar la lectura.
   await ensureStreamAndGroup();
 
-  // 2. Workers (stubs en F1.2.a).
-  const dispatcherWorker = startDispatcher({
-    connection: bullmqConnection,
+  // 2. Workers (real impl — F1.2.b).
+  const dispatcherHandle = startDispatcher({
+    rawRedis,
     sql,
     logger,
-    metaApi,
     metricsCollector,
   });
 
@@ -96,7 +98,12 @@ async function main(): Promise<void> {
     logger,
   });
 
-  logger.info('dispatcher fully booted (skeleton/STUB mode — see F1.2.b for real logic)');
+  // bullmqConnection is still passed to the HTTP server because Bull Board
+  // mounts a (mostly idle) BullMQ Queue handle for the operator UI — see
+  // src/workers/README.md "Bull Board impact".
+  void bullmqConnection;
+
+  logger.info('dispatcher fully booted (real logic — XREADGROUP loop + DLQ + metrics)');
 
   // 4. Graceful shutdown.
   const shutdown = async (signal: string): Promise<void> => {
@@ -104,7 +111,7 @@ async function main(): Promise<void> {
     try {
       clearInterval(recoveryHandle);
       clearInterval(metricsFlushHandle);
-      await dispatcherWorker.close();
+      await dispatcherHandle.stop();
       await server.close();
       await rawRedis.quit();
       await sql.end({ timeout: 5 });
