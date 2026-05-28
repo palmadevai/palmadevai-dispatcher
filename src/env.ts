@@ -74,6 +74,19 @@ const schema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+
+  // ── AI body personalization (Fase 4 item 3) ──────────────────────────────
+  // OpenAI key para sustituir {{ai_generated}} bindings. Si falta + alguna
+  // campaign tiene ai_personalization_enabled=true → el dispatcher loguea
+  // warning y deja el binding como literal '{{ai_generated}}'. Sin esta key,
+  // las campañas AI no rompen el motor — solo no personalizan.
+  // Convención per-node Fase 2e:
+  // OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI
+  OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI: z.string().optional(),
+  AI_PERSONALIZE_DEFAULT_MODEL: z.string().default('gpt-5.4-mini'),
+  AI_PERSONALIZE_DEFAULT_MAX_TOKENS: z.coerce.number().int().min(50).max(2000).default(200),
+  AI_PERSONALIZE_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.7),
+  AI_PERSONALIZE_TIMEOUT_MS: z.coerce.number().int().min(1000).default(15000),
 });
 
 const parsed = schema.safeParse(process.env);

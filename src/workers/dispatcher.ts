@@ -36,6 +36,8 @@ import { pickPhoneForContact } from '../dispatch/pick-phone.js';
 import { sendWhatsApp, type SendWhatsAppResult } from '../dispatch/send-whatsapp.js';
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
+import { resolveAiBindings } from '../lib/ai-personalize.js';
+import { sql as pgPool } from '../lib/postgres.js';
 
 export interface DispatcherDeps {
   rawRedis: Redis;
@@ -308,12 +310,23 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           throw new Error('NoAvailablePhonesError');
         }
 
+        // 3b. Resolve AI bindings (Fase 4 item 3). Sustituye {{ai_generated}}
+        // por LLM-generated body cached per (campaign, contact, var_key,
+        // prompt_hash). Si AI disabled o key falta → no-op.
+        const aiResolvedBindings = await resolveAiBindings(
+          pgPool,
+          ctx.campaign.template_variable_bindings,
+          ctx.campaign,
+          ctx.contact,
+          ctx.template,
+        );
+
         // 4. Resolve template components.
         const components = resolveTemplateComponents(
           ctx.template,
           ctx.contact,
           ctx.delivery.template_variables,
-          ctx.campaign.template_variable_bindings,
+          aiResolvedBindings,
         );
 
         // 5. POST Meta. Apply rate-limit token before the network call.
