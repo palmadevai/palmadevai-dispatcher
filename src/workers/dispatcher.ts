@@ -351,7 +351,24 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           });
         } catch (sendErr) {
           // Network or 5xx. Re-throw to trigger retry logic.
+          // Log el error completo ANTES de tirar para que el retry loop tenga
+          // el context — el outer catch solo guarda en retryError y el "retry
+          // scheduled" log no incluye el detalle. Sin esto, fallas 5xx/network
+          // se ven como retry loop silencioso. Side bug F4i3 smoke 2026-05-28.
+          const e = sendErr as Error & { http_status?: number; error_code?: string };
           metricsCollector.recordError('network_or_5xx');
+          logger.error(
+            {
+              deliveryId,
+              campaign_id: ctx.delivery.campaign_id,
+              http_status: e.http_status,
+              error_code: e.error_code,
+              err: e.message,
+              to_last4: ctx.contact.phone?.slice(-4),
+              phone_number_id: phone.phone_number_id,
+            },
+            'sendWhatsApp threw — propagating to retry path',
+          );
           throw sendErr;
         }
         metricsCollector.recordSend(Date.now() - startMs);
@@ -477,6 +494,13 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
       });
     } catch (err) {
       retryError = err as Error;
+      // Log al setear retryError. El "retry scheduled" downstream solo loguea
+      // deliveryId + attemptIndex + delay_ms — el operador no podía ver QUÉ
+      // error disparó el retry. Side bug F4i3 smoke 2026-05-28.
+      logger.warn(
+        { deliveryId, err: retryError.message },
+        'processJob TX rolled back with thrown error — going to retry path',
+      );
     }
 
     // Post-TX side-effects.
@@ -513,7 +537,10 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         const eta = Date.now() + delay;
         try {
           await rawRedis.zadd(RETRY_ZSET_KEY, String(eta), JSON.stringify({ deliveryId, queuedAt: queuedAt.toISOString() }));
-          logger.info({ deliveryId, attemptIndex, delay_ms: delay }, 'retry scheduled');
+          logger.info(
+            { deliveryId, attemptIndex, delay_ms: delay, reason: carry.errorMessage },
+            'retry scheduled',
+          );
         } catch (zErr) {
           logger.error({ err: (zErr as Error).message, deliveryId }, 'retry ZADD failed — DLQ-ing instead');
           await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'meta_5xx_exhausted');
@@ -541,7 +568,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               JSON.stringify({ deliveryId, queuedAt: queuedAt.toISOString() }),
             );
             logger.info(
-              { deliveryId, attemptIndex, delay_ms: delay },
+              { deliveryId, attemptIndex, delay_ms: delay, reason: retryError.message },
               'retry scheduled',
             );
           } catch (zErr) {
