@@ -51,7 +51,18 @@ export interface DeliveryContext {
     template_variable_bindings: Record<string, unknown>;
     paused_at: Date | null;
     pause_reason: string | null;
+    // Fase 4 item 3 — AI body personalization
+    ai_personalization_enabled: boolean;
+    ai_personalization_config: AiPersonalizationConfig | null;
   };
+}
+
+export interface AiPersonalizationConfig {
+  prompt_template: string;
+  model?: string;
+  temperature?: number;
+  max_tokens?: number;
+  context_fields?: string[];
 }
 
 interface JoinedRow {
@@ -88,6 +99,8 @@ interface JoinedRow {
   cm_pause_reason: string | null;
   cm_variant_a_template_id: string | null;
   cm_variant_b_template_id: string | null;
+  cm_ai_enabled: boolean;
+  cm_ai_config: AiPersonalizationConfig | null;
 }
 
 export async function resolveDeliveryContext(
@@ -134,7 +147,10 @@ export async function resolveDeliveryContext(
       cm.paused_at                       AS cm_paused_at,
       cm.pause_reason                    AS cm_pause_reason,
       cm.variant_a_template_id::text     AS cm_variant_a_template_id,
-      cm.variant_b_template_id::text     AS cm_variant_b_template_id
+      cm.variant_b_template_id::text     AS cm_variant_b_template_id,
+      COALESCE(cm.ai_personalization_enabled, false)
+                                         AS cm_ai_enabled,
+      cm.ai_personalization_config       AS cm_ai_config
     FROM bot.campaign_deliveries d
     JOIN bot.audience_contacts ac ON ac.id = d.audience_contact_id
     JOIN bot.campaigns cm ON cm.id = d.campaign_id
@@ -228,6 +244,8 @@ export async function resolveDeliveryContext(
       template_variable_bindings: r.cm_template_variable_bindings,
       paused_at: r.cm_paused_at,
       pause_reason: r.cm_pause_reason,
+      ai_personalization_enabled: r.cm_ai_enabled,
+      ai_personalization_config: r.cm_ai_config,
     },
   };
 }
