@@ -22,7 +22,7 @@
  * Meta gave us a 4xx response body). 5xx throws inside sendWhatsApp; those
  * land here only via the retry layer after exhaustion.
  */
-import type { SendWhatsAppResult } from '../dispatch/send-whatsapp.js';
+import type { ProviderSendResult } from '../providers/types.js';
 
 export type ErrorCategory =
   | 'meta_template_rejected'
@@ -62,7 +62,7 @@ function isPayloadInvalidCode(code: string): boolean {
 }
 
 export function classifyMetaError(
-  result: SendWhatsAppResult,
+  result: ProviderSendResult,
   attemptsMade: number,
   maxAttempts: number,
 ): ClassificationOutcome {

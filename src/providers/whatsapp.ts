@@ -1,5 +1,5 @@
 /**
- * Real Meta WhatsApp Cloud API send.
+ * WhatsApp provider — Meta Cloud API `/messages` adapter.
  *
  * POST https://graph.facebook.com/{VERSION}/{phone_number_id}/messages
  *
@@ -25,26 +25,15 @@
 import { request } from 'undici';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import type { ProviderSendResult } from './types.js';
 
-export interface SendWhatsAppInput {
+export interface WhatsAppSendInput {
   phone_number_id: string;
   to: string;
   template_name: string;
   template_lang: string;
   components: unknown[];
   biz_opaque_callback_data: string;
-}
-
-export interface SendWhatsAppResult {
-  ok: boolean;
-  message_id?: string;
-  error_code?: string;
-  error_message?: string;
-  error_subcode?: string;
-  error_type?: string;
-  http_status?: number;
-  raw_response?: unknown;
-  raw_request?: unknown;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -65,7 +54,7 @@ interface MetaErrorResponse {
   };
 }
 
-export async function sendWhatsApp(input: SendWhatsAppInput): Promise<SendWhatsAppResult> {
+export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSendResult> {
   const url =
     `https://graph.facebook.com/${env.META_GRAPH_API_VERSION}/` +
     `${encodeURIComponent(input.phone_number_id)}/messages`;

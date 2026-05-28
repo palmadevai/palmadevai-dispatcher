@@ -14,11 +14,8 @@
  */
 import { env } from '../env.js';
 import type { Logger } from './logger.js';
-import {
-  sendWhatsApp as sendWhatsAppReal,
-  type SendWhatsAppInput,
-  type SendWhatsAppResult,
-} from '../dispatch/send-whatsapp.js';
+import { sendWhatsApp as sendWhatsAppReal, type WhatsAppSendInput } from '../providers/whatsapp.js';
+import type { ProviderSendResult } from '../providers/types.js';
 
 export interface SendMessageInput {
   to_phone_e164: string;
@@ -42,7 +39,7 @@ export interface MetaApiClient {
   ping(): Promise<boolean>;
 }
 
-function adapt(result: SendWhatsAppResult): SendMessageResult {
+function adapt(result: ProviderSendResult): SendMessageResult {
   return {
     ok: result.ok,
     message_id: result.message_id,
@@ -60,7 +57,7 @@ export function createMetaApiClient(logger: Logger): MetaApiClient {
 
   return {
     async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-      const payload: SendWhatsAppInput = {
+      const payload: WhatsAppSendInput = {
         phone_number_id: input.from_phone_number_id,
         to: input.to_phone_e164,
         template_name: input.template_name,
