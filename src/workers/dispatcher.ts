@@ -189,6 +189,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
   // ─── Per-job processing ────────────────────────────────────────────────────
   type TerminalCarry = {
+    kind: 'terminal';
     campaignId: string;
     category: ErrorCategory;
     errorCode?: string;
@@ -197,6 +198,12 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     fullResponse?: unknown;
     attemptsMade: number;
   };
+  type RetryCarry = {
+    kind: 'retry';
+    attemptIndex: number; // 0-based — same value just persisted via retry_count++
+    errorMessage: string;
+  };
+  type Carry = TerminalCarry | RetryCarry;
 
   async function processJob(job: StreamJob): Promise<void> {
     metricsCollector.recordDequeue();
@@ -211,7 +218,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     // inside the TX when classification is terminal; consumed post-COMMIT.
     // Wrapped in a single-prop object so TS doesn't narrow away the assignment
     // that happens inside the async TX closure.
-    const carryBox: { value: TerminalCarry | null } = { value: null };
+    const carryBox: { value: Carry | null } = { value: null };
 
     try {
       await sql.begin(async (tx: TransactionSql) => {
@@ -421,6 +428,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           // ack_dlq path — terminalCarry set above;
           // Stash classification on the closure so post-TX code can use it.
           carryBox.value = {
+            kind: 'terminal',
             campaignId: ctx.delivery.campaign_id,
             category: classification.category,
             errorCode: result.error_code,
@@ -432,37 +440,39 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           return;
         }
 
-        // Retriable — bump retry_count, throw to trigger backoff scheduling.
+        // Retriable — bump retry_count and stash carry. NO throw aquí: si
+        // tirábamos error rolleaba la TX y retry_count nunca incrementaba
+        // (bug 2026-05-28: infinite loop con attemptIndex=0 forever).
+        // Ahora COMMIT-eamos el bump, post-TX decide retry vs DLQ.
         await tx`
           UPDATE bot.campaign_deliveries SET retry_count = retry_count + 1
           WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
         `;
-        const err = new Error(
-          `Meta send failed: ${result.error_code ?? '?'} ${result.error_message ?? ''}`,
-        );
-        (err as Error & { __retriable?: boolean; __attemptIndex?: number }).__retriable = true;
-        (err as Error & { __retriable?: boolean; __attemptIndex?: number }).__attemptIndex =
-          attemptIndex;
-        throw err;
+        carryBox.value = {
+          kind: 'retry',
+          attemptIndex,
+          errorMessage: `Meta send failed: ${result.error_code ?? '?'} ${result.error_message ?? ''}`,
+        };
+        return;
       });
     } catch (err) {
       retryError = err as Error;
     }
 
     // Post-TX side-effects.
-    const terminal = carryBox.value;
-    if (terminal) {
+    const carry = carryBox.value;
+    if (carry?.kind === 'terminal') {
       try {
         await moveToDLQ(sql, logger, {
           deliveryId,
           queuedAt,
-          campaignId: terminal.campaignId,
-          errorCategory: terminal.category,
-          errorCode: terminal.errorCode,
-          errorMessage: terminal.errorMessage,
-          fullPayload: terminal.fullPayload,
-          fullResponse: terminal.fullResponse,
-          attemptsMade: terminal.attemptsMade,
+          campaignId: carry.campaignId,
+          errorCategory: carry.category,
+          errorCode: carry.errorCode,
+          errorMessage: carry.errorMessage,
+          fullPayload: carry.fullPayload,
+          fullResponse: carry.fullResponse,
+          attemptsMade: carry.attemptsMade,
           firstFailedAt: new Date(),
         });
       } catch (dlqErr) {
@@ -470,6 +480,24 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           { err: (dlqErr as Error).message, deliveryId },
           'DLQ insert failed (non-fatal — recovery worker will retry)',
         );
+      }
+      carryBox.value = null;
+    } else if (carry?.kind === 'retry') {
+      // Schedule retry OR DLQ if exhausted. retry_count ya commitó +1.
+      const attemptIndex = carry.attemptIndex;
+      const nextAttempt = attemptIndex + 1;
+      if (nextAttempt >= env.DISPATCHER_BULLMQ_ATTEMPTS) {
+        await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'meta_5xx_exhausted');
+      } else {
+        const delay = backoffDelayMs(attemptIndex);
+        const eta = Date.now() + delay;
+        try {
+          await rawRedis.zadd(RETRY_ZSET_KEY, String(eta), JSON.stringify({ deliveryId, queuedAt: queuedAt.toISOString() }));
+          logger.info({ deliveryId, attemptIndex, delay_ms: delay }, 'retry scheduled');
+        } catch (zErr) {
+          logger.error({ err: (zErr as Error).message, deliveryId }, 'retry ZADD failed — DLQ-ing instead');
+          await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'meta_5xx_exhausted');
+        }
       }
       carryBox.value = null;
     }
