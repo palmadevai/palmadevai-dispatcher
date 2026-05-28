@@ -34,6 +34,13 @@ import { env } from '../env.js';
 import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
 import { pickPhoneForContact } from '../dispatch/pick-phone.js';
 import {
+  bumpRetryCount,
+  markDeliveryAccepted,
+  markDeliverySuppressed,
+  markDeliveryTerminal,
+  markDeliveryUndelivered,
+} from '../dispatch/delivery-update.js';
+import {
   assertProviderAvailable,
   ChannelNotImplementedError,
   renderEmailBody,
@@ -277,20 +284,17 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         // 2b. Channel guard (Fase 5 PR0 — canal-agnostic provider abstraction).
         // The campaign's channel must have a registered provider. If a campaign
-        // was launched with channel='email|facebook|instagram|sms' before the
+        // was launched with channel='facebook|instagram|sms' before the
         // adapter ships, fail terminally instead of crashing in the WA send path.
         try {
           assertProviderAvailable(ctx.delivery.channel);
         } catch (err) {
           if (err instanceof ChannelNotImplementedError) {
-            await tx`
-              UPDATE bot.campaign_deliveries SET
-                status = 'failed', failed_at = now(),
-                error_code = 'channel_not_implemented',
-                error_message = ${err.message},
-                failure_reason = 'channel_not_implemented'
-              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-            `;
+            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+              error_code: 'channel_not_implemented',
+              error_message: err.message,
+              failure_reason: 'channel_not_implemented',
+            });
             return;
           }
           throw err;
@@ -298,23 +302,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         if (ctx.campaign.status === 'paused' || ctx.campaign.status === 'canceled') {
           // Campaign was paused/canceled between enqueue and dispatch; suppress.
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'suppressed', suppressed_at = now(),
-              failure_reason = ${'campaign_' + ctx.campaign.status}
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
-          // ack-only path (handled at end);
+          await markDeliverySuppressed(tx, deliveryId, queuedAt, `campaign_${ctx.campaign.status}`);
           return;
         }
         if (ctx.contact.unsubscribed_at) {
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'suppressed', suppressed_at = now(),
-              failure_reason = 'opt_out'
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
-          // ack-only path (handled at end);
+          await markDeliverySuppressed(tx, deliveryId, queuedAt, 'opt_out');
           return;
         }
 
@@ -336,14 +328,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         if (ctx.delivery.channel === 'whatsapp') {
           if (!ctx.contact.phone) {
-            await tx`
-              UPDATE bot.campaign_deliveries SET
-                status = 'failed', failed_at = now(),
-                error_code = 'no_phone',
-                error_message = 'audience contact has no phone for whatsapp channel',
-                failure_reason = 'phone_invalid'
-              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-            `;
+            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+              error_code: 'no_phone',
+              error_message: 'audience contact has no phone for whatsapp channel',
+              failure_reason: 'phone_invalid',
+            });
             return;
           }
 
@@ -398,14 +387,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           metricsCollector.recordSend(Date.now() - startMs);
         } else if (ctx.delivery.channel === 'email') {
           if (!ctx.contact.email) {
-            await tx`
-              UPDATE bot.campaign_deliveries SET
-                status = 'failed', failed_at = now(),
-                error_code = 'no_email',
-                error_message = 'audience contact has no email for email channel',
-                failure_reason = 'email_invalid'
-              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-            `;
+            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+              error_code: 'no_email',
+              error_message: 'audience contact has no email for email channel',
+              failure_reason: 'email_invalid',
+            });
             return;
           }
 
@@ -460,14 +446,10 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         // 6. Branch on result.
         if (result.ok && result.message_id) {
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'accepted',
-              accepted_at = now(),
-              meta_message_id = ${result.message_id},
-              wa_phone_number_id = ${waPhone?.id ?? null}
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
+          await markDeliveryAccepted(tx, deliveryId, queuedAt, {
+            message_id: result.message_id,
+            wa_phone_number_id: waPhone?.id,
+          });
           // 7. Bump sent_today (WA only — email has no per-phone counter).
           if (waPhone) {
             await tx`
@@ -504,18 +486,12 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         // 131049 frequency cap — WA-only, terminal undelivered. Distinct branch (not DLQ).
         if (ctx.delivery.channel === 'whatsapp' && errCode === '131049') {
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'undelivered',
-              undelivered_at = now(),
-              failed_at = now(),
-              error_code = '131049',
-              error_message = 'Meta frequency cap (cross-brand 2/24h)',
-              failure_reason = 'meta_freq_cap_131049'
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
+          await markDeliveryUndelivered(tx, deliveryId, queuedAt, {
+            error_code: '131049',
+            error_message: 'Meta frequency cap (cross-brand 2/24h)',
+            failure_reason: 'meta_freq_cap_131049',
+          });
           metricsCollector.recordError('freq_cap_131049');
-          // ack-only path (handled at end);
           return;
         }
 
@@ -529,15 +505,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         if (classification.terminal) {
           // Terminal failure — write delivery row + queue DLQ insert outside TX.
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'failed',
-              failed_at = now(),
-              error_code = ${result.error_code ?? null},
-              error_message = ${result.error_message ?? null},
-              failure_reason = ${classification.category}
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
+          await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+            error_code: result.error_code ?? '',
+            error_message: result.error_message ?? '',
+            failure_reason: classification.category,
+          });
           if (classification.shouldPauseCampaign && classification.pauseReason) {
             await tx`
               UPDATE bot.campaigns
@@ -567,10 +539,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // tirábamos error rolleaba la TX y retry_count nunca incrementaba
         // (bug 2026-05-28: infinite loop con attemptIndex=0 forever).
         // Ahora COMMIT-eamos el bump, post-TX decide retry vs DLQ.
-        await tx`
-          UPDATE bot.campaign_deliveries SET retry_count = retry_count + 1
-          WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-        `;
+        await bumpRetryCount(tx, deliveryId, queuedAt);
         carryBox.value = {
           kind: 'retry',
           attemptIndex,
