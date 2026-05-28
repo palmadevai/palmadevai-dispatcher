@@ -87,6 +87,20 @@ const schema = z.object({
   AI_PERSONALIZE_DEFAULT_MAX_TOKENS: z.coerce.number().int().min(50).max(2000).default(200),
   AI_PERSONALIZE_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.7),
   AI_PERSONALIZE_TIMEOUT_MS: z.coerce.number().int().min(1000).default(15000),
+
+  // ── Email channel (Fase 5 Item 1 — Resend) ───────────────────────────────
+  // Optional: if missing, email deliveries fail terminally with
+  // `error_code='resend_api_key_missing'` (classified payload_invalid, no retry).
+  // The dispatcher boots fine — only campaigns with channel='email' are blocked.
+  RESEND_API_KEY: z.string().optional(),
+  // Default From for email campaigns. Per-campaign override comes from
+  // template.body.from once cockpit UI ships (PR3). Sandbox default below
+  // works only for the Resend account owner; configure a verified domain
+  // before launching real campaigns.
+  CAMPAIGNS_DEFAULT_FROM_EMAIL: z.string().default('onboarding@resend.dev'),
+  // Public unsubscribe link prefix injected in every email footer. Final URL is
+  // `<base>/u/<audience_contact_id>`. Default derives from DOMAIN at boot.
+  CAMPAIGNS_UNSUBSCRIBE_BASE_URL: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);

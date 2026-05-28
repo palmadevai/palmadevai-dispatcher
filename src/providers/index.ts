@@ -17,13 +17,21 @@
  */
 
 import { sendWhatsApp, type WhatsAppSendInput } from './whatsapp.js';
+import { sendEmail, renderEmailBody, type EmailSendInput, type RenderEmailInput, type RenderEmailOutput } from './email.js';
 import { ChannelNotImplementedError, type Channel, type ProviderSendResult } from './types.js';
 
-export { sendWhatsApp };
-export type { WhatsAppSendInput, Channel, ProviderSendResult };
+export { sendWhatsApp, sendEmail, renderEmailBody };
+export type {
+  WhatsAppSendInput,
+  EmailSendInput,
+  RenderEmailInput,
+  RenderEmailOutput,
+  Channel,
+  ProviderSendResult,
+};
 export { ChannelNotImplementedError };
 
-const IMPLEMENTED_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['whatsapp']);
+const IMPLEMENTED_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['whatsapp', 'email']);
 
 export function isChannelImplemented(channel: string): channel is Channel {
   return IMPLEMENTED_CHANNELS.has(channel as Channel);

@@ -36,10 +36,13 @@ import { pickPhoneForContact } from '../dispatch/pick-phone.js';
 import {
   assertProviderAvailable,
   ChannelNotImplementedError,
+  renderEmailBody,
+  sendEmail,
   sendWhatsApp,
   type ProviderSendResult,
 } from '../providers/index.js';
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
+import { classifyResendError } from '../classify/email-error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
@@ -293,19 +296,6 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           throw err;
         }
 
-        if (!ctx.contact.phone) {
-          // Phone missing for WA channel = terminal payload-invalid.
-          await tx`
-            UPDATE bot.campaign_deliveries SET
-              status = 'failed', failed_at = now(),
-              error_code = 'no_phone',
-              error_message = 'audience contact has no phone for whatsapp channel',
-              failure_reason = 'phone_invalid'
-            WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
-          `;
-          // ack-only path (handled at end);
-          return;
-        }
         if (ctx.campaign.status === 'paused' || ctx.campaign.status === 'canceled') {
           // Campaign was paused/canceled between enqueue and dispatch; suppress.
           await tx`
@@ -328,25 +318,10 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           return;
         }
 
-        // 3. Pick phone (sticky / multi-phone).
-        const phone = await pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
-        if (!phone) {
-          // Pause the campaign so we stop dequeueing jobs that all hit this.
-          await tx`
-            UPDATE bot.campaigns
-            SET status = 'paused', paused_at = now(),
-                pause_reason = 'auto_no_available_phones',
-                paused_by = 'dispatcher_auto'
-            WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
-          `;
-          // Throw so the job retries — by next retry the operator may have
-          // re-activated a phone or the campaign is paused (then we'll suppress).
-          throw new Error('NoAvailablePhonesError');
-        }
-
-        // 3b. Resolve AI bindings (Fase 4 item 3). Sustituye {{ai_generated}}
+        // 3. Resolve AI bindings (Fase 4 item 3). Sustituye {{ai_generated}}
         // por LLM-generated body cached per (campaign, contact, var_key,
-        // prompt_hash). Si AI disabled o key falta → no-op.
+        // prompt_hash). Channel-agnostic — both WA components and email body
+        // honor the resolved bindings.
         const aiResolvedBindings = await resolveAiBindings(
           pgPool,
           ctx.campaign.template_variable_bindings,
@@ -355,50 +330,133 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           ctx.template,
         );
 
-        // 4. Resolve template components.
-        const components = resolveTemplateComponents(
-          ctx.template,
-          ctx.contact,
-          ctx.delivery.template_variables,
-          aiResolvedBindings,
-        );
-
-        // 5. POST Meta. Apply rate-limit token before the network call.
-        await acquireToken();
-        const startMs = Date.now();
+        // 4. Channel dispatch — assertProviderAvailable already validated.
         let result: ProviderSendResult;
-        try {
-          result = await sendWhatsApp({
-            phone_number_id: phone.phone_number_id,
-            to: ctx.contact.phone,
-            template_name: ctx.template.name,
-            template_lang: ctx.template.language,
-            components,
-            biz_opaque_callback_data: ctx.delivery.client_ref,
-          });
-        } catch (sendErr) {
-          // Network or 5xx. Re-throw to trigger retry logic.
-          // Log el error completo ANTES de tirar para que el retry loop tenga
-          // el context — el outer catch solo guarda en retryError y el "retry
-          // scheduled" log no incluye el detalle. Sin esto, fallas 5xx/network
-          // se ven como retry loop silencioso. Side bug F4i3 smoke 2026-05-28.
-          const e = sendErr as Error & { http_status?: number; error_code?: string };
-          metricsCollector.recordError('network_or_5xx');
-          logger.error(
-            {
-              deliveryId,
-              campaign_id: ctx.delivery.campaign_id,
-              http_status: e.http_status,
-              error_code: e.error_code,
-              err: e.message,
-              to_last4: ctx.contact.phone?.slice(-4),
-              phone_number_id: phone.phone_number_id,
-            },
-            'sendWhatsApp threw — propagating to retry path',
+        let waPhone: { id: string; phone_number_id: string } | null = null;
+
+        if (ctx.delivery.channel === 'whatsapp') {
+          if (!ctx.contact.phone) {
+            await tx`
+              UPDATE bot.campaign_deliveries SET
+                status = 'failed', failed_at = now(),
+                error_code = 'no_phone',
+                error_message = 'audience contact has no phone for whatsapp channel',
+                failure_reason = 'phone_invalid'
+              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
+            `;
+            return;
+          }
+
+          const phone = await pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
+          if (!phone) {
+            await tx`
+              UPDATE bot.campaigns
+              SET status = 'paused', paused_at = now(),
+                  pause_reason = 'auto_no_available_phones',
+                  paused_by = 'dispatcher_auto'
+              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
+            `;
+            throw new Error('NoAvailablePhonesError');
+          }
+          waPhone = phone;
+
+          const components = resolveTemplateComponents(
+            ctx.template,
+            ctx.contact,
+            ctx.delivery.template_variables,
+            aiResolvedBindings,
           );
-          throw sendErr;
+
+          await acquireToken();
+          const startMs = Date.now();
+          try {
+            result = await sendWhatsApp({
+              phone_number_id: phone.phone_number_id,
+              to: ctx.contact.phone,
+              template_name: ctx.template.name,
+              template_lang: ctx.template.language,
+              components,
+              biz_opaque_callback_data: ctx.delivery.client_ref,
+            });
+          } catch (sendErr) {
+            const e = sendErr as Error & { http_status?: number; error_code?: string };
+            metricsCollector.recordError('network_or_5xx');
+            logger.error(
+              {
+                deliveryId,
+                campaign_id: ctx.delivery.campaign_id,
+                http_status: e.http_status,
+                error_code: e.error_code,
+                err: e.message,
+                to_last4: ctx.contact.phone?.slice(-4),
+                phone_number_id: phone.phone_number_id,
+              },
+              'sendWhatsApp threw — propagating to retry path',
+            );
+            throw sendErr;
+          }
+          metricsCollector.recordSend(Date.now() - startMs);
+        } else if (ctx.delivery.channel === 'email') {
+          if (!ctx.contact.email) {
+            await tx`
+              UPDATE bot.campaign_deliveries SET
+                status = 'failed', failed_at = now(),
+                error_code = 'no_email',
+                error_message = 'audience contact has no email for email channel',
+                failure_reason = 'email_invalid'
+              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
+            `;
+            return;
+          }
+
+          const unsubBase = env.CAMPAIGNS_UNSUBSCRIBE_BASE_URL ?? `https://${env.DOMAIN}/unsubscribe`;
+          const rendered = renderEmailBody({
+            templateBody: ctx.template.body,
+            contactDisplayName: ctx.contact.display_name,
+            contactId: ctx.delivery.audience_contact_id,
+            perRowBindings: ctx.delivery.template_variables,
+            campaignBindings: ctx.campaign.template_variable_bindings,
+            aiResolvedBindings,
+            unsubscribeBaseUrl: unsubBase,
+          });
+
+          const fromOverride =
+            typeof ctx.template.body.from === 'string'
+              ? (ctx.template.body.from as string)
+              : env.CAMPAIGNS_DEFAULT_FROM_EMAIL;
+
+          await acquireToken();
+          const startMs = Date.now();
+          try {
+            result = await sendEmail({
+              from: fromOverride,
+              to: ctx.contact.email,
+              subject: rendered.subject,
+              html: rendered.html,
+              ...(rendered.text ? { text: rendered.text } : {}),
+              biz_opaque_callback_data: ctx.delivery.client_ref,
+            });
+          } catch (sendErr) {
+            const e = sendErr as Error & { http_status?: number; error_code?: string };
+            metricsCollector.recordError('network_or_5xx');
+            logger.error(
+              {
+                deliveryId,
+                campaign_id: ctx.delivery.campaign_id,
+                http_status: e.http_status,
+                error_code: e.error_code,
+                err: e.message,
+                to_domain: ctx.contact.email.split('@')[1],
+              },
+              'sendEmail threw — propagating to retry path',
+            );
+            throw sendErr;
+          }
+          metricsCollector.recordSend(Date.now() - startMs);
+        } else {
+          // Defensive — assertProviderAvailable should have caught this.
+          throw new ChannelNotImplementedError(ctx.delivery.channel);
         }
-        metricsCollector.recordSend(Date.now() - startMs);
 
         // 6. Branch on result.
         if (result.ok && result.message_id) {
@@ -407,15 +465,17 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               status = 'accepted',
               accepted_at = now(),
               meta_message_id = ${result.message_id},
-              wa_phone_number_id = ${phone.id}
+              wa_phone_number_id = ${waPhone?.id ?? null}
             WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
           `;
-          // 7. Bump sent_today.
-          await tx`
-            UPDATE bot.wa_phone_numbers
-            SET sent_today = sent_today + 1
-            WHERE id = ${phone.id}
-          `;
+          // 7. Bump sent_today (WA only — email has no per-phone counter).
+          if (waPhone) {
+            await tx`
+              UPDATE bot.wa_phone_numbers
+              SET sent_today = sent_today + 1
+              WHERE id = ${waPhone.id}
+            `;
+          }
           // 8. SSE publish (outside the TX would be safer for atomicity but
           // postgres.js doesn't expose a post-commit hook; the cost of an
           // occasional missed publish on rollback is acceptable — the cockpit
@@ -442,8 +502,8 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // 6.b Send returned non-ok (4xx with error body).
         const errCode = result.error_code ?? '';
 
-        // 131049 frequency cap — terminal undelivered. Distinct branch (not DLQ).
-        if (errCode === '131049') {
+        // 131049 frequency cap — WA-only, terminal undelivered. Distinct branch (not DLQ).
+        if (ctx.delivery.channel === 'whatsapp' && errCode === '131049') {
           await tx`
             UPDATE bot.campaign_deliveries SET
               status = 'undelivered',
@@ -461,11 +521,10 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
         const attemptIndex = row.retry_count;
         const attemptsMade = attemptIndex + 1;
-        const classification = classifyMetaError(
-          result,
-          attemptsMade,
-          env.DISPATCHER_BULLMQ_ATTEMPTS,
-        );
+        const classification =
+          ctx.delivery.channel === 'email'
+            ? classifyResendError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
+            : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
         metricsCollector.recordError(classification.category);
 
         if (classification.terminal) {
