@@ -37,6 +37,7 @@ import { sendWhatsApp, type SendWhatsAppResult } from '../dispatch/send-whatsapp
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
+import { parseQueuedAt } from '../lib/parse-queued-at.js';
 import { sql as pgPool } from '../lib/postgres.js';
 
 export interface DispatcherDeps {
@@ -176,8 +177,14 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               continue;
             }
             const deliveryId = Number(deliveryIdRaw);
-            const queuedAt = queuedAtRaw ? new Date(queuedAtRaw) : new Date();
-            pushJob({ streamId, deliveryId, queuedAt });
+            const parsed = parseQueuedAt(queuedAtRaw);
+            if (parsed.fallback) {
+              logger.warn(
+                { streamId, deliveryId, queuedAtRaw, normalized: parsed.normalized },
+                'queued_at raw inválido — usando now() como fallback (SELECT no matcheará)',
+              );
+            }
+            pushJob({ streamId, deliveryId, queuedAt: parsed.date });
           }
         }
       } catch (err) {

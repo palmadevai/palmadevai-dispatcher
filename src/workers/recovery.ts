@@ -22,6 +22,7 @@ import type { Redis } from 'ioredis';
 import type { Sql } from 'postgres';
 import { env } from '../env.js';
 import type { Logger } from '../lib/logger.js';
+import { parseQueuedAt } from '../lib/parse-queued-at.js';
 import { moveToDLQ } from './dlq.js';
 
 const RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
@@ -174,7 +175,14 @@ async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promis
             continue;
           }
           const deliveryId = Number(deliveryIdRaw);
-          const queuedAt = queuedAtRaw ? new Date(queuedAtRaw) : new Date();
+          const parsed = parseQueuedAt(queuedAtRaw);
+          if (parsed.fallback) {
+            logger.warn(
+              { streamId, deliveryId, queuedAtRaw, normalized: parsed.normalized },
+              'PEL dead-letter: queued_at raw inválido — fallback now()',
+            );
+          }
+          const queuedAt = parsed.date;
 
           // Range ±1ms para tolerar precision drift JS Date ↔ µs Postgres
           // (ver techdebt-dispatcher-smoke-bugs-2026-05-27). RETURNING queued_at
