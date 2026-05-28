@@ -22,7 +22,7 @@
  *   4. resolveTemplateComponents
  *   5. sendWhatsApp(biz_opaque_callback_data = client_ref)
  *   6. classify result → UPDATE status / throw retry / DLQ terminal
- *   7. UPDATE wa_phone_numbers.sent_today++
+ *   7. UPDATE outbound_endpoints.sent_today++ (WA only — email/FB/IG skip)
  *   8. PUBLISH campaign:<id> for SSE (ADR-005)
  *   9. COMMIT, XACK stream_id
  */
@@ -453,7 +453,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           // 7. Bump sent_today (WA only — email has no per-phone counter).
           if (waPhone) {
             await tx`
-              UPDATE bot.wa_phone_numbers
+              UPDATE bot.outbound_endpoints
               SET sent_today = sent_today + 1
               WHERE id = ${waPhone.id}
             `;

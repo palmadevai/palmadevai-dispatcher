@@ -60,10 +60,11 @@ export async function pickPhoneForContact(
 ): Promise<PickedPhone | null> {
   // 1. Sticky lookup
   const sticky = await sql<PhoneRow[]>`
-    SELECT p.id, p.phone_number_id, p.status, p.sent_today, p.daily_cap_override
+    SELECT p.id, p.endpoint_id AS phone_number_id, p.status, p.sent_today, p.daily_cap_override
     FROM bot.audience_contact_phone_assignments a
-    JOIN bot.wa_phone_numbers p ON p.id = a.wa_phone_number_id
+    JOIN bot.outbound_endpoints p ON p.id = a.wa_phone_number_id
     WHERE a.audience_contact_id = ${audienceContactId}
+      AND p.channel = 'whatsapp'
     LIMIT 1
   `;
 
@@ -81,9 +82,10 @@ export async function pickPhoneForContact(
   // is unnecessary since the column has no zero semantics, but we guard NULL so
   // phones with no cap rank by raw sent_today (still want least-loaded).
   const candidates = await sql<PhoneRow[]>`
-    SELECT id, phone_number_id, status, sent_today, daily_cap_override
-    FROM bot.wa_phone_numbers
-    WHERE status IN ('active', 'warming')
+    SELECT id, endpoint_id AS phone_number_id, status, sent_today, daily_cap_override
+    FROM bot.outbound_endpoints
+    WHERE channel = 'whatsapp'
+      AND status IN ('active', 'warming')
       AND sent_today < COALESCE(daily_cap_override, ${NO_CAP_SENTINEL})
     ORDER BY
       priority DESC,
