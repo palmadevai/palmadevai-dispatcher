@@ -89,13 +89,13 @@ export async function moveToDLQ(
       SELECT
         (SELECT count(*)::int FROM bot.campaign_dlq
            WHERE campaign_id = ${entry.campaignId}
-             AND last_failed_at > now() - (${AUTO_PAUSE_WINDOW_MIN}::int || ' minutes')::interval
+             AND last_failed_at > now() - (${AUTO_PAUSE_WINDOW_MIN}::int * INTERVAL '1 minute')
         ) AS recent_failures,
         (SELECT count(*)::int FROM bot.campaign_deliveries
            WHERE campaign_id = ${entry.campaignId}
              AND COALESCE(
                    accepted_at, sent_at, failed_at, undelivered_at, queued_at
-                 ) > now() - (${AUTO_PAUSE_WINDOW_MIN}::int || ' minutes')::interval
+                 ) > now() - (${AUTO_PAUSE_WINDOW_MIN}::int * INTERVAL '1 minute')
         ) AS recent_total
     `;
 
