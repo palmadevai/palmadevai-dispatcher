@@ -37,7 +37,13 @@ interface PhoneRow {
 // Default cap if daily_cap_override is NULL. ADR-013 says warming default 50/day;
 // active without override = no cap (Meta tier governs). We model "no cap" with
 // a sentinel so the filter is uniform.
-const NO_CAP_SENTINEL = Number.MAX_SAFE_INTEGER;
+//
+// Sentinel = INT4 max (2^31-1). Mayor sería Number.MAX_SAFE_INTEGER pero
+// Postgres infiere el tipo del placeholder desde el contexto (COALESCE con
+// `daily_cap_override::int`) → `integer` → JS Number 9007199254740991
+// overflowea int4 con `out of range for type integer`. Fase 4 smoke 2026-05-28.
+// 2.1B basta como "sin cap" — Meta tier real no supera unos miles/día.
+const NO_CAP_SENTINEL = 2_147_483_647;
 
 function effectiveCap(row: PhoneRow): number {
   return row.daily_cap_override ?? NO_CAP_SENTINEL;
