@@ -33,7 +33,12 @@ import type { MetricsCollector } from '../observability/metrics-collector.js';
 import { env } from '../env.js';
 import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
 import { pickPhoneForContact } from '../dispatch/pick-phone.js';
-import { sendWhatsApp, type SendWhatsAppResult } from '../dispatch/send-whatsapp.js';
+import {
+  assertProviderAvailable,
+  ChannelNotImplementedError,
+  sendWhatsApp,
+  type ProviderSendResult,
+} from '../providers/index.js';
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
@@ -266,6 +271,28 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         if (!ctx) {
           throw new Error(`Delivery ${deliveryId} context not resolvable`);
         }
+
+        // 2b. Channel guard (Fase 5 PR0 — canal-agnostic provider abstraction).
+        // The campaign's channel must have a registered provider. If a campaign
+        // was launched with channel='email|facebook|instagram|sms' before the
+        // adapter ships, fail terminally instead of crashing in the WA send path.
+        try {
+          assertProviderAvailable(ctx.delivery.channel);
+        } catch (err) {
+          if (err instanceof ChannelNotImplementedError) {
+            await tx`
+              UPDATE bot.campaign_deliveries SET
+                status = 'failed', failed_at = now(),
+                error_code = 'channel_not_implemented',
+                error_message = ${err.message},
+                failure_reason = 'channel_not_implemented'
+              WHERE id = ${deliveryId} AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond' AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
+            `;
+            return;
+          }
+          throw err;
+        }
+
         if (!ctx.contact.phone) {
           // Phone missing for WA channel = terminal payload-invalid.
           await tx`
@@ -339,7 +366,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // 5. POST Meta. Apply rate-limit token before the network call.
         await acquireToken();
         const startMs = Date.now();
-        let result: SendWhatsAppResult;
+        let result: ProviderSendResult;
         try {
           result = await sendWhatsApp({
             phone_number_id: phone.phone_number_id,
