@@ -45,6 +45,10 @@ const schema = z.object({
   // ── Rate limits ──────────────────────────────────────────────────────────
   CAMPAIGNS_DEFAULT_RATE_BURST_MPS: z.coerce.number().int().default(10),
   CAMPAIGNS_DEFAULT_DAILY_CAP_OVERRIDE: z.coerce.number().int().optional(),
+  // Fase 7 item 10: Redis-coordinated rate limiter cross-replica.
+  // 'in_memory' (default, single-replica) | 'redis' (atómico Lua, multi-replica safe).
+  CAMPAIGNS_RATE_LIMIT_BACKEND: z.enum(['in_memory', 'redis']).default('in_memory'),
+  CAMPAIGNS_RATE_LIMIT_KEY_PREFIX: z.string().default('campaigns:rl'),
 
   // ── Bull Board auth ──────────────────────────────────────────────────────
   // Opcional en F1.2.a (skeleton). En F1.2.b será required para producción —

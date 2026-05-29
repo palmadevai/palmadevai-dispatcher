@@ -31,6 +31,7 @@ import type { Sql, TransactionSql } from 'postgres';
 import type { Logger } from '../lib/logger.js';
 import type { MetricsCollector } from '../observability/metrics-collector.js';
 import { env } from '../env.js';
+import { createRedisRateLimiter, type RateLimiter } from '../lib/rate-limiter.js';
 import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
 import { pickPhoneForContact } from '../dispatch/pick-phone.js';
 import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
@@ -107,22 +108,53 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     'starting dispatcher worker (XREADGROUP loop)',
   );
 
-  // ─── Token bucket rate limiter (ADR-004) ───────────────────────────────────
-  let tokens = env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS;
-  const refillHandle = setInterval(() => {
-    tokens = env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS;
-  }, 1000);
-
-  async function acquireToken(): Promise<void> {
-    // Busy-spin with 25ms sleep when out of tokens. Acceptable for low MPS.
-    while (tokens <= 0 && !stopping) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    tokens -= 1;
-  }
-
   // ─── Stop flag + task accounting ───────────────────────────────────────────
   let stopping = false;
+
+  // ─── Rate limiter (ADR-004 + Fase 7 item 10) ───────────────────────────────
+  // Redis-coordinated cross-replica si CAMPAIGNS_RATE_LIMIT_BACKEND=redis,
+  // sino fallback in-memory single-replica (default backwards-compat).
+  // El refill rate viene de CAMPAIGNS_DEFAULT_RATE_BURST_MPS. Es un bucket
+  // global (scope='global'). Per-phone scope futuro extension.
+  let rateLimiter: RateLimiter;
+  let inMemoryTokens = env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS;
+  let refillHandle: NodeJS.Timeout | null = null;
+  if (env.CAMPAIGNS_RATE_LIMIT_BACKEND === 'redis') {
+    rateLimiter = createRedisRateLimiter({
+      redis: rawRedis,
+      keyPrefix: env.CAMPAIGNS_RATE_LIMIT_KEY_PREFIX,
+      scope: 'global',
+      maxBurst: env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS,
+      refillPerSec: env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS,
+      fallbackOnError: true,
+      logger: { warn: (obj, msg) => logger.warn(obj, msg) },
+    });
+    logger.info(
+      { backend: 'redis', max_burst: env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS },
+      'rate limiter: Redis-coordinated cross-replica',
+    );
+  } else {
+    // In-memory legacy.
+    refillHandle = setInterval(() => {
+      inMemoryTokens = env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS;
+    }, 1000);
+    rateLimiter = {
+      async acquire(stoppingCheck: () => boolean): Promise<void> {
+        while (inMemoryTokens <= 0 && !stoppingCheck()) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        inMemoryTokens -= 1;
+      },
+    };
+    logger.info(
+      { backend: 'in_memory', max_burst: env.CAMPAIGNS_DEFAULT_RATE_BURST_MPS },
+      'rate limiter: in-memory (single replica)',
+    );
+  }
+
+  async function acquireToken(): Promise<void> {
+    await rateLimiter.acquire(() => stopping);
+  }
   const inflight = new Set<Promise<void>>();
 
   // Bounded in-memory queue between reader and workers.
@@ -1034,7 +1066,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
   async function stop(): Promise<void> {
     stopping = true;
-    clearInterval(refillHandle);
+    if (refillHandle) clearInterval(refillHandle);
     clearInterval(retryHandle);
     // Wake any sleeping workers.
     if (readerWake) {
