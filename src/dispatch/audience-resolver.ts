@@ -35,6 +35,7 @@ export interface DeliveryContext {
     unsubscribed_at: Date | null;
     consent_status: string;
     meta: Record<string, unknown>;
+    language: string | null;
   };
   template: {
     id: string;
@@ -56,7 +57,14 @@ export interface DeliveryContext {
     // Fase 4 item 3 — AI body personalization
     ai_personalization_enabled: boolean;
     ai_personalization_config: AiPersonalizationConfig | null;
+    // Fase 7 item 4 — multi-language routing
+    language_routing: LanguageRouting | null;
   };
+}
+
+export interface LanguageRouting {
+  default: string;
+  [lang: string]: string;
 }
 
 export interface AiPersonalizationConfig {
@@ -87,6 +95,7 @@ interface JoinedRow {
   c_unsubscribed_at: Date | null;
   c_consent_status: string;
   c_meta: Record<string, unknown>;
+  c_language: string | null;
   t_id: string;
   t_name: string;
   t_language: string;
@@ -105,6 +114,7 @@ interface JoinedRow {
   cm_variant_b_template_id: string | null;
   cm_ai_enabled: boolean;
   cm_ai_config: AiPersonalizationConfig | null;
+  cm_language_routing: LanguageRouting | null;
 }
 
 export async function resolveDeliveryContext(
@@ -137,6 +147,7 @@ export async function resolveDeliveryContext(
       ac.unsubscribed_at                 AS c_unsubscribed_at,
       ac.consent_status                  AS c_consent_status,
       COALESCE(ac.meta, '{}'::jsonb)     AS c_meta,
+      ac.language                        AS c_language,
       t.id::text                         AS t_id,
       t.name                             AS t_name,
       t.language                         AS t_language,
@@ -156,7 +167,8 @@ export async function resolveDeliveryContext(
       cm.variant_b_template_id::text     AS cm_variant_b_template_id,
       COALESCE(cm.ai_personalization_enabled, false)
                                          AS cm_ai_enabled,
-      cm.ai_personalization_config       AS cm_ai_config
+      cm.ai_personalization_config       AS cm_ai_config,
+      cm.language_routing                AS cm_language_routing
     FROM bot.campaign_deliveries d
     JOIN bot.audience_contacts ac ON ac.id = d.audience_contact_id
     JOIN bot.campaigns cm ON cm.id = d.campaign_id
@@ -171,13 +183,14 @@ export async function resolveDeliveryContext(
   const r = rows[0];
 
   // Template precedence (highest → lowest):
-  //   1. drip_template_id      — Fase 4 item 5 PR5b-PR3. kind='drip' deliveries
-  //                              carry the per-step template explicitly on the
-  //                              row. Takes priority over A/B (A/B doesn't apply
-  //                              to drip steps; each step picks its own template).
-  //   2. variant_b_template_id — A/B override when delivery.variant_label='B'.
-  //   3. variant_a_template_id — A/B override when delivery.variant_label='A'.
-  //   4. campaign.template_id  — base template (already in t_id via JOIN).
+  //   1. drip_template_id        — Fase 4 item 5 PR5b-PR3. kind='drip' carries
+  //                                template explicitly on the row.
+  //   2. variant_b_template_id   — A/B override when delivery.variant_label='B'.
+  //   3. variant_a_template_id   — A/B override when delivery.variant_label='A'.
+  //   4. language_routing[lang]  — Fase 7 item 4. Multi-lang campaign: pick
+  //                                template per audience.language.
+  //   5. language_routing[default] — fallback when contact lang null/unmapped.
+  //   6. campaign.template_id    — base (already in t_id via JOIN).
   let templateIdToUse: string | null = null;
   if (r.d_drip_step !== null && r.d_drip_template_id) {
     templateIdToUse = r.d_drip_template_id;
@@ -185,6 +198,8 @@ export async function resolveDeliveryContext(
     templateIdToUse = r.cm_variant_b_template_id;
   } else if (r.d_variant_label === 'A' && r.cm_variant_a_template_id) {
     templateIdToUse = r.cm_variant_a_template_id;
+  } else if (r.cm_language_routing) {
+    templateIdToUse = resolveLanguageRouting(r.cm_language_routing, r.c_language);
   }
 
   let template = {
@@ -249,6 +264,7 @@ export async function resolveDeliveryContext(
       unsubscribed_at: r.c_unsubscribed_at,
       consent_status: r.c_consent_status,
       meta: r.c_meta,
+      language: r.c_language,
     },
     template,
     campaign: {
@@ -261,8 +277,32 @@ export async function resolveDeliveryContext(
       pause_reason: r.cm_pause_reason,
       ai_personalization_enabled: r.cm_ai_enabled,
       ai_personalization_config: r.cm_ai_config,
+      language_routing: r.cm_language_routing,
     },
   };
+}
+
+/**
+ * Pick a template_id from a language_routing map based on the contact's
+ * language. Falls back to language_routing.default → underlying campaign
+ * template if even the default key has no entry (defensive — DB CHECK
+ * constraint guarantees 'default' is present, but we don't trust input).
+ *
+ * Returns null if the routing object can't resolve at all (caller falls
+ * through to campaign.template_id).
+ */
+function resolveLanguageRouting(
+  routing: LanguageRouting,
+  contactLang: string | null,
+): string | null {
+  if (contactLang && typeof routing[contactLang] === 'string') {
+    return routing[contactLang];
+  }
+  const defaultLang = routing.default;
+  if (defaultLang && typeof routing[defaultLang] === 'string') {
+    return routing[defaultLang];
+  }
+  return null;
 }
 
 /**
