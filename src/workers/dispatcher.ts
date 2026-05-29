@@ -33,6 +33,7 @@ import type { MetricsCollector } from '../observability/metrics-collector.js';
 import { env } from '../env.js';
 import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
 import { pickPhoneForContact } from '../dispatch/pick-phone.js';
+import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
 import {
   bumpRetryCount,
   markDeliveryAccepted,
@@ -45,11 +46,13 @@ import {
   ChannelNotImplementedError,
   renderEmailBody,
   sendEmail,
+  sendFacebookMessenger,
   sendWhatsApp,
   type ProviderSendResult,
 } from '../providers/index.js';
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
 import { classifyResendError } from '../classify/email-error-classifier.js';
+import { classifyMessengerError } from '../classify/facebook-error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
@@ -325,6 +328,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // 4. Channel dispatch — assertProviderAvailable already validated.
         let result: ProviderSendResult;
         let waPhone: { id: string; phone_number_id: string } | null = null;
+        let fbEndpoint: { id: string; endpoint_id: string; access_token: string } | null = null;
 
         if (ctx.delivery.channel === 'whatsapp') {
           if (!ctx.contact.phone) {
@@ -439,6 +443,82 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             throw sendErr;
           }
           metricsCollector.recordSend(Date.now() - startMs);
+        } else if (ctx.delivery.channel === 'facebook') {
+          // PSID en contact.meta.facebook_psid — sin mig nueva todavía.
+          const psid = typeof ctx.contact.meta?.facebook_psid === 'string'
+            ? (ctx.contact.meta.facebook_psid as string)
+            : null;
+          if (!psid) {
+            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+              error_code: 'no_psid',
+              error_message: 'audience contact has no facebook_psid in meta',
+              failure_reason: 'facebook_psid_invalid',
+            });
+            return;
+          }
+
+          const endpoint = await pickEndpointForChannel(tx, 'facebook');
+          if (!endpoint) {
+            await tx`
+              UPDATE bot.campaigns
+              SET status = 'paused', paused_at = now(),
+                  pause_reason = 'auto_no_available_phones',
+                  paused_by = 'dispatcher_auto'
+              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
+            `;
+            throw new Error('NoAvailableFacebookEndpointError');
+          }
+          fbEndpoint = endpoint;
+
+          // template.body shape (body_format='plain_text'):
+          //   { text: "Hola {{name}}", messaging_tag: "ACCOUNT_UPDATE" }
+          // Variable interpolation: same priority as email — per-row > AI > campaign > {{name}}.
+          const tplBody = ctx.template.body as Record<string, unknown>;
+          const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
+          const tag = typeof tplBody.messaging_tag === 'string'
+            ? (tplBody.messaging_tag as 'ACCOUNT_UPDATE' | 'POST_PURCHASE_UPDATE' | 'CONFIRMED_EVENT_UPDATE')
+            : undefined;
+          const vars: Record<string, string> = {};
+          if (ctx.contact.display_name) vars.name = ctx.contact.display_name;
+          for (const [k, v] of Object.entries(ctx.campaign.template_variable_bindings ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          for (const [k, v] of Object.entries(aiResolvedBindings ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          for (const [k, v] of Object.entries(ctx.delivery.template_variables ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          const messageText = rawText.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (m, k: string) => vars[k] ?? m);
+
+          await acquireToken();
+          const startMs = Date.now();
+          try {
+            result = await sendFacebookMessenger({
+              page_access_token: endpoint.access_token,
+              recipient_psid: psid,
+              message_text: messageText,
+              messaging_tag: tag,
+              biz_opaque_callback_data: ctx.delivery.client_ref,
+            });
+          } catch (sendErr) {
+            const e = sendErr as Error & { http_status?: number; error_code?: string };
+            metricsCollector.recordError('network_or_5xx');
+            logger.error(
+              {
+                deliveryId,
+                campaign_id: ctx.delivery.campaign_id,
+                http_status: e.http_status,
+                error_code: e.error_code,
+                err: e.message,
+                psid_last4: psid.slice(-4),
+                page_endpoint_id: endpoint.endpoint_id,
+              },
+              'sendFacebookMessenger threw — propagating to retry path',
+            );
+            throw sendErr;
+          }
+          metricsCollector.recordSend(Date.now() - startMs);
         } else {
           // Defensive — assertProviderAvailable should have caught this.
           throw new ChannelNotImplementedError(ctx.delivery.channel);
@@ -450,12 +530,18 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             message_id: result.message_id,
             wa_phone_number_id: waPhone?.id,
           });
-          // 7. Bump sent_today (WA only — email has no per-phone counter).
+          // 7. Bump sent_today per endpoint (WA via wa_phone_numbers FK; FB/IG via outbound_endpoints).
           if (waPhone) {
             await tx`
               UPDATE bot.outbound_endpoints
               SET sent_today = sent_today + 1
               WHERE id = ${waPhone.id}
+            `;
+          } else if (fbEndpoint) {
+            await tx`
+              UPDATE bot.outbound_endpoints
+              SET sent_today = sent_today + 1
+              WHERE id = ${fbEndpoint.id}
             `;
           }
           // 8. SSE publish (outside the TX would be safer for atomicity but
@@ -500,7 +586,9 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         const classification =
           ctx.delivery.channel === 'email'
             ? classifyResendError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
-            : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
+            : ctx.delivery.channel === 'facebook'
+              ? classifyMessengerError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
+              : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
         metricsCollector.recordError(classification.category);
 
         if (classification.terminal) {
