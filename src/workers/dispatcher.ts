@@ -885,8 +885,19 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
   }
 
   // ─── Worker pool ───────────────────────────────────────────────────────────
-  async function workerLoop(): Promise<void> {
-    while (!stopping) {
+  // Fase 7 item 9: pool dinámico para hot-reload de concurrency. Cada worker
+  // tiene un control object con shouldStop; el controller scale-down lo
+  // setea y el worker drena su job actual antes de exitar naturalmente.
+  interface WorkerControl {
+    id: number;
+    shouldStop: boolean;
+    promise: Promise<void>;
+  }
+  const workers: WorkerControl[] = [];
+  let workerIdCounter = 0;
+
+  async function workerLoop(ctrl: WorkerControl): Promise<void> {
+    while (!stopping && !ctrl.shouldStop) {
       const job = await waitForJob();
       if (!job) break;
       const task = processJob(job).catch((err) => {
@@ -900,6 +911,71 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
       // by pool size, not by background tasks.
       await task;
       inflight.delete(task);
+    }
+    logger.debug({ worker_id: ctrl.id, reason: ctrl.shouldStop ? 'drained' : 'stopping' }, 'worker exiting');
+  }
+
+  function spawnWorker(): void {
+    workerIdCounter += 1;
+    const ctrl: WorkerControl = {
+      id: workerIdCounter,
+      shouldStop: false,
+      promise: Promise.resolve(),
+    };
+    ctrl.promise = workerLoop(ctrl);
+    workers.push(ctrl);
+  }
+
+  function drainOneWorker(): void {
+    // Pop the LAST worker (LIFO) so we don't disrupt the oldest+warmest task.
+    const ctrl = workers.pop();
+    if (!ctrl) return;
+    ctrl.shouldStop = true;
+    // Don't await — let it finish naturally. stop() awaits all at shutdown.
+  }
+
+  // Fase 7 item 9: poll bot.config para detectar cambios de concurrency.
+  // Source of truth: bot.config[key='campaigns'].value.dispatcher.concurrency,
+  // fallback a env.DISPATCHER_CONCURRENCY (valor inicial).
+  async function getDesiredConcurrency(): Promise<number> {
+    try {
+      const rows = await sql<Array<{ c: string | null }>>`
+        SELECT (value->'dispatcher'->>'concurrency')::text AS c
+          FROM bot.config WHERE key = 'campaigns'
+      `;
+      const raw = rows[0]?.c;
+      if (raw) {
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n) && n >= 1 && n <= 100) return n;
+      }
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'getDesiredConcurrency query failed; using env fallback');
+    }
+    return env.DISPATCHER_CONCURRENCY;
+  }
+
+  async function concurrencyControllerLoop(): Promise<void> {
+    while (!stopping) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 30_000));
+      if (stopping) break;
+      let desired: number;
+      try {
+        desired = await getDesiredConcurrency();
+      } catch (err) {
+        logger.warn({ err: (err as Error).message }, 'concurrency controller tick failed');
+        continue;
+      }
+      const current = workers.length;
+      if (desired === current) continue;
+      if (desired > current) {
+        const toAdd = desired - current;
+        logger.info({ from: current, to: desired, added: toAdd }, 'concurrency hot-reload: scale-up');
+        for (let i = 0; i < toAdd; i += 1) spawnWorker();
+      } else {
+        const toDrain = current - desired;
+        logger.info({ from: current, to: desired, drained: toDrain }, 'concurrency hot-reload: scale-down');
+        for (let i = 0; i < toDrain; i += 1) drainOneWorker();
+      }
     }
   }
 
@@ -951,10 +1027,10 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
 
   // ─── Boot ──────────────────────────────────────────────────────────────────
   const readerPromise = readerLoop();
-  const workerPromises: Array<Promise<void>> = [];
   for (let i = 0; i < env.DISPATCHER_CONCURRENCY; i += 1) {
-    workerPromises.push(workerLoop());
+    spawnWorker();
   }
+  const controllerPromise = concurrencyControllerLoop();
 
   async function stop(): Promise<void> {
     stopping = true;
@@ -965,7 +1041,12 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
       readerWake();
       readerWake = null;
     }
-    await Promise.allSettled([readerPromise, ...workerPromises, ...inflight]);
+    await Promise.allSettled([
+      readerPromise,
+      controllerPromise,
+      ...workers.map((w) => w.promise),
+      ...inflight,
+    ]);
   }
 
   return { stop };
