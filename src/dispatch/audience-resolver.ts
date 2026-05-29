@@ -24,6 +24,8 @@ export interface DeliveryContext {
     status: string;
     retry_count: number;
     variant_label: string | null;
+    drip_step: number | null;
+    drip_template_id: string | null;
   };
   contact: {
     id: string;
@@ -76,6 +78,8 @@ interface JoinedRow {
   d_status: string;
   d_retry_count: number;
   d_variant_label: string | null;
+  d_drip_step: number | null;
+  d_drip_template_id: string | null;
   c_id: string;
   c_phone: string | null;
   c_email: string | null;
@@ -124,6 +128,8 @@ export async function resolveDeliveryContext(
       d.status                           AS d_status,
       d.retry_count                      AS d_retry_count,
       d.variant_label                    AS d_variant_label,
+      d.drip_step                        AS d_drip_step,
+      d.drip_template_id::text           AS d_drip_template_id,
       ac.id::text                        AS c_id,
       ac.phone                           AS c_phone,
       ac.email::text                     AS c_email,
@@ -164,11 +170,18 @@ export async function resolveDeliveryContext(
   if (rows.length === 0 || !rows[0]) return null;
   const r = rows[0];
 
-  // A/B override: if delivery has variant_label='B' AND the campaign has a B
-  // template defined, swap. Otherwise stick with the base template (which is
-  // campaign.template_id — usually equivalent to variant_a_template_id).
+  // Template precedence (highest → lowest):
+  //   1. drip_template_id      — Fase 4 item 5 PR5b-PR3. kind='drip' deliveries
+  //                              carry the per-step template explicitly on the
+  //                              row. Takes priority over A/B (A/B doesn't apply
+  //                              to drip steps; each step picks its own template).
+  //   2. variant_b_template_id — A/B override when delivery.variant_label='B'.
+  //   3. variant_a_template_id — A/B override when delivery.variant_label='A'.
+  //   4. campaign.template_id  — base template (already in t_id via JOIN).
   let templateIdToUse: string | null = null;
-  if (r.d_variant_label === 'B' && r.cm_variant_b_template_id) {
+  if (r.d_drip_step !== null && r.d_drip_template_id) {
+    templateIdToUse = r.d_drip_template_id;
+  } else if (r.d_variant_label === 'B' && r.cm_variant_b_template_id) {
     templateIdToUse = r.cm_variant_b_template_id;
   } else if (r.d_variant_label === 'A' && r.cm_variant_a_template_id) {
     templateIdToUse = r.cm_variant_a_template_id;
@@ -225,6 +238,8 @@ export async function resolveDeliveryContext(
       status: r.d_status,
       retry_count: r.d_retry_count,
       variant_label: r.d_variant_label,
+      drip_step: r.d_drip_step,
+      drip_template_id: r.d_drip_template_id,
     },
     contact: {
       id: r.c_id,
