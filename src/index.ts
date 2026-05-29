@@ -18,6 +18,7 @@ import { MetricsCollector } from './observability/metrics-collector.js';
 import { startDispatcher } from './workers/dispatcher.js';
 import { startRecovery } from './workers/recovery.js';
 import { startMetricsFlush } from './workers/metrics-flush.js';
+import { startCrmWebhookEmitter } from './workers/crm-webhook-emitter.js';
 import { startServer } from './server.js';
 
 async function ensureStreamAndGroup(): Promise<void> {
@@ -90,6 +91,12 @@ async function main(): Promise<void> {
     metricsCollector,
   });
 
+  // Fase 6 Item 1 — CRM webhook emitter (outbox poller con HMAC).
+  const crmWebhookEmitterHandle = startCrmWebhookEmitter({
+    sql,
+    logger,
+  });
+
   // 3. HTTP server (healthcheck + Bull Board).
   const server = await startServer({
     bullmqConnection,
@@ -111,6 +118,7 @@ async function main(): Promise<void> {
     try {
       clearInterval(recoveryHandle);
       clearInterval(metricsFlushHandle);
+      clearInterval(crmWebhookEmitterHandle);
       await dispatcherHandle.stop();
       await server.close();
       await rawRedis.quit();
