@@ -47,12 +47,14 @@ import {
   renderEmailBody,
   sendEmail,
   sendFacebookMessenger,
+  sendInstagramDm,
   sendWhatsApp,
   type ProviderSendResult,
 } from '../providers/index.js';
 import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
 import { classifyResendError } from '../classify/email-error-classifier.js';
 import { classifyMessengerError } from '../classify/facebook-error-classifier.js';
+import { classifyInstagramError } from '../classify/instagram-error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
@@ -329,6 +331,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         let result: ProviderSendResult;
         let waPhone: { id: string; phone_number_id: string } | null = null;
         let fbEndpoint: { id: string; endpoint_id: string; access_token: string } | null = null;
+        let igEndpoint: { id: string; endpoint_id: string; access_token: string } | null = null;
 
         if (ctx.delivery.channel === 'whatsapp') {
           if (!ctx.contact.phone) {
@@ -519,6 +522,79 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             throw sendErr;
           }
           metricsCollector.recordSend(Date.now() - startMs);
+        } else if (ctx.delivery.channel === 'instagram') {
+          // IGSID en contact.meta.instagram_user_id.
+          const igsid = typeof ctx.contact.meta?.instagram_user_id === 'string'
+            ? (ctx.contact.meta.instagram_user_id as string)
+            : null;
+          if (!igsid) {
+            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+              error_code: 'no_igsid',
+              error_message: 'audience contact has no instagram_user_id in meta',
+              failure_reason: 'instagram_igsid_invalid',
+            });
+            return;
+          }
+
+          const endpoint = await pickEndpointForChannel(tx, 'instagram');
+          if (!endpoint) {
+            await tx`
+              UPDATE bot.campaigns
+              SET status = 'paused', paused_at = now(),
+                  pause_reason = 'auto_no_available_phones',
+                  paused_by = 'dispatcher_auto'
+              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
+            `;
+            throw new Error('NoAvailableInstagramEndpointError');
+          }
+          igEndpoint = endpoint;
+
+          // template.body shape (body_format='plain_text'):
+          //   { text: "Hola {{name}}", messaging_tag: "HUMAN_AGENT"? }
+          const tplBody = ctx.template.body as Record<string, unknown>;
+          const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
+          const tag = tplBody.messaging_tag === 'HUMAN_AGENT' ? 'HUMAN_AGENT' as const : undefined;
+          const vars: Record<string, string> = {};
+          if (ctx.contact.display_name) vars.name = ctx.contact.display_name;
+          for (const [k, v] of Object.entries(ctx.campaign.template_variable_bindings ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          for (const [k, v] of Object.entries(aiResolvedBindings ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          for (const [k, v] of Object.entries(ctx.delivery.template_variables ?? {})) {
+            if (v != null) vars[k] = String(v);
+          }
+          const messageText = rawText.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (m, k: string) => vars[k] ?? m);
+
+          await acquireToken();
+          const startMs = Date.now();
+          try {
+            result = await sendInstagramDm({
+              page_access_token: endpoint.access_token,
+              recipient_igsid: igsid,
+              message_text: messageText,
+              messaging_tag: tag,
+              biz_opaque_callback_data: ctx.delivery.client_ref,
+            });
+          } catch (sendErr) {
+            const e = sendErr as Error & { http_status?: number; error_code?: string };
+            metricsCollector.recordError('network_or_5xx');
+            logger.error(
+              {
+                deliveryId,
+                campaign_id: ctx.delivery.campaign_id,
+                http_status: e.http_status,
+                error_code: e.error_code,
+                err: e.message,
+                igsid_last4: igsid.slice(-4),
+                ig_endpoint_id: endpoint.endpoint_id,
+              },
+              'sendInstagramDm threw — propagating to retry path',
+            );
+            throw sendErr;
+          }
+          metricsCollector.recordSend(Date.now() - startMs);
         } else {
           // Defensive — assertProviderAvailable should have caught this.
           throw new ChannelNotImplementedError(ctx.delivery.channel);
@@ -542,6 +618,12 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               UPDATE bot.outbound_endpoints
               SET sent_today = sent_today + 1
               WHERE id = ${fbEndpoint.id}
+            `;
+          } else if (igEndpoint) {
+            await tx`
+              UPDATE bot.outbound_endpoints
+              SET sent_today = sent_today + 1
+              WHERE id = ${igEndpoint.id}
             `;
           }
           // 8. SSE publish (outside the TX would be safer for atomicity but
@@ -588,7 +670,9 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             ? classifyResendError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
             : ctx.delivery.channel === 'facebook'
               ? classifyMessengerError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
-              : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
+              : ctx.delivery.channel === 'instagram'
+                ? classifyInstagramError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
+                : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
         metricsCollector.recordError(classification.category);
 
         if (classification.terminal) {
