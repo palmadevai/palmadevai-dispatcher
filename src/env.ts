@@ -101,6 +101,15 @@ const schema = z.object({
   // Public unsubscribe link prefix injected in every email footer. Final URL is
   // `<base>/u/<audience_contact_id>`. Default derives from DOMAIN at boot.
   CAMPAIGNS_UNSUBSCRIBE_BASE_URL: z.string().optional(),
+
+  // ── CRM webhooks salientes (Fase 6 Item 1) ───────────────────────────────
+  // Worker crm-webhook-emitter polea bot.crm_webhook_deliveries cada
+  // INTERVAL_MS, dispatcha hasta BATCH_SIZE filas por tick con HMAC firmado.
+  // Defaults coinciden con manifest features/campaigns/manifest.yaml. timeout
+  // y max_attempts son per-endpoint (columnas en bot.crm_webhook_endpoints).
+  CAMPAIGNS_WEBHOOK_EMITTER_INTERVAL_MS: z.coerce.number().int().min(500).default(2000),
+  CAMPAIGNS_WEBHOOK_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
+  CAMPAIGNS_WEBHOOK_USER_AGENT: z.string().default('palmadev-webhooks/1'),
 });
 
 const parsed = schema.safeParse(process.env);
