@@ -19,21 +19,23 @@
 import { sendWhatsApp, type WhatsAppSendInput } from './whatsapp.js';
 import { sendEmail, renderEmailBody, type EmailSendInput, type RenderEmailInput, type RenderEmailOutput } from './email.js';
 import { sendFacebookMessenger, type FacebookSendInput } from './facebook.js';
+import { sendInstagramDm, type InstagramSendInput } from './instagram.js';
 import { ChannelNotImplementedError, type Channel, type ProviderSendResult } from './types.js';
 
-export { sendWhatsApp, sendEmail, renderEmailBody, sendFacebookMessenger };
+export { sendWhatsApp, sendEmail, renderEmailBody, sendFacebookMessenger, sendInstagramDm };
 export type {
   WhatsAppSendInput,
   EmailSendInput,
   RenderEmailInput,
   RenderEmailOutput,
   FacebookSendInput,
+  InstagramSendInput,
   Channel,
   ProviderSendResult,
 };
 export { ChannelNotImplementedError };
 
-const IMPLEMENTED_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['whatsapp', 'email', 'facebook']);
+const IMPLEMENTED_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['whatsapp', 'email', 'facebook', 'instagram']);
 
 export function isChannelImplemented(channel: string): channel is Channel {
   return IMPLEMENTED_CHANNELS.has(channel as Channel);
