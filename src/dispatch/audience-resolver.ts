@@ -340,21 +340,74 @@ export function resolveTemplateComponents(
     ...(typeof deliveryVariables === 'object' && deliveryVariables ? deliveryVariables : {}),
   };
 
-  const interpolateString = (s: string): string =>
+  const interpolate = (s: string): string =>
     s
       .replace(/\$\{(\w+)\}/g, (_m, k: string) => String(vars[k] ?? ''))
       .replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, k: string) => String(vars[k] ?? ''));
 
   const walk = (node: unknown): unknown => {
-    if (typeof node === 'string') return interpolateString(node);
+    if (typeof node === 'string') return interpolate(node);
     if (Array.isArray(node)) return node.map(walk);
     if (node && typeof node === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(node)) out[k] = walk(v);
-      return out;
+      const o: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(node)) o[k] = walk(v);
+      return o;
     }
     return node;
   };
 
-  return componentsRaw.map(walk);
+  // Meta SEND API: los components NO aceptan `text` (ese es el formato de LECTURA,
+  // como los guarda el sync desde Graph API). El envío sólo lleva `parameters` con
+  // los valores ya substituidos. Un component SIN placeholders debe OMITIRSE — Meta
+  // usa el contenido registrado del template. Mandar {type:'BODY', text:'...'} causa:
+  // "100 Unexpected key 'text' on param template.components.0".
+  const out: unknown[] = [];
+  for (const comp of componentsRaw) {
+    if (!comp || typeof comp !== 'object') continue;
+    const c = comp as {
+      type?: unknown;
+      text?: unknown;
+      parameters?: unknown;
+      sub_type?: unknown;
+      index?: unknown;
+    };
+    const type = String(c.type ?? '').toLowerCase();
+
+    // Caso A: ya viene en formato de ENVÍO (con `parameters`). Interpolar valores +
+    // preservar sub_type/index para botones. Sin parameters → omitir.
+    if (Array.isArray(c.parameters)) {
+      const params = (c.parameters as unknown[]).map(walk);
+      if (params.length === 0) continue;
+      const base: Record<string, unknown> = { type: type || 'body', parameters: params };
+      if (type === 'button') {
+        base.sub_type = typeof c.sub_type === 'string' ? c.sub_type : 'url';
+        base.index = String(c.index ?? '0');
+      }
+      out.push(base);
+      continue;
+    }
+
+    // Caso B: formato de LECTURA {type:'BODY', text:'...'}. Extraer placeholders
+    // ({{1}}/{{name}}/${name}) → parameters. Sin placeholders → omitir.
+    const text = typeof c.text === 'string' ? c.text : '';
+    const tokens = text.match(/\$\{\w+\}|\{\{\s*\w+\s*\}\}/g) ?? [];
+    if (tokens.length === 0) continue;
+    const parameters = tokens.map((tok) => ({
+      type: 'text',
+      text: String(vars[tok.replace(/[${}\s]/g, '')] ?? ''),
+    }));
+    if (type === 'header') {
+      out.push({ type: 'header', parameters });
+    } else if (type === 'button' || type === 'buttons') {
+      out.push({
+        type: 'button',
+        sub_type: typeof c.sub_type === 'string' ? c.sub_type : 'url',
+        index: String(c.index ?? '0'),
+        parameters,
+      });
+    } else {
+      out.push({ type: 'body', parameters });
+    }
+  }
+  return out;
 }
