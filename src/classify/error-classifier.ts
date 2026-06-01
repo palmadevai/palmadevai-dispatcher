@@ -51,7 +51,11 @@ export interface ClassificationOutcome {
 const FREQ_CAP_CODES = new Set(['131049']);
 const TIER_EXCEEDED_CODES = new Set(['131000', '131056']);
 const PHONE_INVALID_CODES = new Set(['131005', '131026', '131051']);
-const TEMPLATE_REJECTED_CODES = new Set(['132047']);
+// 132047: template pausado/rechazado mid-flight.
+// 131058: template no se puede enviar desde este número (ej. hello_world solo
+//   desde Public Test Numbers, o template restringido al WABA equivocado).
+//   Permanente — reintentar no ayuda; afecta a TODAS las deliveries del template.
+const TEMPLATE_REJECTED_CODES = new Set(['132047', '131058']);
 const AUTH_CODES = new Set(['190']);
 
 function isPayloadInvalidCode(code: string): boolean {
