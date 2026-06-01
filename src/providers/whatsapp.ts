@@ -34,6 +34,11 @@ export interface WhatsAppSendInput {
   template_lang: string;
   components: unknown[];
   biz_opaque_callback_data: string;
+  /**
+   * Fase 9 — token del endpoint emisor fijado (multi-WABA / multi-app). Si se
+   * omite, se usa el bearer global del .env (caso single-app / warming pool).
+   */
+  access_token?: string;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -76,7 +81,7 @@ export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSe
     res = await request(url, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${env.META_WA_BEARER_TOKEN}`,
+        authorization: `Bearer ${input.access_token ?? env.META_WA_BEARER_TOKEN}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),

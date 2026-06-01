@@ -33,7 +33,7 @@ import type { MetricsCollector } from '../observability/metrics-collector.js';
 import { env } from '../env.js';
 import { createRedisRateLimiter, type RateLimiter } from '../lib/rate-limiter.js';
 import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
-import { pickPhoneForContact } from '../dispatch/pick-phone.js';
+import { pickPhoneForContact, resolvePinnedWaEndpoint } from '../dispatch/pick-phone.js';
 import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
 import {
   bumpRetryCount,
@@ -386,7 +386,25 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             return;
           }
 
-          const phone = await pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
+          // Fase 9 — emisor: si la campaña fijó un endpoint (multi-WABA), usar ESE
+          // número + su token. Si no, auto-pick legacy (sticky + warming pool).
+          let phone: { id: string; phone_number_id: string } | null = null;
+          let waAccessToken: string | undefined;
+          if (ctx.campaign.outbound_endpoint_id) {
+            const pinned = await resolvePinnedWaEndpoint(tx, ctx.campaign.outbound_endpoint_id);
+            if (pinned) {
+              phone = { id: pinned.id, phone_number_id: pinned.phone_number_id };
+              waAccessToken = pinned.access_token ?? undefined;
+            } else {
+              logger.warn(
+                { deliveryId, campaign_id: ctx.delivery.campaign_id, outbound_endpoint_id: ctx.campaign.outbound_endpoint_id },
+                'pinned outbound_endpoint no usable (missing/disabled) — fallback a auto-pick',
+              );
+            }
+          }
+          if (!phone) {
+            phone = await pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
+          }
           if (!phone) {
             await tx`
               UPDATE bot.campaigns
@@ -416,6 +434,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               template_lang: ctx.template.language,
               components,
               biz_opaque_callback_data: ctx.delivery.client_ref,
+              ...(waAccessToken ? { access_token: waAccessToken } : {}),
             });
           } catch (sendErr) {
             const e = sendErr as Error & { http_status?: number; error_code?: string };
