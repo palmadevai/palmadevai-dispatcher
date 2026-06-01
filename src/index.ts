@@ -19,6 +19,7 @@ import { startDispatcher } from './workers/dispatcher.js';
 import { startRecovery } from './workers/recovery.js';
 import { startMetricsFlush } from './workers/metrics-flush.js';
 import { startCrmWebhookEmitter } from './workers/crm-webhook-emitter.js';
+import { startWakeupSubscriber } from './workers/wakeup-subscriber.js';
 import { startServer } from './server.js';
 
 async function ensureStreamAndGroup(): Promise<void> {
@@ -97,6 +98,15 @@ async function main(): Promise<void> {
     logger,
   });
 
+  // Wakeup subscriber — enqueue (n8n) publica a campaigns:enqueued; acá lo
+  // consumimos y XADDeamos los pendings frescos al stream → envío inmediato
+  // (sin esperar el recovery net de 5 min). Bug funcional fix 2026-06-01.
+  const wakeupHandle = startWakeupSubscriber({
+    rawRedis,
+    sql,
+    logger,
+  });
+
   // 3. HTTP server (healthcheck + Bull Board).
   const server = await startServer({
     bullmqConnection,
@@ -119,6 +129,7 @@ async function main(): Promise<void> {
       clearInterval(recoveryHandle);
       clearInterval(metricsFlushHandle);
       clearInterval(crmWebhookEmitterHandle);
+      await wakeupHandle.stop();
       await dispatcherHandle.stop();
       await server.close();
       await rawRedis.quit();

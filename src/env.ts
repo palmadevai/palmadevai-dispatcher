@@ -26,6 +26,10 @@ const schema = z.object({
   REDIS_DB: z.coerce.number().int().default(0),
   CAMPAIGNS_STREAM: z.string().default('campaigns:stream'),
   CAMPAIGNS_GROUP: z.string().default('dispatchers'),
+  // Canal pub/sub donde el workflow n8n "Campaigns Enqueue" publica el wakeup tras
+  // insertar deliveries (el nodo Redis de n8n no puede XADD). El subscriber del
+  // dispatcher escucha acá y XADDea los pendings frescos al stream → envío inmediato.
+  CAMPAIGNS_WAKEUP_CHANNEL: z.string().default('campaigns:enqueued'),
 
   // ── Postgres ─────────────────────────────────────────────────────────────
   APPDB_HOST: z.string().default('postgresql'),
