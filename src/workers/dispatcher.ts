@@ -41,6 +41,8 @@ import {
   markDeliverySuppressed,
   markDeliveryTerminal,
   markDeliveryUndelivered,
+  markCampaignSending,
+  maybeMarkCampaignDone,
 } from '../dispatch/delivery-update.js';
 import {
   assertProviderAvailable,
@@ -280,6 +282,9 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     // Wrapped in a single-prop object so TS doesn't narrow away the assignment
     // that happens inside the async TX closure.
     const carryBox: { value: Carry | null } = { value: null };
+    // Campaign id capturado dentro de la TX para el check de lifecycle post-TX
+    // (sending→done cuando no quedan pending). Bug B1.
+    const campaignBox: { value: string | null } = { value: null };
 
     try {
       await sql.begin(async (tx: TransactionSql) => {
@@ -318,6 +323,12 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         if (!ctx) {
           throw new Error(`Delivery ${deliveryId} context not resolvable`);
         }
+
+        // 2a. Lifecycle: la primera delivery procesada sube la campaña
+        // queued→sending (idempotente; bug B1). Sin esto la campaña quedaba
+        // en 'queued' para siempre y los WHERE status='sending' nunca matchean.
+        campaignBox.value = ctx.delivery.campaign_id;
+        await markCampaignSending(tx, ctx.delivery.campaign_id);
 
         // 2b. Channel guard (Fase 5 PR0 — canal-agnostic provider abstraction).
         // The campaign's channel must have a registered provider. If a campaign
@@ -865,6 +876,25 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             'retry ZADD failed',
           );
         }
+      }
+    }
+
+    // Lifecycle: cerrar sending→done si no quedan deliveries pending de la
+    // campaña (bug B1). Seguro llamarlo siempre: el guard NOT EXISTS pending del
+    // helper NO cierra si esta delivery quedó pending por retry (sigue contando
+    // como pending). Para el caso terminal (sent/failed/DLQ) ya no es pending y
+    // si era la última → done. Idempotente + kind='one_off' gated en el helper.
+    if (campaignBox.value) {
+      try {
+        const done = await maybeMarkCampaignDone(sql, campaignBox.value);
+        if (done) {
+          logger.info({ campaignId: campaignBox.value }, 'campaign marked done (no pending left)');
+        }
+      } catch (e) {
+        logger.error(
+          { err: (e as Error).message, campaignId: campaignBox.value },
+          'maybeMarkCampaignDone failed (non-fatal)',
+        );
       }
     }
 
