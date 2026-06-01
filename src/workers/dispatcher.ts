@@ -773,7 +773,11 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         // tirábamos error rolleaba la TX y retry_count nunca incrementaba
         // (bug 2026-05-28: infinite loop con attemptIndex=0 forever).
         // Ahora COMMIT-eamos el bump, post-TX decide retry vs DLQ.
-        await bumpRetryCount(tx, deliveryId, queuedAt);
+        await bumpRetryCount(tx, deliveryId, queuedAt, {
+          error_code: result.error_code,
+          error_message: result.error_message,
+          failure_reason: classification.category,
+        });
         carryBox.value = {
           kind: 'retry',
           attemptIndex,

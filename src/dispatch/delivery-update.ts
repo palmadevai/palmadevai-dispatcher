@@ -101,7 +101,10 @@ export async function markDeliveryAccepted(
       status = 'accepted',
       accepted_at = now(),
       meta_message_id = ${accepted.message_id},
-      wa_phone_number_id = ${accepted.wa_phone_number_id ?? null}
+      wa_phone_number_id = ${accepted.wa_phone_number_id ?? null},
+      -- Limpiar el error del último intento fallido (si reintentó y ahora salió OK)
+      -- para no mostrar un motivo stale sobre un delivery aceptado.
+      error_code = NULL, error_message = NULL, failure_reason = NULL
     WHERE id = ${deliveryId}
       AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
                         AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
@@ -109,16 +112,24 @@ export async function markDeliveryAccepted(
 }
 
 /**
- * Bump del retry_count tras una falla retriable. NO cambia status — el
- * delivery sigue `pending`, la próxima retry ZSET pop lo procesa de nuevo.
+ * Bump del retry_count tras una falla retriable. NO cambia status — el delivery
+ * sigue `pending`, la próxima retry ZSET pop lo procesa de nuevo. Persiste el
+ * último error (code/message/reason) para que la UI muestre POR QUÉ está pending
+ * (reintentando) en vez de un pending mudo. Se limpia en markDeliveryAccepted si
+ * el retry termina OK.
  */
 export async function bumpRetryCount(
   sql: SqlOrTx,
   deliveryId: number,
   queuedAt: Date,
+  lastError?: { error_code?: string; error_message?: string; failure_reason?: string },
 ): Promise<void> {
   await sql`
-    UPDATE bot.campaign_deliveries SET retry_count = retry_count + 1
+    UPDATE bot.campaign_deliveries SET
+      retry_count = retry_count + 1,
+      error_code = ${lastError?.error_code ?? null},
+      error_message = ${lastError?.error_message ?? null},
+      failure_reason = ${lastError?.failure_reason ?? null}
     WHERE id = ${deliveryId}
       AND queued_at BETWEEN ${queuedAt}::timestamptz - INTERVAL '1 millisecond'
                         AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
