@@ -149,3 +149,51 @@ export async function markDeliveryUndelivered(
                         AND ${queuedAt}::timestamptz + INTERVAL '1 millisecond'
   `;
 }
+
+/**
+ * Lifecycle de la campaña: queued → sending → done.
+ *
+ * El enqueue deja la campaña en `queued` (estado canónico que consume el
+ * scheduler). Nadie la avanzaba a `sending`/`done` → el funnel del dashboard
+ * quedaba siempre en queued y los WHERE status='sending' del dispatcher eran
+ * código muerto (bug B1, detectado en smoke E2E 2026-05-31).
+ *
+ * - `markCampaignSending`: al empezar a procesar la primera delivery, sube
+ *   queued→sending (idempotente: solo si está queued; no toca paused/done/etc).
+ * - `maybeMarkCampaignDone`: tras un terminal de delivery, si NO quedan
+ *   deliveries 'pending' de esa campaña, baja sending→done. Idempotente.
+ *
+ * Ambas son no-op para drip/trigger_based-style si la campaña no está en el
+ * estado esperado (el WHERE de status las protege).
+ */
+export async function markCampaignSending(
+  sql: SqlOrTx,
+  campaignId: string,
+): Promise<void> {
+  await sql`
+    UPDATE bot.campaigns
+       SET status = 'sending'
+     WHERE id = ${campaignId} AND status = 'queued'
+  `;
+}
+
+export async function maybeMarkCampaignDone(
+  sql: SqlOrTx,
+  campaignId: string,
+): Promise<boolean> {
+  // Solo cierra one_off/recurring-children: las campañas drip/trigger_based
+  // siguen enrolando (no se cierran por "no pending"). Guard: kind='one_off'.
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE bot.campaigns c
+       SET status = 'done', done_at = now()
+     WHERE c.id = ${campaignId}
+       AND c.status = 'sending'
+       AND c.kind = 'one_off'
+       AND NOT EXISTS (
+         SELECT 1 FROM bot.campaign_deliveries d
+          WHERE d.campaign_id = c.id AND d.status = 'pending'
+       )
+    RETURNING c.id::text AS id
+  `;
+  return rows.length > 0;
+}
