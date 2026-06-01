@@ -26,6 +26,40 @@ export interface PickedPhone {
   daily_cap_remaining: number;
 }
 
+export interface PinnedWaEndpoint {
+  id: string;
+  phone_number_id: string;
+  access_token: string | null;
+}
+
+/**
+ * Fase 9 — resuelve el endpoint WhatsApp FIJADO por la campaña
+ * (`campaigns.outbound_endpoint_id`). A diferencia de pickPhoneForContact, NO
+ * hay sticky, ni rotación, ni daily-cap gating: el operador eligió explícitamente
+ * este número como emisor (típicamente para mandar desde el WABA correcto en un
+ * setup multi-WABA). Devuelve el `access_token` propio del endpoint cuando existe
+ * (multi-app / multi-WABA); NULL → el caller usa el bearer global del .env.
+ *
+ * Devuelve null si el endpoint no existe (no debería: la FK es ON DELETE SET NULL),
+ * no es WhatsApp, o está 'disabled' → el caller cae al auto-pick legacy.
+ */
+export async function resolvePinnedWaEndpoint(
+  sql: SqlOrTx,
+  endpointId: string,
+): Promise<PinnedWaEndpoint | null> {
+  const rows = await sql<
+    Array<{ id: string; phone_number_id: string; access_token: string | null; status: string }>
+  >`
+    SELECT id, endpoint_id AS phone_number_id, access_token, status
+    FROM bot.outbound_endpoints
+    WHERE id = ${endpointId} AND channel = 'whatsapp'
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row || row.status === 'disabled') return null;
+  return { id: row.id, phone_number_id: row.phone_number_id, access_token: row.access_token };
+}
+
 interface PhoneRow {
   id: string;
   phone_number_id: string;

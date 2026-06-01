@@ -59,6 +59,8 @@ export interface DeliveryContext {
     ai_personalization_config: AiPersonalizationConfig | null;
     // Fase 7 item 4 — multi-language routing
     language_routing: LanguageRouting | null;
+    // Fase 9 — número emisor elegido (endpoint). NULL = auto-pick legacy/warming.
+    outbound_endpoint_id: string | null;
   };
 }
 
@@ -115,6 +117,7 @@ interface JoinedRow {
   cm_ai_enabled: boolean;
   cm_ai_config: AiPersonalizationConfig | null;
   cm_language_routing: LanguageRouting | null;
+  cm_outbound_endpoint_id: string | null;
 }
 
 export async function resolveDeliveryContext(
@@ -168,7 +171,8 @@ export async function resolveDeliveryContext(
       COALESCE(cm.ai_personalization_enabled, false)
                                          AS cm_ai_enabled,
       cm.ai_personalization_config       AS cm_ai_config,
-      cm.language_routing                AS cm_language_routing
+      cm.language_routing                AS cm_language_routing,
+      cm.outbound_endpoint_id::text      AS cm_outbound_endpoint_id
     FROM bot.campaign_deliveries d
     JOIN bot.audience_contacts ac ON ac.id = d.audience_contact_id
     JOIN bot.campaigns cm ON cm.id = d.campaign_id
@@ -278,6 +282,7 @@ export async function resolveDeliveryContext(
       ai_personalization_enabled: r.cm_ai_enabled,
       ai_personalization_config: r.cm_ai_config,
       language_routing: r.cm_language_routing,
+      outbound_endpoint_id: r.cm_outbound_endpoint_id,
     },
   };
 }
