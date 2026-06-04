@@ -1,0 +1,51 @@
+name: Build & Push Dispatcher Image (GHCR)
+
+# Modelo pull: el build pasa acá (runner) y la imagen se publica en GHCR.
+# El VPS la BAJA (docker pull, outbound) — no requiere inbound SSH desde GitHub,
+# que la red de Hostinger filtra (runners Azure, IPs rotativas). Reemplaza el
+# viejo deploy.yml push-SSH (que ahora corre solo on-demand como fallback).
+#
+# Imagen: ghcr.io/palmadevai/<repo>:latest + :<sha>  (privada). Sin build-args:
+# es un worker Node/TS, toda la config se resuelve en runtime (env/Postgres).
+# Doc canónico: handbook/docs/technical-gitops-pull-deploy.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.img.outputs.name }}:latest
+            ghcr.io/${{ steps.img.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

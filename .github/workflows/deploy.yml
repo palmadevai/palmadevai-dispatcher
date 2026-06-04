@@ -10,9 +10,12 @@ name: Deploy Dispatcher
 # - REPO_URL no necesario: usamos github.token + repo HTTPS authed via
 #   x-access-token (mismo patrón que cockpit/chat-site).
 
+# DESACTIVADO el auto-trigger on:push — el deploy migró a build-image.yml
+# (build → push GHCR) + pull VPS-side (deploy-pull.sh + systemd timer). El VPS
+# no acepta inbound SSH detrás de la red Hostinger que filtra runners GitHub
+# (Azure). Este queda como fallback manual (workflow_dispatch) para VPS que sí
+# aceptan inbound SSH. Doc: handbook/docs/technical-gitops-pull-deploy.md.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
