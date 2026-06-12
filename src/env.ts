@@ -109,6 +109,10 @@ const schema = z.object({
   // Public unsubscribe link prefix injected in every email footer. Final URL is
   // `<base>/u/<audience_contact_id>`. Default derives from DOMAIN at boot.
   CAMPAIGNS_UNSUBSCRIBE_BASE_URL: z.string().optional(),
+  // Email del operador/dueño para alertas operativas (ej. auto-pause por calidad
+  // degradada). Si está vacío, la alerta solo va al log (no rompe nada). Se manda
+  // por el mismo Resend de las campañas email (requiere RESEND_API_KEY).
+  CAMPAIGNS_ALERT_EMAIL: z.string().optional(),
 
   // ── CRM webhooks salientes (Fase 6 Item 1) ───────────────────────────────
   // Worker crm-webhook-emitter polea bot.crm_webhook_deliveries cada

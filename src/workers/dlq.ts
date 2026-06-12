@@ -16,10 +16,17 @@
 import type { Sql } from 'postgres';
 import type { Logger } from '../lib/logger.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
+import { env } from '../env.js';
+import { sendEmail } from '../providers/email.js';
 
 const AUTO_PAUSE_RATIO = 0.2; // 20 %
 const AUTO_PAUSE_WINDOW_MIN = 1; // last 1 minute of attempts
 const AUTO_PAUSE_MIN_SAMPLE = 10; // require at least 10 attempts before triggering
+
+// Escape mínimo para interpolar el nombre de campaña (operator-set) en el HTML
+// del email de alerta.
+const escapeHtml = (s: string): string =>
+  s.replace(/[<>&]/g, (c) => (c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;'));
 
 export interface DLQEntry {
   deliveryId: number;
@@ -105,7 +112,7 @@ export async function moveToDLQ(
       stats.recent_total >= AUTO_PAUSE_MIN_SAMPLE &&
       stats.recent_failures / Math.max(stats.recent_total, 1) >= AUTO_PAUSE_RATIO
     ) {
-      const pauseResult = await sql<Array<{ id: string }>>`
+      const pauseResult = await sql<Array<{ id: string; name: string | null }>>`
         UPDATE bot.campaigns
         SET status = 'paused',
             paused_at = now(),
@@ -113,7 +120,7 @@ export async function moveToDLQ(
             paused_by = 'dispatcher_auto'
         WHERE id = ${entry.campaignId}
           AND status = 'sending'
-        RETURNING id::text AS id
+        RETURNING id::text AS id, name
       `;
       if (pauseResult.length > 0) {
         logger.warn(
@@ -124,6 +131,41 @@ export async function moveToDLQ(
           },
           'auto-paused campaign — DLQ rate exceeded threshold',
         );
+        // Aviso al operador por email (Resend), best-effort: que NO se entere por
+        // sorpresa al entrar al cockpit. Antes esto era solo un logger.warn que
+        // nadie ve (y el POST a /api/notifications apuntaba a un endpoint
+        // inexistente). Si falta CAMPAIGNS_ALERT_EMAIL o RESEND_API_KEY, no-op.
+        if (env.CAMPAIGNS_ALERT_EMAIL && env.RESEND_API_KEY) {
+          const name = pauseResult[0].name ?? entry.campaignId;
+          const ratePct = Math.round(
+            (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
+          );
+          const link = env.COCKPIT_URL
+            ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
+            : '';
+          void sendEmail({
+            from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+            to: env.CAMPAIGNS_ALERT_EMAIL,
+            subject: `Campaña pausada automáticamente: ${name}`,
+            html:
+              `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
+              `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
+              `(${stats.recent_failures}/${stats.recent_total}).</p>` +
+              `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
+              (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
+            text:
+              `Campaña pausada automáticamente: ${name}\n` +
+              `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
+              `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
+              (link ? `\n${link}` : ''),
+            biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}`,
+          }).catch((err: unknown) =>
+            logger.error(
+              { err: (err as Error).message, campaign_id: entry.campaignId },
+              'auto-pause email notify failed',
+            ),
+          );
+        }
       }
     }
   } catch (err) {
