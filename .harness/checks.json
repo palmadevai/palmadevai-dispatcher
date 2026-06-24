@@ -1,0 +1,7 @@
+{
+  "_doc": "Checks de calidad de palmadevai-campaigns-dispatcher (servicio Fastify/TS, no Next). Lo lee test_agent.py (handbook/sessions) en el funnel del orchestrator para gatear la validacion ANTES de la aceptacion funcional del humano. Usa el script 'typecheck' del repo (tsc --noEmit). El repo aun no tiene suite de tests ni lint configurado; agregar 'test' y 'lint' (typescript-eslint) cuando esten disponibles. `npm ci` instala en el worktree del orchestrator. Ref: handbook/docs/technical-test-quality-agent.md.",
+  "profile": "palmadevai-campaigns-dispatcher",
+  "checks": [
+    {"name": "typecheck", "cmd": "npm ci && npm run typecheck", "required": true}
+  ]
+}
