@@ -72,7 +72,9 @@ in-memory counter does not survive).
 request/response payloads + classified `error_category`. Then it computes a
 sliding 1-min DLQ-rate per campaign: if `>= 20% of recent attempts in same
 campaign`, auto-pause the campaign with `pause_reason='auto_quality_degraded'`.
-Operator triages from `/campaigns/dlq` (cockpit).
+Operator triages from `/dlq` in campaign-site (`campaign.<DOMAIN>/dlq`). The
+campaigns UI was cut over from cockpit to `palmadevai-campaign-site` (S10,
+2026-05-30); cockpit `/campaigns/*` 308-redirects there.
 
 ## Bull Board impact
 
