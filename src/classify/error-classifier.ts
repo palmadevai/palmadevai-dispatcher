@@ -15,7 +15,7 @@
  *   - http_status 401/403 → auth_failed.
  *   - http_status >= 500 with retries exhausted → meta_5xx_exhausted.
  *   - http_status 4xx with retries exhausted → meta_template_rejected
- *     (generic permanent-ish bucket; operator triages in /campaigns/dlq).
+ *     (generic permanent-ish bucket; operator triages in campaign-site `/dlq`).
  *   - else → unknown.
  *
  * The classifier is invoked ONLY when sendWhatsApp returned ok=false (i.e.
