@@ -74,6 +74,7 @@ function renderPrompt(
 
 async function callOpenAi(
   apiKey: string,
+  baseUrl: string,
   prompt: string,
   model: string,
   temperature: number,
@@ -83,7 +84,7 @@ async function callOpenAi(
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -130,6 +131,7 @@ export async function resolveAiBindings(
     logger.warn({ campaign_id: campaign.id }, 'ai_personalization_enabled=true but OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI is empty');
     return bindings;
   }
+  const baseUrl = env.OPENAI_BASE_URL__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI || 'https://api.openai.com/v1';
 
   const model = config.model ?? env.AI_PERSONALIZE_DEFAULT_MODEL;
   const temperature = config.temperature ?? env.AI_PERSONALIZE_DEFAULT_TEMPERATURE;
@@ -161,7 +163,7 @@ export async function resolveAiBindings(
 
     // LLM call
     try {
-      const res = await callOpenAi(apiKey, prompt, model, temperature, maxTokens, env.AI_PERSONALIZE_TIMEOUT_MS);
+      const res = await callOpenAi(apiKey, baseUrl, prompt, model, temperature, maxTokens, env.AI_PERSONALIZE_TIMEOUT_MS);
       const bodyText = res.choices[0]?.message?.content?.trim();
       if (!bodyText) {
         logger.warn({ campaign_id: campaign.id, contact_id: contact.id, varKey }, 'OpenAI returned empty content');
