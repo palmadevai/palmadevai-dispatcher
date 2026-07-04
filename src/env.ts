@@ -91,6 +91,10 @@ const schema = z.object({
   // Convención per-node Fase 2e:
   // OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI
   OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI: z.string().optional(),
+  // Cascade transport-only (F1 LLM gateway, handbook analysis-llm-gateway-byok.md §5.2):
+  // si está seteada, apunta al proxy LiteLLM (http://<slug>_litellm:4000/v1) y la
+  // API key de arriba pasa a ser la virtual key del gateway. Vacía → api.openai.com directo.
+  OPENAI_BASE_URL__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI: z.string().optional(),
   AI_PERSONALIZE_DEFAULT_MODEL: z.string().default('gpt-5.4-mini'),
   AI_PERSONALIZE_DEFAULT_MAX_TOKENS: z.coerce.number().int().min(50).max(2000).default(200),
   AI_PERSONALIZE_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.7),
