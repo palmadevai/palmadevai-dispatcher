@@ -171,20 +171,26 @@ export async function markDeliveryUndelivered(
  *
  * - `markCampaignSending`: al empezar a procesar la primera delivery, sube
  *   queued→sending (idempotente: solo si está queued; no toca paused/done/etc).
+ *   SOLO one_off/recurring: trigger_based y drip NO se mueven a 'sending' —
+ *   deben quedar en 'queued' porque el scheduler solo re-evalúa status='queued';
+ *   si pasan a 'sending' el motor deja de enrolar y dispara una sola vez
+ *   (bug del smoke funcional P0#3, 2026-07-10).
  * - `maybeMarkCampaignDone`: tras un terminal de delivery, si NO quedan
  *   deliveries 'pending' de esa campaña, baja sending→done. Idempotente.
- *
- * Ambas son no-op para drip/trigger_based-style si la campaña no está en el
- * estado esperado (el WHERE de status las protege).
+ *   SOLO one_off (guard kind): drip/trigger_based siguen enrolando, no se cierran.
  */
 export async function markCampaignSending(
   sql: SqlOrTx,
   campaignId: string,
 ): Promise<void> {
+  // Guard de kind simétrico con maybeMarkCampaignDone: trigger_based/drip son
+  // continuas y viven en 'queued' (el scheduler las consume ahí). Solo las
+  // batch-style (one_off/recurring-children) transicionan a 'sending'.
   await sql`
     UPDATE bot.campaigns
        SET status = 'sending'
      WHERE id = ${campaignId} AND status = 'queued'
+       AND kind NOT IN ('trigger_based', 'drip')
   `;
 }
 
