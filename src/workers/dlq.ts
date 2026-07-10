@@ -134,37 +134,48 @@ export async function moveToDLQ(
         // Aviso al operador por email (Resend), best-effort: que NO se entere por
         // sorpresa al entrar al cockpit. Antes esto era solo un logger.warn que
         // nadie ve (y el POST a /api/notifications apuntaba a un endpoint
-        // inexistente). Si falta CAMPAIGNS_ALERT_EMAIL o RESEND_API_KEY, no-op.
-        if (env.CAMPAIGNS_ALERT_EMAIL && env.RESEND_API_KEY) {
-          const name = pauseResult[0].name ?? entry.campaignId;
-          const ratePct = Math.round(
-            (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
-          );
-          const link = env.COCKPIT_URL
-            ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
-            : '';
-          void sendEmail({
-            from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
-            to: env.CAMPAIGNS_ALERT_EMAIL,
-            subject: `Campaña pausada automáticamente: ${name}`,
-            html:
-              `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
-              `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
-              `(${stats.recent_failures}/${stats.recent_total}).</p>` +
-              `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
-              (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
-            text:
-              `Campaña pausada automáticamente: ${name}\n` +
-              `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
-              `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
-              (link ? `\n${link}` : ''),
-            biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}`,
-          }).catch((err: unknown) =>
-            logger.error(
-              { err: (err as Error).message, campaign_id: entry.campaignId },
-              'auto-pause email notify failed',
-            ),
-          );
+        // inexistente). El destinatario vive en bot.config['branding'].admin_email
+        // (config de negocio no-secreta, no env var — criterio secreto-vs-config
+        // del handbook, 2026-06-16; mismo patrón que llm-gateway-alerts /
+        // facturacion-abonos-cron). Si falta admin_email o RESEND_API_KEY, no-op.
+        if (env.RESEND_API_KEY) {
+          const [brandingRow] = await sql<Array<{ admin_email: string | null }>>`
+            SELECT value->>'admin_email' AS admin_email
+            FROM bot.config
+            WHERE key = 'branding'
+          `;
+          const alertEmail = brandingRow?.admin_email;
+          if (alertEmail) {
+            const name = pauseResult[0].name ?? entry.campaignId;
+            const ratePct = Math.round(
+              (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
+            );
+            const link = env.COCKPIT_URL
+              ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
+              : '';
+            void sendEmail({
+              from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+              to: alertEmail,
+              subject: `Campaña pausada automáticamente: ${name}`,
+              html:
+                `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
+                `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
+                `(${stats.recent_failures}/${stats.recent_total}).</p>` +
+                `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
+                (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
+              text:
+                `Campaña pausada automáticamente: ${name}\n` +
+                `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
+                `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
+                (link ? `\n${link}` : ''),
+              biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}`,
+            }).catch((err: unknown) =>
+              logger.error(
+                { err: (err as Error).message, campaign_id: entry.campaignId },
+                'auto-pause email notify failed',
+              ),
+            );
+          }
         }
       }
     }
