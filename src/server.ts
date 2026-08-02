@@ -8,6 +8,9 @@
  *   POST /send          — Messaging Service H2.1 (bajo volumen, sincrónico).
  *                         Auth: Bearer DISPATCHER_SEND_BEARER. Ver
  *                         `transports/http/send-route.ts`.
+ *   /management/*       — Messaging Service F3 (templates/endpoints/quality).
+ *                         Mismo bearer que /send. Ver
+ *                         `transports/http/management-routes.ts`.
  *
  * Cockpit consume /admin/queues vía reverse-proxy interno (red Docker `net`
  * compartida): https://cockpit.<DOMAIN>/admin/queues → http://dispatcher:8080/admin/queues
@@ -24,6 +27,8 @@ import type { Logger } from './lib/logger.js';
 import type { SqlClient } from './lib/postgres.js';
 import type { MetricsCollector } from './observability/metrics-collector.js';
 import { registerSendRoute } from './transports/http/send-route.js';
+import { registerManagementRoutes } from './transports/http/management-routes.js';
+import type { ManagementDeps } from './core/management.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
@@ -31,6 +36,8 @@ export interface ServerDeps {
   sql: SqlClient;
   logger: Logger;
   metricsCollector: MetricsCollector;
+  /** F3 — deps del core de management (Graph adapter + email inyectados). */
+  managementCore: ManagementDeps;
 }
 
 const HEALTHCHECK_PING_TIMEOUT_MS = 2000;
@@ -66,7 +73,7 @@ async function pingPostgres(sql: SqlClient): Promise<boolean> {
 const startTimestamp = Date.now();
 
 export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
-  const { logger, bullmqConnection, rawRedis, sql, metricsCollector } = deps;
+  const { logger, bullmqConnection, rawRedis, sql, metricsCollector, managementCore } = deps;
 
   // Fastify 5 acepta un logger instance pre-built via la opción `loggerInstance`.
   // El cast a `any` evita el generic mismatch entre nuestros logger types y
@@ -109,6 +116,12 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     staffAllowlist: env.STAFF_NOTIFY_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean),
     defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
     defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+  });
+
+  // ── /management/* (Messaging Service F3) ────────────────────────────────
+  registerManagementRoutes(app, {
+    core: managementCore,
+    sendBearer: env.DISPATCHER_SEND_BEARER,
   });
 
   // ── /admin/queues (Bull Board) ──────────────────────────────────────────

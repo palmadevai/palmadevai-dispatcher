@@ -132,6 +132,12 @@ const schema = z.object({
   // means nothing is allowlisted yet: every notification send 403s until an
   // operator configures this (fail-closed, not fail-open).
   STAFF_NOTIFY_ALLOWLIST: z.string().default(''),
+
+  // ── Messaging Service — management plane (Fase 3, H3.1) ──────────────────
+  // Recurring template mirror interval (replaces the retired n8n
+  // `campaigns-template-sync` daily cron). 0 disables the worker; on-demand
+  // POST /management/templates/sync stays available either way.
+  DISPATCHER_TEMPLATE_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(0).default(360),
 });
 
 const parsed = schema.safeParse(process.env);

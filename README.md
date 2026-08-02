@@ -12,7 +12,16 @@ de `palmadevai-apps` v0.4.0. Empaqueta:
 - **metrics-flush** — cron 30s, INSERT a `bot.dispatcher_metrics` con
   queue depth + latencies p50/p95/p99 + error ratio (ADR-012).
 - **HTTP server** (Fastify) — `GET /health` (Docker healthcheck) + Bull Board
-  UI en `/admin/queues` reverse-proxied desde el cockpit.
+  UI en `/admin/queues` reverse-proxied desde el cockpit + Messaging Service:
+  `POST /send` (H2.1, bearer `DISPATCHER_SEND_BEARER`) y `/management/*`
+  (F3 H3.1/H3.2 — templates sync/create/delete, endpoints sync, quality
+  refresh; mismo bearer, red docker interna, sin ruta Traefik).
+- **template-sync worker** — mirror recurrente de templates Meta →
+  `bot.message_templates` (default cada 6h, `DISPATCHER_TEMPLATE_SYNC_INTERVAL_MINUTES`),
+  con auto-pause de campañas si un template pasa a rejected/disabled + email
+  al operador (`bot.config['branding'].admin_email`). Reemplaza el cron n8n
+  `campaigns-template-sync` (retirado en F3/H3.4 de
+  `palmadevai-apps:features/messaging/doc/analysis-messaging-service.md`).
 
 > **Estado actual: SKELETON / Fase 1 boot scaffold (F1.2.a).**
 >
