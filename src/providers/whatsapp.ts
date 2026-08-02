@@ -36,15 +36,30 @@ import type { ProviderSendResult } from './types.js';
 export interface WhatsAppSendInput {
   phone_number_id: string;
   to: string;
-  template_name: string;
-  template_lang: string;
-  components: unknown[];
   biz_opaque_callback_data: string;
   /**
    * Fase 9 — token del endpoint emisor fijado (multi-WABA / multi-app). Si se
    * omite, se usa el bearer global del .env (caso single-app / warming pool).
    */
   access_token?: string;
+  /**
+   * H2.1 (messaging-service `POST /send`) — discriminant. Optional +
+   * defaults to the template wire shape so every existing call site (the
+   * campaign worker via `prepareWhatsApp`, which never sets this field)
+   * keeps compiling and behaving unchanged. Only `/send` sets `type: 'text'`.
+   */
+  type?: 'template' | 'text';
+  // ── type: 'template' (default) ──────────────────────────────────────────
+  template_name?: string;
+  template_lang?: string;
+  components?: unknown[];
+  // ── type: 'text' ─────────────────────────────────────────────────────────
+  // v1 limitation (H2.1): the Meta 24h customer-service window is NOT
+  // validated here — Meta rejects out-of-window text sends on its own and we
+  // surface that error transparently (error_code/message from the 4xx body)
+  // rather than pre-checking `bot.campaign_deliveries`/Chatwoot conversation
+  // state for a window that only applies to this one send path.
+  body?: string;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -70,17 +85,26 @@ export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSe
     `https://graph.facebook.com/${env.META_GRAPH_API_VERSION}/` +
     `${encodeURIComponent(input.phone_number_id)}/messages`;
 
-  const body = {
-    messaging_product: 'whatsapp',
-    to: input.to,
-    type: 'template',
-    template: {
-      name: input.template_name,
-      language: { code: input.template_lang },
-      components: input.components,
-    },
-    biz_opaque_callback_data: input.biz_opaque_callback_data,
-  };
+  const body =
+    input.type === 'text'
+      ? {
+          messaging_product: 'whatsapp',
+          to: input.to,
+          type: 'text',
+          text: { body: input.body ?? '' },
+          biz_opaque_callback_data: input.biz_opaque_callback_data,
+        }
+      : {
+          messaging_product: 'whatsapp',
+          to: input.to,
+          type: 'template',
+          template: {
+            name: input.template_name,
+            language: { code: input.template_lang },
+            components: input.components,
+          },
+          biz_opaque_callback_data: input.biz_opaque_callback_data,
+        };
 
   let res;
   try {

@@ -113,6 +113,7 @@ async function main(): Promise<void> {
     rawRedis,
     sql,
     logger,
+    metricsCollector,
   });
 
   // bullmqConnection is still passed to the HTTP server because Bull Board
