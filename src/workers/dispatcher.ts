@@ -18,13 +18,15 @@
  * Per spec §5.3 the per-job transaction:
  *   1. BEGIN
  *   2. SELECT FOR UPDATE SKIP LOCKED → bail if locked/non-pending
- *   3. pickPhoneForContact → pause campaign if null
- *   4. resolveTemplateComponents
- *   5. sendWhatsApp(biz_opaque_callback_data = client_ref)
- *   6. classify result → UPDATE status / throw retry / DLQ terminal
- *   7. UPDATE outbound_endpoints.sent_today++ (WA only — email/FB/IG skip)
- *   8. PUBLISH campaign:<id> for SSE (ADR-005)
- *   9. COMMIT, XACK stream_id
+ *   3. getProviderForChannel(channel).prepare(tx, ctx, aiBindings) — validates
+ *      destination, picks endpoint (pause campaign if none), builds payload.
+ *      Channel-specific; see `ports/channel-provider.ts` (H1.1 ports & adapters
+ *      refactor — was a ~285-line if/else branch here before).
+ *   4. provider.send(sendInput) (biz_opaque_callback_data = client_ref)
+ *   5. provider.classify(result) → UPDATE status / throw retry / DLQ terminal
+ *   6. UPDATE outbound_endpoints.sent_today++ (WA/FB/IG — email has no endpoint row)
+ *   7. PUBLISH campaign:<id> for SSE (ADR-005)
+ *   8. COMMIT, XACK stream_id
  */
 import type { Redis } from 'ioredis';
 import type { Sql, TransactionSql } from 'postgres';
@@ -32,9 +34,7 @@ import type { Logger } from '../lib/logger.js';
 import type { MetricsCollector } from '../observability/metrics-collector.js';
 import { env } from '../env.js';
 import { createRedisRateLimiter, type RateLimiter } from '../lib/rate-limiter.js';
-import { resolveDeliveryContext, resolveTemplateComponents } from '../dispatch/audience-resolver.js';
-import { pickPhoneForContact, resolvePinnedWaEndpoint } from '../dispatch/pick-phone.js';
-import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
+import { resolveDeliveryContext } from '../dispatch/audience-resolver.js';
 import {
   bumpRetryCount,
   markDeliveryAccepted,
@@ -44,20 +44,9 @@ import {
   markCampaignSending,
   maybeMarkCampaignDone,
 } from '../dispatch/delivery-update.js';
-import {
-  assertProviderAvailable,
-  ChannelNotImplementedError,
-  renderEmailBody,
-  sendEmail,
-  sendFacebookMessenger,
-  sendInstagramDm,
-  sendWhatsApp,
-  type ProviderSendResult,
-} from '../providers/index.js';
-import { classifyMetaError, type ErrorCategory } from '../classify/error-classifier.js';
-import { classifyResendError } from '../classify/email-error-classifier.js';
-import { classifyMessengerError } from '../classify/facebook-error-classifier.js';
-import { classifyInstagramError } from '../classify/instagram-error-classifier.js';
+import { assertProviderAvailable, ChannelNotImplementedError, type ProviderSendResult } from '../providers/index.js';
+import { getProviderForChannel } from '../ports/channel-provider.js';
+import type { ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
@@ -370,322 +359,68 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           ctx.template,
         );
 
-        // 4. Channel dispatch — assertProviderAvailable already validated.
-        let result: ProviderSendResult;
-        let waPhone: { id: string; phone_number_id: string } | null = null;
-        let fbEndpoint: { id: string; endpoint_id: string; access_token: string } | null = null;
-        let igEndpoint: { id: string; endpoint_id: string; access_token: string } | null = null;
+        // 4. Channel dispatch via ChannelProvider (H1.1 ports & adapters
+        // refactor — see providers/{whatsapp,email,facebook,instagram}.ts).
+        // assertProviderAvailable already validated the channel above (2b).
+        const provider = getProviderForChannel(ctx.delivery.channel);
+        const prep = await provider.prepare(tx, ctx, aiResolvedBindings);
 
-        if (ctx.delivery.channel === 'whatsapp') {
-          if (!ctx.contact.phone) {
-            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
-              error_code: 'no_phone',
-              error_message: 'audience contact has no phone for whatsapp channel',
-              failure_reason: 'phone_invalid',
-            });
-            return;
-          }
-
-          // Fase 9 — emisor: si la campaña fijó un endpoint (multi-WABA), usar ESE
-          // número + su token. Si no, auto-pick legacy (sticky + warming pool).
-          let phone: { id: string; phone_number_id: string } | null = null;
-          let waAccessToken: string | undefined;
-          if (ctx.campaign.outbound_endpoint_id) {
-            const pinned = await resolvePinnedWaEndpoint(tx, ctx.campaign.outbound_endpoint_id);
-            if (pinned) {
-              phone = { id: pinned.id, phone_number_id: pinned.phone_number_id };
-              waAccessToken = pinned.access_token ?? undefined;
-            } else {
-              logger.warn(
-                { deliveryId, campaign_id: ctx.delivery.campaign_id, outbound_endpoint_id: ctx.campaign.outbound_endpoint_id },
-                'pinned outbound_endpoint no usable (missing/disabled) — fallback a auto-pick',
-              );
-            }
-          }
-          if (!phone) {
-            phone = await pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
-          }
-          if (!phone) {
-            await tx`
-              UPDATE bot.campaigns
-              SET status = 'paused', paused_at = now(),
-                  pause_reason = 'auto_no_available_phones',
-                  paused_by = 'dispatcher_auto'
-              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
-            `;
-            throw new Error('NoAvailablePhonesError');
-          }
-          waPhone = phone;
-
-          const components = resolveTemplateComponents(
-            ctx.template,
-            ctx.contact,
-            ctx.delivery.template_variables,
-            aiResolvedBindings,
-          );
-
-          await acquireToken();
-          const startMs = Date.now();
-          try {
-            result = await sendWhatsApp({
-              phone_number_id: phone.phone_number_id,
-              to: ctx.contact.phone,
-              template_name: ctx.template.name,
-              template_lang: ctx.template.language,
-              components,
-              biz_opaque_callback_data: ctx.delivery.client_ref,
-              ...(waAccessToken ? { access_token: waAccessToken } : {}),
-            });
-          } catch (sendErr) {
-            const e = sendErr as Error & { http_status?: number; error_code?: string };
-            metricsCollector.recordError('network_or_5xx');
-            logger.error(
-              {
-                deliveryId,
-                campaign_id: ctx.delivery.campaign_id,
-                http_status: e.http_status,
-                error_code: e.error_code,
-                err: e.message,
-                to_last4: ctx.contact.phone?.slice(-4),
-                phone_number_id: phone.phone_number_id,
-              },
-              'sendWhatsApp threw — propagating to retry path',
-            );
-            throw sendErr;
-          }
-          metricsCollector.recordSend(Date.now() - startMs);
-        } else if (ctx.delivery.channel === 'email') {
-          if (!ctx.contact.email) {
-            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
-              error_code: 'no_email',
-              error_message: 'audience contact has no email for email channel',
-              failure_reason: 'email_invalid',
-            });
-            return;
-          }
-
-          const unsubBase = env.CAMPAIGNS_UNSUBSCRIBE_BASE_URL ?? `https://${env.DOMAIN}/unsubscribe`;
-          const rendered = renderEmailBody({
-            templateBody: ctx.template.body,
-            contactDisplayName: ctx.contact.display_name,
-            contactId: ctx.delivery.audience_contact_id,
-            perRowBindings: ctx.delivery.template_variables,
-            campaignBindings: ctx.campaign.template_variable_bindings,
-            aiResolvedBindings,
-            unsubscribeBaseUrl: unsubBase,
+        if (prep.kind === 'terminal') {
+          await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+            error_code: prep.error_code,
+            error_message: prep.error_message,
+            failure_reason: prep.failure_reason,
           });
-
-          const fromOverride =
-            typeof ctx.template.body.from === 'string'
-              ? (ctx.template.body.from as string)
-              : env.CAMPAIGNS_DEFAULT_FROM_EMAIL;
-
-          await acquireToken();
-          const startMs = Date.now();
-          try {
-            result = await sendEmail({
-              from: fromOverride,
-              to: ctx.contact.email,
-              subject: rendered.subject,
-              html: rendered.html,
-              ...(rendered.text ? { text: rendered.text } : {}),
-              biz_opaque_callback_data: ctx.delivery.client_ref,
-            });
-          } catch (sendErr) {
-            const e = sendErr as Error & { http_status?: number; error_code?: string };
-            metricsCollector.recordError('network_or_5xx');
-            logger.error(
-              {
-                deliveryId,
-                campaign_id: ctx.delivery.campaign_id,
-                http_status: e.http_status,
-                error_code: e.error_code,
-                err: e.message,
-                to_domain: ctx.contact.email.split('@')[1],
-              },
-              'sendEmail threw — propagating to retry path',
-            );
-            throw sendErr;
-          }
-          metricsCollector.recordSend(Date.now() - startMs);
-        } else if (ctx.delivery.channel === 'facebook') {
-          // PSID en contact.meta.facebook_psid — sin mig nueva todavía.
-          const psid = typeof ctx.contact.meta?.facebook_psid === 'string'
-            ? (ctx.contact.meta.facebook_psid as string)
-            : null;
-          if (!psid) {
-            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
-              error_code: 'no_psid',
-              error_message: 'audience contact has no facebook_psid in meta',
-              failure_reason: 'facebook_psid_invalid',
-            });
-            return;
-          }
-
-          const endpoint = await pickEndpointForChannel(tx, 'facebook');
-          if (!endpoint) {
-            await tx`
-              UPDATE bot.campaigns
-              SET status = 'paused', paused_at = now(),
-                  pause_reason = 'auto_no_available_phones',
-                  paused_by = 'dispatcher_auto'
-              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
-            `;
-            throw new Error('NoAvailableFacebookEndpointError');
-          }
-          fbEndpoint = endpoint;
-
-          // template.body shape (body_format='plain_text'):
-          //   { text: "Hola {{name}}", messaging_tag: "ACCOUNT_UPDATE" }
-          // Variable interpolation: same priority as email — per-row > AI > campaign > {{name}}.
-          const tplBody = ctx.template.body as Record<string, unknown>;
-          const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
-          const tag = typeof tplBody.messaging_tag === 'string'
-            ? (tplBody.messaging_tag as 'ACCOUNT_UPDATE' | 'POST_PURCHASE_UPDATE' | 'CONFIRMED_EVENT_UPDATE')
-            : undefined;
-          const vars: Record<string, string> = {};
-          if (ctx.contact.display_name) vars.name = ctx.contact.display_name;
-          for (const [k, v] of Object.entries(ctx.campaign.template_variable_bindings ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          for (const [k, v] of Object.entries(aiResolvedBindings ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          for (const [k, v] of Object.entries(ctx.delivery.template_variables ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          const messageText = rawText.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (m, k: string) => vars[k] ?? m);
-
-          await acquireToken();
-          const startMs = Date.now();
-          try {
-            result = await sendFacebookMessenger({
-              page_access_token: endpoint.access_token,
-              recipient_psid: psid,
-              message_text: messageText,
-              messaging_tag: tag,
-              biz_opaque_callback_data: ctx.delivery.client_ref,
-            });
-          } catch (sendErr) {
-            const e = sendErr as Error & { http_status?: number; error_code?: string };
-            metricsCollector.recordError('network_or_5xx');
-            logger.error(
-              {
-                deliveryId,
-                campaign_id: ctx.delivery.campaign_id,
-                http_status: e.http_status,
-                error_code: e.error_code,
-                err: e.message,
-                psid_last4: psid.slice(-4),
-                page_endpoint_id: endpoint.endpoint_id,
-              },
-              'sendFacebookMessenger threw — propagating to retry path',
-            );
-            throw sendErr;
-          }
-          metricsCollector.recordSend(Date.now() - startMs);
-        } else if (ctx.delivery.channel === 'instagram') {
-          // IGSID en contact.meta.instagram_user_id.
-          const igsid = typeof ctx.contact.meta?.instagram_user_id === 'string'
-            ? (ctx.contact.meta.instagram_user_id as string)
-            : null;
-          if (!igsid) {
-            await markDeliveryTerminal(tx, deliveryId, queuedAt, {
-              error_code: 'no_igsid',
-              error_message: 'audience contact has no instagram_user_id in meta',
-              failure_reason: 'instagram_igsid_invalid',
-            });
-            return;
-          }
-
-          const endpoint = await pickEndpointForChannel(tx, 'instagram');
-          if (!endpoint) {
-            await tx`
-              UPDATE bot.campaigns
-              SET status = 'paused', paused_at = now(),
-                  pause_reason = 'auto_no_available_phones',
-                  paused_by = 'dispatcher_auto'
-              WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
-            `;
-            throw new Error('NoAvailableInstagramEndpointError');
-          }
-          igEndpoint = endpoint;
-
-          // template.body shape (body_format='plain_text'):
-          //   { text: "Hola {{name}}", messaging_tag: "HUMAN_AGENT"? }
-          const tplBody = ctx.template.body as Record<string, unknown>;
-          const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
-          const tag = tplBody.messaging_tag === 'HUMAN_AGENT' ? 'HUMAN_AGENT' as const : undefined;
-          const vars: Record<string, string> = {};
-          if (ctx.contact.display_name) vars.name = ctx.contact.display_name;
-          for (const [k, v] of Object.entries(ctx.campaign.template_variable_bindings ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          for (const [k, v] of Object.entries(aiResolvedBindings ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          for (const [k, v] of Object.entries(ctx.delivery.template_variables ?? {})) {
-            if (v != null) vars[k] = String(v);
-          }
-          const messageText = rawText.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (m, k: string) => vars[k] ?? m);
-
-          await acquireToken();
-          const startMs = Date.now();
-          try {
-            result = await sendInstagramDm({
-              page_access_token: endpoint.access_token,
-              recipient_igsid: igsid,
-              message_text: messageText,
-              messaging_tag: tag,
-              biz_opaque_callback_data: ctx.delivery.client_ref,
-            });
-          } catch (sendErr) {
-            const e = sendErr as Error & { http_status?: number; error_code?: string };
-            metricsCollector.recordError('network_or_5xx');
-            logger.error(
-              {
-                deliveryId,
-                campaign_id: ctx.delivery.campaign_id,
-                http_status: e.http_status,
-                error_code: e.error_code,
-                err: e.message,
-                igsid_last4: igsid.slice(-4),
-                ig_endpoint_id: endpoint.endpoint_id,
-              },
-              'sendInstagramDm threw — propagating to retry path',
-            );
-            throw sendErr;
-          }
-          metricsCollector.recordSend(Date.now() - startMs);
-        } else {
-          // Defensive — assertProviderAvailable should have caught this.
-          throw new ChannelNotImplementedError(ctx.delivery.channel);
+          return;
         }
+
+        if (prep.kind === 'no_endpoint') {
+          await tx`
+            UPDATE bot.campaigns
+            SET status = 'paused', paused_at = now(),
+                pause_reason = 'auto_no_available_phones',
+                paused_by = 'dispatcher_auto'
+            WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
+          `;
+          throw new Error(prep.throwMessage);
+        }
+
+        await acquireToken();
+        const startMs = Date.now();
+        let result: ProviderSendResult;
+        try {
+          result = await provider.send(prep.sendInput);
+        } catch (sendErr) {
+          const e = sendErr as Error & { http_status?: number; error_code?: string };
+          metricsCollector.recordError('network_or_5xx');
+          logger.error(
+            {
+              deliveryId,
+              campaign_id: ctx.delivery.campaign_id,
+              http_status: e.http_status,
+              error_code: e.error_code,
+              err: e.message,
+              ...prep.errorLogFields,
+            },
+            `send ${ctx.delivery.channel} threw — propagating to retry path`,
+          );
+          throw sendErr;
+        }
+        metricsCollector.recordSend(Date.now() - startMs);
 
         // 6. Branch on result.
         if (result.ok && result.message_id) {
           await markDeliveryAccepted(tx, deliveryId, queuedAt, {
             message_id: result.message_id,
-            wa_phone_number_id: waPhone?.id,
+            ...prep.acceptedExtra,
           });
-          // 7. Bump sent_today per endpoint (WA via wa_phone_numbers FK; FB/IG via outbound_endpoints).
-          if (waPhone) {
+          // 7. Bump sent_today per endpoint (unified: WA/FB/IG all write
+          // bot.outbound_endpoints; email has no endpoint row → endpointRowId=null).
+          if (prep.endpointRowId) {
             await tx`
               UPDATE bot.outbound_endpoints
               SET sent_today = sent_today + 1
-              WHERE id = ${waPhone.id}
-            `;
-          } else if (fbEndpoint) {
-            await tx`
-              UPDATE bot.outbound_endpoints
-              SET sent_today = sent_today + 1
-              WHERE id = ${fbEndpoint.id}
-            `;
-          } else if (igEndpoint) {
-            await tx`
-              UPDATE bot.outbound_endpoints
-              SET sent_today = sent_today + 1
-              WHERE id = ${igEndpoint.id}
+              WHERE id = ${prep.endpointRowId}
             `;
           }
           // 8. SSE publish (outside the TX would be safer for atomicity but
@@ -712,29 +447,23 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         }
 
         // 6.b Send returned non-ok (4xx with error body).
-        const errCode = result.error_code ?? '';
 
-        // 131049 frequency cap — WA-only, terminal undelivered. Distinct branch (not DLQ).
-        if (ctx.delivery.channel === 'whatsapp' && errCode === '131049') {
+        // Channel-specific terminal short-circuit BEFORE classification —
+        // today only WA's 131049 frequency cap (terminal undelivered, not DLQ).
+        const override = provider.terminalOverride?.(result);
+        if (override) {
           await markDeliveryUndelivered(tx, deliveryId, queuedAt, {
-            error_code: '131049',
-            error_message: 'Meta frequency cap (cross-brand 2/24h)',
-            failure_reason: 'meta_freq_cap_131049',
+            error_code: override.error_code,
+            error_message: override.error_message,
+            failure_reason: override.failure_reason,
           });
-          metricsCollector.recordError('freq_cap_131049');
+          metricsCollector.recordError(override.metricsKey);
           return;
         }
 
         const attemptIndex = row.retry_count;
         const attemptsMade = attemptIndex + 1;
-        const classification =
-          ctx.delivery.channel === 'email'
-            ? classifyResendError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
-            : ctx.delivery.channel === 'facebook'
-              ? classifyMessengerError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
-              : ctx.delivery.channel === 'instagram'
-                ? classifyInstagramError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS)
-                : classifyMetaError(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
+        const classification = provider.classify(result, attemptsMade, env.DISPATCHER_BULLMQ_ATTEMPTS);
         metricsCollector.recordError(classification.category);
 
         if (classification.terminal) {

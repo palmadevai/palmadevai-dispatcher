@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "node --watch --import tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@bull-board/api": "^6.0.0",
@@ -27,7 +28,8 @@
     "@types/node": "^22.9.0",
     "pino-pretty": "^11.3.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.10"
   },
   "engines": {
     "node": ">=22"
