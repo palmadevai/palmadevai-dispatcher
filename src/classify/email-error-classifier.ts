@@ -5,11 +5,11 @@
  *   - validation_error (422)       → payload_invalid, terminal, no retry
  *   - invalid_api_key (401)        → auth_failed, terminal, pause campaign
  *   - missing_api_key (401)        → auth_failed, terminal, pause campaign
- *   - rate_limit_exceeded (429)    → meta_5xx_exhausted-style, retry until exhausted
+ *   - rate_limit_exceeded (429)    → provider_5xx_exhausted-style, retry until exhausted
  *   - internal_server_error (5xx)  → throws inside sendEmail, lands here only
- *                                    after retries exhausted → meta_5xx_exhausted
+ *                                    after retries exhausted → provider_5xx_exhausted
  *   - resend_api_key_missing       → synthetic from adapter: payload_invalid, terminal
- *   - else / unknown 4xx           → meta_template_rejected (generic permanent-ish)
+ *   - else / unknown 4xx           → provider_content_rejected (generic permanent-ish)
  *
  * The classifier reuses the WA ErrorCategory taxonomy for now — the cockpit DLQ
  * filters by category and adding a parallel email taxonomy is premature. If
@@ -54,7 +54,7 @@ export function classifyResendError(
 
   if (status === 429) {
     return {
-      category: 'meta_5xx_exhausted',
+      category: 'provider_5xx_exhausted',
       terminal: exhausted,
       shouldPauseCampaign: false,
     };
@@ -62,7 +62,7 @@ export function classifyResendError(
 
   if (status >= 500) {
     return {
-      category: 'meta_5xx_exhausted',
+      category: 'provider_5xx_exhausted',
       terminal: exhausted,
       shouldPauseCampaign: false,
     };
@@ -70,7 +70,7 @@ export function classifyResendError(
 
   if (status >= 400 && status < 500) {
     return {
-      category: 'meta_template_rejected',
+      category: 'provider_content_rejected',
       terminal: exhausted,
       shouldPauseCampaign: false,
     };

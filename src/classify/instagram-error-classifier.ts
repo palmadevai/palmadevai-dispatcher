@@ -8,8 +8,8 @@
  *   - 200         — permissions denied. auth_failed + pause.
  *   - 10          — app permission denied (Human Agent permission missing).
  *                   auth_failed + pause (necesita Meta App Review).
- *   - 230         — banned/duplicate. meta_template_rejected (terminal).
- *   - 5xx         — retry path, meta_5xx_exhausted al agotarse.
+ *   - 230         — banned/duplicate. provider_content_rejected (terminal).
+ *   - 5xx         — retry path, provider_5xx_exhausted al agotarse.
  *
  * Reusa ErrorCategory enum compartido — cockpit DLQ taxonomy unchanged.
  */
@@ -42,17 +42,17 @@ export function classifyInstagramError(
   }
 
   if (IG_BANNED_OR_DUP_CODES.has(code)) {
-    return { category: 'meta_template_rejected', terminal: true, shouldPauseCampaign: false };
+    return { category: 'provider_content_rejected', terminal: true, shouldPauseCampaign: false };
   }
 
   const exhausted = attemptsMade >= maxAttempts;
 
   if (status >= 500) {
-    return { category: 'meta_5xx_exhausted', terminal: exhausted, shouldPauseCampaign: false };
+    return { category: 'provider_5xx_exhausted', terminal: exhausted, shouldPauseCampaign: false };
   }
 
   if (status >= 400 && status < 500) {
-    return { category: 'meta_template_rejected', terminal: exhausted, shouldPauseCampaign: false };
+    return { category: 'provider_content_rejected', terminal: exhausted, shouldPauseCampaign: false };
   }
 
   return { category: 'unknown', terminal: exhausted, shouldPauseCampaign: false };

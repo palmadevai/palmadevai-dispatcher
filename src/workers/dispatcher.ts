@@ -553,7 +553,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
       const attemptIndex = carry.attemptIndex;
       const nextAttempt = attemptIndex + 1;
       if (nextAttempt >= env.DISPATCHER_BULLMQ_ATTEMPTS) {
-        await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'meta_5xx_exhausted');
+        await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'provider_5xx_exhausted');
       } else {
         const delay = backoffDelayMs(attemptIndex);
         const eta = Date.now() + delay;
@@ -565,7 +565,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           );
         } catch (zErr) {
           logger.error({ err: (zErr as Error).message, deliveryId }, 'retry ZADD failed — DLQ-ing instead');
-          await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'meta_5xx_exhausted');
+          await failTerminallyAndDLQ(deliveryId, queuedAt, new Error(carry.errorMessage), 'provider_5xx_exhausted');
         }
       }
       carryBox.value = null;
@@ -579,7 +579,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
         const nextAttempt = attemptIndex + 1; // 0-based attempt index already bumped
         if (nextAttempt >= env.DISPATCHER_BULLMQ_ATTEMPTS) {
           // Exhausted — DLQ.
-          await failTerminallyAndDLQ(deliveryId, queuedAt, retryError, 'meta_5xx_exhausted');
+          await failTerminallyAndDLQ(deliveryId, queuedAt, retryError, 'provider_5xx_exhausted');
         } else {
           const delay = backoffDelayMs(attemptIndex);
           const eta = Date.now() + delay;
@@ -602,7 +602,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
               deliveryId,
               queuedAt,
               retryError,
-              'meta_5xx_exhausted',
+              'provider_5xx_exhausted',
             );
           }
         }
