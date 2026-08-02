@@ -20,6 +20,10 @@ import { startRecovery } from './workers/recovery.js';
 import { startMetricsFlush } from './workers/metrics-flush.js';
 import { startCrmWebhookEmitter } from './workers/crm-webhook-emitter.js';
 import { startWakeupSubscriber } from './workers/wakeup-subscriber.js';
+import { startTemplateSync } from './workers/template-sync.js';
+import { graphManagement } from './providers/whatsapp-management.js';
+import { sendEmail } from './providers/email.js';
+import type { ManagementDeps } from './core/management.js';
 import { startServer } from './server.js';
 
 async function ensureStreamAndGroup(): Promise<void> {
@@ -107,6 +111,22 @@ async function main(): Promise<void> {
     logger,
   });
 
+  // F3 — management plane core deps: shared by the HTTP transport
+  // (/management/*) and the template-sync cron worker (misma lógica, dos puertas).
+  const managementCore: ManagementDeps = {
+    sql,
+    logger,
+    graph: graphManagement,
+    wabaId: env.META_WA_WABA_ID,
+    cockpitUrl: env.COCKPIT_URL,
+    sendEmail,
+  };
+
+  const templateSyncHandle = startTemplateSync(managementCore, {
+    intervalMinutes: env.DISPATCHER_TEMPLATE_SYNC_INTERVAL_MINUTES,
+    stubMode: env.STUB_MODE,
+  });
+
   // 3. HTTP server (healthcheck + Bull Board).
   const server = await startServer({
     bullmqConnection,
@@ -114,6 +134,7 @@ async function main(): Promise<void> {
     sql,
     logger,
     metricsCollector,
+    managementCore,
   });
 
   // bullmqConnection is still passed to the HTTP server because Bull Board
@@ -130,6 +151,7 @@ async function main(): Promise<void> {
       clearInterval(recoveryHandle);
       clearInterval(metricsFlushHandle);
       clearInterval(crmWebhookEmitterHandle);
+      templateSyncHandle.stop();
       await wakeupHandle.stop();
       await dispatcherHandle.stop();
       await server.close();
