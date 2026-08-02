@@ -19,16 +19,22 @@ import {
   type ManagementDeps,
 } from '../management.js';
 
-function makeFakeSql(responses: unknown[][]): { sql: SqlClient; calls: string[] } {
+function makeFakeSql(responses: unknown[][]): {
+  sql: SqlClient;
+  calls: string[];
+  values: unknown[][];
+} {
   let i = 0;
   const calls: string[] = [];
-  const fn = ((strings: TemplateStringsArray, ..._values: unknown[]) => {
+  const values: unknown[][] = [];
+  const fn = ((strings: TemplateStringsArray, ...vals: unknown[]) => {
     calls.push(strings.join('?').replace(/\s+/g, ' ').trim());
+    values.push(vals);
     const r = responses[i] ?? [];
     i += 1;
     return Promise.resolve(r);
   }) as unknown as SqlClient;
-  return { sql: fn, calls };
+  return { sql: fn, calls, values };
 }
 
 function makeFakeLogger(): Logger {
@@ -41,8 +47,13 @@ function makeDeps(overrides: {
   sqlResponses?: unknown[][];
   graph?: Partial<GraphManagement>;
   sendEmail?: (input: unknown) => Promise<ProviderSendResult>;
-}): { deps: ManagementDeps; calls: string[]; sendEmail: ReturnType<typeof vi.fn> } {
-  const { sql, calls } = makeFakeSql(overrides.sqlResponses ?? []);
+}): {
+  deps: ManagementDeps;
+  calls: string[];
+  values: unknown[][];
+  sendEmail: ReturnType<typeof vi.fn>;
+} {
+  const { sql, calls, values } = makeFakeSql(overrides.sqlResponses ?? []);
   const sendEmail = vi.fn(overrides.sendEmail ?? (async () => okSend));
   const graph: GraphManagement = {
     fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [] })),
@@ -62,6 +73,7 @@ function makeDeps(overrides: {
       sendEmail: sendEmail as unknown as ManagementDeps['sendEmail'],
     },
     calls,
+    values,
     sendEmail,
   };
 }
@@ -184,6 +196,27 @@ describe('syncTemplates', () => {
     const r = await syncTemplates(deps);
     expect(r.campaigns_paused).toBe(1);
     expect(sendEmail).not.toHaveBeenCalled();
+  });
+
+  it('persists language RAW (es_AR) — lowercasing it duplicated rows against the UNIQUE', async () => {
+    const { deps, values } = makeDeps({
+      sqlResponses: [
+        [], // outbound_endpoints WABAs
+        [], // prev lookup
+        [{ id: 'tpl-1', inserted: true }], // upsert
+      ],
+      graph: {
+        fetchTemplates: vi.fn(async () => ({
+          ok: true as const,
+          templates: [{ ...approvedTemplate, language: 'es_AR' }],
+        })),
+      },
+    });
+    await syncTemplates(deps);
+    // values[1] = prev lookup (name, language); values[2] = upsert params.
+    expect(values[1]).toContain('es_AR');
+    expect(values[2]).toContain('es_AR');
+    expect(values.flat()).not.toContain('es_ar');
   });
 
   it('collects per-WABA fetch errors without aborting the sync', async () => {

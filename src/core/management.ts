@@ -247,7 +247,11 @@ async function upsertTemplate(
 ): Promise<{ inserted: boolean; pause: TemplatePauseEvent | null }> {
   const { sql } = deps;
   const name = String(t.name || '');
-  const language = String(t.language || 'es').toLowerCase();
+  // Language se persiste RAW como lo devuelve Meta (es_AR, en_US) — igual que
+  // el sync histórico de campaign-site. Lowercasearlo (herencia del cron n8n)
+  // duplica filas contra el UNIQUE (channel, name, language): incidente del
+  // primer sync en el lab 2026-08-02 (es_ar/en_us nuevas junto a es_AR/en_US).
+  const language = String(t.language || 'es');
   if (!name || !language) return { inserted: false, pause: null };
 
   const bodyComponent = (t.components ?? []).find((c) => c.type === 'BODY');
