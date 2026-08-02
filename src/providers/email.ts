@@ -26,6 +26,9 @@
 import { request } from 'undici';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import { classifyResendError } from '../classify/email-error-classifier.js';
+import type { DeliveryContext } from '../dispatch/audience-resolver.js';
+import type { ChannelProvider, PrepareOutcome } from '../ports/channel-provider.js';
 import type { ProviderSendResult } from './types.js';
 
 export interface EmailSendInput {
@@ -239,3 +242,66 @@ export function renderEmailBody(input: RenderEmailInput): RenderEmailOutput {
     ...(renderedText ? { text: renderedText } : {}),
   };
 }
+
+// ─── ChannelProvider (H1.1) ─────────────────────────────────────────────────
+
+/**
+ * Moved from `workers/dispatcher.ts` (the old `ctx.delivery.channel ===
+ * 'email'` branch, pre-`acquireToken()` half): destination validation +
+ * body rendering. Email has no `bot.outbound_endpoints` row (no picker), so
+ * `prepare()` needs no injectable deps and ignores `tx`.
+ */
+export async function prepareEmail(
+  _tx: unknown,
+  ctx: DeliveryContext,
+  aiResolvedBindings: Record<string, unknown>,
+): Promise<PrepareOutcome> {
+  if (!ctx.contact.email) {
+    return {
+      kind: 'terminal',
+      error_code: 'no_email',
+      error_message: 'audience contact has no email for email channel',
+      failure_reason: 'email_invalid',
+    };
+  }
+
+  const unsubBase = env.CAMPAIGNS_UNSUBSCRIBE_BASE_URL ?? `https://${env.DOMAIN}/unsubscribe`;
+  const rendered = renderEmailBody({
+    templateBody: ctx.template.body,
+    contactDisplayName: ctx.contact.display_name,
+    contactId: ctx.delivery.audience_contact_id,
+    perRowBindings: ctx.delivery.template_variables,
+    campaignBindings: ctx.campaign.template_variable_bindings,
+    aiResolvedBindings,
+    unsubscribeBaseUrl: unsubBase,
+  });
+
+  const fromOverride =
+    typeof ctx.template.body.from === 'string'
+      ? (ctx.template.body.from as string)
+      : env.CAMPAIGNS_DEFAULT_FROM_EMAIL;
+
+  const sendInput: EmailSendInput = {
+    from: fromOverride,
+    to: ctx.contact.email,
+    subject: rendered.subject,
+    html: rendered.html,
+    ...(rendered.text ? { text: rendered.text } : {}),
+    biz_opaque_callback_data: ctx.delivery.client_ref,
+  };
+
+  return {
+    kind: 'ready',
+    sendInput,
+    endpointRowId: null,
+    acceptedExtra: {},
+    errorLogFields: { to_domain: ctx.contact.email.split('@')[1] },
+  };
+}
+
+export const emailProvider: ChannelProvider = {
+  channel: 'email',
+  prepare: prepareEmail,
+  send: (input: unknown) => sendEmail(input as EmailSendInput),
+  classify: (result, attemptsMade, maxAttempts) => classifyResendError(result, attemptsMade, maxAttempts),
+};

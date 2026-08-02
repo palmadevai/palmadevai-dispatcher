@@ -23,8 +23,14 @@
  * Meta response shape. classifier.ts owns the decision tree.
  */
 import { request } from 'undici';
+import type { TransactionSql } from 'postgres';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import { resolvePinnedWaEndpoint, pickPhoneForContact } from '../dispatch/pick-phone.js';
+import { resolveTemplateComponents } from '../dispatch/audience-resolver.js';
+import type { DeliveryContext } from '../dispatch/audience-resolver.js';
+import { classifyMetaError } from '../classify/error-classifier.js';
+import type { ChannelProvider, PrepareOutcome, TerminalOverride } from '../ports/channel-provider.js';
 import type { ProviderSendResult } from './types.js';
 
 export interface WhatsAppSendInput {
@@ -164,3 +170,119 @@ export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSe
     raw_request: body,
   };
 }
+
+// ─── ChannelProvider (H1.1) ─────────────────────────────────────────────────
+
+/**
+ * Injectable deps for `prepare()` — defaults to the real DB pickers /
+ * component resolver. Tests substitute fakes here instead of mocking `tx`
+ * query-by-query.
+ */
+export interface WhatsAppPrepareDeps {
+  resolvePinnedWaEndpoint: typeof resolvePinnedWaEndpoint;
+  pickPhoneForContact: typeof pickPhoneForContact;
+  resolveTemplateComponents: typeof resolveTemplateComponents;
+}
+
+const defaultWhatsAppPrepareDeps: WhatsAppPrepareDeps = {
+  resolvePinnedWaEndpoint,
+  pickPhoneForContact,
+  resolveTemplateComponents,
+};
+
+/**
+ * Moved from `workers/dispatcher.ts` (the old `ctx.delivery.channel ===
+ * 'whatsapp'` branch, pre-`acquireToken()` half): destination validation,
+ * pinned-endpoint → auto-pick endpoint resolution (Fase 9 multi-WABA), and
+ * template component resolution.
+ */
+export async function prepareWhatsApp(
+  tx: TransactionSql,
+  ctx: DeliveryContext,
+  aiResolvedBindings: Record<string, unknown>,
+  deps: WhatsAppPrepareDeps = defaultWhatsAppPrepareDeps,
+): Promise<PrepareOutcome> {
+  if (!ctx.contact.phone) {
+    return {
+      kind: 'terminal',
+      error_code: 'no_phone',
+      error_message: 'audience contact has no phone for whatsapp channel',
+      failure_reason: 'phone_invalid',
+    };
+  }
+
+  // Fase 9 — emisor: si la campaña fijó un endpoint (multi-WABA), usar ESE
+  // número + su token. Si no, auto-pick legacy (sticky + warming pool).
+  let phone: { id: string; phone_number_id: string } | null = null;
+  let waAccessToken: string | undefined;
+  if (ctx.campaign.outbound_endpoint_id) {
+    const pinned = await deps.resolvePinnedWaEndpoint(tx, ctx.campaign.outbound_endpoint_id);
+    if (pinned) {
+      phone = { id: pinned.id, phone_number_id: pinned.phone_number_id };
+      waAccessToken = pinned.access_token ?? undefined;
+    } else {
+      logger.warn(
+        {
+          deliveryId: ctx.delivery.id,
+          campaign_id: ctx.delivery.campaign_id,
+          outbound_endpoint_id: ctx.campaign.outbound_endpoint_id,
+        },
+        'pinned outbound_endpoint no usable (missing/disabled) — fallback a auto-pick',
+      );
+    }
+  }
+  if (!phone) {
+    phone = await deps.pickPhoneForContact(tx, ctx.delivery.audience_contact_id);
+  }
+  if (!phone) {
+    return { kind: 'no_endpoint', throwMessage: 'NoAvailablePhonesError' };
+  }
+
+  const components = deps.resolveTemplateComponents(
+    ctx.template,
+    ctx.contact,
+    ctx.delivery.template_variables,
+    aiResolvedBindings,
+  );
+
+  const sendInput: WhatsAppSendInput = {
+    phone_number_id: phone.phone_number_id,
+    to: ctx.contact.phone,
+    template_name: ctx.template.name,
+    template_lang: ctx.template.language,
+    components,
+    biz_opaque_callback_data: ctx.delivery.client_ref,
+    ...(waAccessToken ? { access_token: waAccessToken } : {}),
+  };
+
+  return {
+    kind: 'ready',
+    sendInput,
+    endpointRowId: phone.id,
+    acceptedExtra: { wa_phone_number_id: phone.id },
+    errorLogFields: {
+      to_last4: ctx.contact.phone.slice(-4),
+      phone_number_id: phone.phone_number_id,
+    },
+  };
+}
+
+/** 131049 (cross-brand 2/24h frequency cap) — terminal undelivered, NOT DLQ. WA-only. */
+export function whatsAppTerminalOverride(result: ProviderSendResult): TerminalOverride | null {
+  if ((result.error_code ?? '') !== '131049') return null;
+  return {
+    markAs: 'undelivered',
+    error_code: '131049',
+    error_message: 'Meta frequency cap (cross-brand 2/24h)',
+    failure_reason: 'meta_freq_cap_131049',
+    metricsKey: 'freq_cap_131049',
+  };
+}
+
+export const whatsappProvider: ChannelProvider = {
+  channel: 'whatsapp',
+  prepare: prepareWhatsApp,
+  send: (input: unknown) => sendWhatsApp(input as WhatsAppSendInput),
+  classify: (result, attemptsMade, maxAttempts) => classifyMetaError(result, attemptsMade, maxAttempts),
+  terminalOverride: whatsAppTerminalOverride,
+};

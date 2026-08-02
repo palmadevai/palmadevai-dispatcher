@@ -29,8 +29,14 @@
  * has its own. No env-var cliente-wide.
  */
 import { request } from 'undici';
+import type { TransactionSql } from 'postgres';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
+import type { DeliveryContext } from '../dispatch/audience-resolver.js';
+import { interpolatePlainText } from '../lib/interpolate-vars.js';
+import { classifyMessengerError } from '../classify/facebook-error-classifier.js';
+import type { ChannelProvider, PrepareOutcome } from '../ports/channel-provider.js';
 import type { ProviderSendResult } from './types.js';
 
 export interface FacebookSendInput {
@@ -150,3 +156,74 @@ export async function sendFacebookMessenger(input: FacebookSendInput): Promise<P
     raw_request: body,
   };
 }
+
+// ─── ChannelProvider (H1.1) ─────────────────────────────────────────────────
+
+export interface FacebookPrepareDeps {
+  pickEndpointForChannel: typeof pickEndpointForChannel;
+}
+
+const defaultFacebookPrepareDeps: FacebookPrepareDeps = { pickEndpointForChannel };
+
+/**
+ * Moved from `workers/dispatcher.ts` (the old `ctx.delivery.channel ===
+ * 'facebook'` branch, pre-`acquireToken()` half): PSID validation, generic
+ * endpoint picking (no sticky/tier, unlike WA — see `pick-endpoint.ts`), and
+ * `{{var}}` interpolation of the plain-text template body.
+ */
+export async function prepareFacebook(
+  tx: TransactionSql,
+  ctx: DeliveryContext,
+  aiResolvedBindings: Record<string, unknown>,
+  deps: FacebookPrepareDeps = defaultFacebookPrepareDeps,
+): Promise<PrepareOutcome> {
+  // PSID en contact.meta.facebook_psid — sin mig nueva todavía.
+  const psid =
+    typeof ctx.contact.meta?.facebook_psid === 'string' ? (ctx.contact.meta.facebook_psid as string) : null;
+  if (!psid) {
+    return {
+      kind: 'terminal',
+      error_code: 'no_psid',
+      error_message: 'audience contact has no facebook_psid in meta',
+      failure_reason: 'facebook_psid_invalid',
+    };
+  }
+
+  const endpoint = await deps.pickEndpointForChannel(tx, 'facebook');
+  if (!endpoint) {
+    return { kind: 'no_endpoint', throwMessage: 'NoAvailableFacebookEndpointError' };
+  }
+
+  // template.body shape (body_format='plain_text'):
+  //   { text: "Hola {{name}}", messaging_tag: "ACCOUNT_UPDATE" }
+  const tplBody = ctx.template.body as Record<string, unknown>;
+  const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
+  const tag =
+    typeof tplBody.messaging_tag === 'string'
+      ? (tplBody.messaging_tag as 'ACCOUNT_UPDATE' | 'POST_PURCHASE_UPDATE' | 'CONFIRMED_EVENT_UPDATE')
+      : undefined;
+  const messageText = interpolatePlainText(rawText, ctx, aiResolvedBindings);
+
+  const sendInput: FacebookSendInput = {
+    page_access_token: endpoint.access_token,
+    recipient_psid: psid,
+    message_text: messageText,
+    messaging_tag: tag,
+    biz_opaque_callback_data: ctx.delivery.client_ref,
+  };
+
+  return {
+    kind: 'ready',
+    sendInput,
+    endpointRowId: endpoint.id,
+    acceptedExtra: {},
+    errorLogFields: { psid_last4: psid.slice(-4), page_endpoint_id: endpoint.endpoint_id },
+  };
+}
+
+export const facebookProvider: ChannelProvider = {
+  channel: 'facebook',
+  prepare: prepareFacebook,
+  send: (input: unknown) => sendFacebookMessenger(input as FacebookSendInput),
+  classify: (result, attemptsMade, maxAttempts) => classifyMessengerError(result, attemptsMade, maxAttempts),
+};

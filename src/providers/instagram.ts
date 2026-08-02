@@ -26,8 +26,14 @@
  * Error policy idéntica WA/FB (2xx→ok, 4xx→ok=false, 5xx/net→throw).
  */
 import { request } from 'undici';
+import type { TransactionSql } from 'postgres';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import { pickEndpointForChannel } from '../dispatch/pick-endpoint.js';
+import type { DeliveryContext } from '../dispatch/audience-resolver.js';
+import { interpolatePlainText } from '../lib/interpolate-vars.js';
+import { classifyInstagramError } from '../classify/instagram-error-classifier.js';
+import type { ChannelProvider, PrepareOutcome } from '../ports/channel-provider.js';
 import type { ProviderSendResult } from './types.js';
 
 export interface InstagramSendInput {
@@ -148,3 +154,72 @@ export async function sendInstagramDm(input: InstagramSendInput): Promise<Provid
     raw_request: body,
   };
 }
+
+// ─── ChannelProvider (H1.1) ─────────────────────────────────────────────────
+
+export interface InstagramPrepareDeps {
+  pickEndpointForChannel: typeof pickEndpointForChannel;
+}
+
+const defaultInstagramPrepareDeps: InstagramPrepareDeps = { pickEndpointForChannel };
+
+/**
+ * Moved from `workers/dispatcher.ts` (the old `ctx.delivery.channel ===
+ * 'instagram'` branch, pre-`acquireToken()` half): IGSID validation, generic
+ * endpoint picking, and `{{var}}` interpolation of the plain-text template body.
+ */
+export async function prepareInstagram(
+  tx: TransactionSql,
+  ctx: DeliveryContext,
+  aiResolvedBindings: Record<string, unknown>,
+  deps: InstagramPrepareDeps = defaultInstagramPrepareDeps,
+): Promise<PrepareOutcome> {
+  // IGSID en contact.meta.instagram_user_id.
+  const igsid =
+    typeof ctx.contact.meta?.instagram_user_id === 'string'
+      ? (ctx.contact.meta.instagram_user_id as string)
+      : null;
+  if (!igsid) {
+    return {
+      kind: 'terminal',
+      error_code: 'no_igsid',
+      error_message: 'audience contact has no instagram_user_id in meta',
+      failure_reason: 'instagram_igsid_invalid',
+    };
+  }
+
+  const endpoint = await deps.pickEndpointForChannel(tx, 'instagram');
+  if (!endpoint) {
+    return { kind: 'no_endpoint', throwMessage: 'NoAvailableInstagramEndpointError' };
+  }
+
+  // template.body shape (body_format='plain_text'):
+  //   { text: "Hola {{name}}", messaging_tag: "HUMAN_AGENT"? }
+  const tplBody = ctx.template.body as Record<string, unknown>;
+  const rawText = typeof tplBody.text === 'string' ? (tplBody.text as string) : '';
+  const tag = tplBody.messaging_tag === 'HUMAN_AGENT' ? ('HUMAN_AGENT' as const) : undefined;
+  const messageText = interpolatePlainText(rawText, ctx, aiResolvedBindings);
+
+  const sendInput: InstagramSendInput = {
+    page_access_token: endpoint.access_token,
+    recipient_igsid: igsid,
+    message_text: messageText,
+    messaging_tag: tag,
+    biz_opaque_callback_data: ctx.delivery.client_ref,
+  };
+
+  return {
+    kind: 'ready',
+    sendInput,
+    endpointRowId: endpoint.id,
+    acceptedExtra: {},
+    errorLogFields: { igsid_last4: igsid.slice(-4), ig_endpoint_id: endpoint.endpoint_id },
+  };
+}
+
+export const instagramProvider: ChannelProvider = {
+  channel: 'instagram',
+  prepare: prepareInstagram,
+  send: (input: unknown) => sendInstagramDm(input as InstagramSendInput),
+  classify: (result, attemptsMade, maxAttempts) => classifyInstagramError(result, attemptsMade, maxAttempts),
+};
