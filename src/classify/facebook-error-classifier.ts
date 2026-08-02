@@ -5,12 +5,12 @@
  *   - 100         invalid parameter (payload_invalid)
  *   - 190         OAuth token invalid/expired (auth_failed + pause campaign)
  *   - 200         permissions error (auth_failed + pause campaign)
- *   - 230         banned/duplicate message (meta_template_rejected, terminal)
+ *   - 230         banned/duplicate message (provider_content_rejected, terminal)
  *   - 551         cannot send (24h window expired without valid tag) — payload_invalid
  *   - 1545041     messaging_type=MESSAGE_TAG required — payload_invalid
  *   - 10          app permission denied — auth_failed + pause
  *   - http 401/403 — auth_failed + pause
- *   - 5xx — meta_5xx_exhausted via retry exhaustion
+ *   - 5xx — provider_5xx_exhausted via retry exhaustion
  *
  * Reuses ErrorCategory enum from WA classifier — same cockpit DLQ taxonomy.
  */
@@ -43,17 +43,17 @@ export function classifyMessengerError(
   }
 
   if (FB_BANNED_OR_DUP_CODES.has(code)) {
-    return { category: 'meta_template_rejected', terminal: true, shouldPauseCampaign: false };
+    return { category: 'provider_content_rejected', terminal: true, shouldPauseCampaign: false };
   }
 
   const exhausted = attemptsMade >= maxAttempts;
 
   if (status >= 500) {
-    return { category: 'meta_5xx_exhausted', terminal: exhausted, shouldPauseCampaign: false };
+    return { category: 'provider_5xx_exhausted', terminal: exhausted, shouldPauseCampaign: false };
   }
 
   if (status >= 400 && status < 500) {
-    return { category: 'meta_template_rejected', terminal: exhausted, shouldPauseCampaign: false };
+    return { category: 'provider_content_rejected', terminal: exhausted, shouldPauseCampaign: false };
   }
 
   return { category: 'unknown', terminal: exhausted, shouldPauseCampaign: false };

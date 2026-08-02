@@ -168,7 +168,7 @@ describe('whatsAppTerminalOverride', () => {
       markAs: 'undelivered',
       error_code: '131049',
       error_message: 'Meta frequency cap (cross-brand 2/24h)',
-      failure_reason: 'meta_freq_cap_131049',
+      failure_reason: 'provider_freq_cap',
       metricsKey: 'freq_cap_131049',
     });
   });

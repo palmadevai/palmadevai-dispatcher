@@ -3,18 +3,18 @@
  *
  * Decision tree:
  *   - 131049 (cross-brand 2/24h frequency cap) → terminal undelivered, NO retry,
- *     NOT DLQ. Caller handles via dedicated branch (failure_reason='meta_freq_cap_131049').
+ *     NOT DLQ. Caller handles via dedicated branch (failure_reason='provider_freq_cap').
  *   - 131000 / 131056 (tier exceeded) → DLQ + pause campaign (caller).
  *   - 132000–132016 (template params invalid / template not found) →
  *     payload_invalid. Immediate DLQ — retrying won't fix a bad payload.
  *   - 131005 / 131026 / 131051 (phone invalid / contact not on WA) →
  *     phone_invalid. Immediate DLQ.
- *   - 132047 (template paused/rejected mid-flight) → meta_template_rejected
+ *   - 132047 (template paused/rejected mid-flight) → provider_content_rejected
  *     + pause campaign (caller).
  *   - 190 (auth token expired) → auth_failed + pause campaign.
  *   - http_status 401/403 → auth_failed.
- *   - http_status >= 500 with retries exhausted → meta_5xx_exhausted.
- *   - http_status 4xx with retries exhausted → meta_template_rejected
+ *   - http_status >= 500 with retries exhausted → provider_5xx_exhausted.
+ *   - http_status 4xx with retries exhausted → provider_content_rejected
  *     (generic permanent-ish bucket; operator triages in campaign-site `/dlq`).
  *   - else → unknown.
  *
@@ -25,8 +25,8 @@
 import type { ProviderSendResult } from '../providers/types.js';
 
 export type ErrorCategory =
-  | 'meta_template_rejected'
-  | 'meta_5xx_exhausted'
+  | 'provider_content_rejected'
+  | 'provider_5xx_exhausted'
   | 'payload_invalid'
   | 'phone_invalid'
   | 'auth_failed'
@@ -80,7 +80,7 @@ export function classifyMetaError(
 
   if (TIER_EXCEEDED_CODES.has(code)) {
     return {
-      category: 'meta_template_rejected',
+      category: 'provider_content_rejected',
       terminal: true,
       shouldPauseCampaign: true,
       pauseReason: 'auto_meta_tier_hit',
@@ -93,7 +93,7 @@ export function classifyMetaError(
 
   if (TEMPLATE_REJECTED_CODES.has(code)) {
     return {
-      category: 'meta_template_rejected',
+      category: 'provider_content_rejected',
       terminal: true,
       shouldPauseCampaign: true,
       pauseReason: 'auto_template_rejected',
@@ -117,7 +117,7 @@ export function classifyMetaError(
 
   if (status >= 500) {
     return {
-      category: 'meta_5xx_exhausted',
+      category: 'provider_5xx_exhausted',
       terminal: exhausted,
       shouldPauseCampaign: false,
     };
@@ -125,7 +125,7 @@ export function classifyMetaError(
 
   if (status >= 400 && status < 500) {
     return {
-      category: 'meta_template_rejected',
+      category: 'provider_content_rejected',
       terminal: exhausted,
       shouldPauseCampaign: false,
     };
