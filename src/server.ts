@@ -5,6 +5,9 @@
  *   GET /admin/queues/* — Bull Board UI (BullMQ queue inspector + retry).
  *                         Auth: header X-Cockpit-Auth = COCKPIT_INTERNAL_TOKEN.
  *                         Si token env vacío, log warning + allow (DEV ONLY).
+ *   POST /send          — Messaging Service H2.1 (bajo volumen, sincrónico).
+ *                         Auth: Bearer DISPATCHER_SEND_BEARER. Ver
+ *                         `transports/http/send-route.ts`.
  *
  * Cockpit consume /admin/queues vía reverse-proxy interno (red Docker `net`
  * compartida): https://cockpit.<DOMAIN>/admin/queues → http://dispatcher:8080/admin/queues
@@ -19,12 +22,15 @@ import type { Redis } from 'ioredis';
 import { env } from './env.js';
 import type { Logger } from './lib/logger.js';
 import type { SqlClient } from './lib/postgres.js';
+import type { MetricsCollector } from './observability/metrics-collector.js';
+import { registerSendRoute } from './transports/http/send-route.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
   rawRedis: Redis;
   sql: SqlClient;
   logger: Logger;
+  metricsCollector: MetricsCollector;
 }
 
 const HEALTHCHECK_PING_TIMEOUT_MS = 2000;
@@ -60,7 +66,7 @@ async function pingPostgres(sql: SqlClient): Promise<boolean> {
 const startTimestamp = Date.now();
 
 export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
-  const { logger, bullmqConnection, rawRedis, sql } = deps;
+  const { logger, bullmqConnection, rawRedis, sql, metricsCollector } = deps;
 
   // Fastify 5 acepta un logger instance pre-built via la opción `loggerInstance`.
   // El cast a `any` evita el generic mismatch entre nuestros logger types y
@@ -91,6 +97,18 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
       stub_mode: env.STUB_MODE,
     };
     return reply.code(healthy ? 200 : 503).send(body);
+  });
+
+  // ── /send (Messaging Service H2.1) ──────────────────────────────────────
+  registerSendRoute(app, {
+    sql,
+    redis: rawRedis,
+    logger,
+    metricsCollector,
+    sendBearer: env.DISPATCHER_SEND_BEARER,
+    staffAllowlist: env.STAFF_NOTIFY_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean),
+    defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
+    defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
   });
 
   // ── /admin/queues (Bull Board) ──────────────────────────────────────────

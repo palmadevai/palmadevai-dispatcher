@@ -46,6 +46,7 @@ import {
 } from '../dispatch/delivery-update.js';
 import { assertProviderAvailable, ChannelNotImplementedError, type ProviderSendResult } from '../providers/index.js';
 import { getProviderForChannel } from '../ports/channel-provider.js';
+import { checkBudget, maybeAlert } from '../core/budget.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
@@ -383,6 +384,36 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
             WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
           `;
           throw new Error(prep.throwMessage);
+        }
+
+        // 4b. Budget check (H2.2) — same core check `POST /send` runs
+        // (core/budget.ts), so no route bypasses the cap (§5 decision 1 of
+        // the messaging-service analysis doc). Exceeded → terminal failed
+        // (no DLQ, no retry — same treatment as channel_not_implemented) +
+        // auto-pause the campaign, mirroring the no_endpoint branch above
+        // but with its own pause_reason so the operator can tell them apart.
+        const budgetResult = await checkBudget(
+          tx,
+          rawRedis,
+          logger,
+          ctx.delivery.channel,
+          ctx.template.category,
+        );
+        await maybeAlert(rawRedis, logger, ctx.delivery.channel, ctx.template.category, budgetResult);
+        if (!budgetResult.allowed) {
+          await markDeliveryTerminal(tx, deliveryId, queuedAt, {
+            error_code: 'budget_exceeded',
+            error_message: `monthly budget cap reached for ${ctx.delivery.channel}/${ctx.template.category}`,
+            failure_reason: 'budget_exceeded',
+          });
+          await tx`
+            UPDATE bot.campaigns
+            SET status = 'paused', paused_at = now(),
+                pause_reason = 'auto_budget_exceeded',
+                paused_by = 'dispatcher_auto'
+            WHERE id = ${ctx.delivery.campaign_id} AND status = 'sending'
+          `;
+          return;
         }
 
         await acquireToken();

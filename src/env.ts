@@ -121,6 +121,17 @@ const schema = z.object({
   CAMPAIGNS_WEBHOOK_EMITTER_INTERVAL_MS: z.coerce.number().int().min(500).default(2000),
   CAMPAIGNS_WEBHOOK_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
   CAMPAIGNS_WEBHOOK_USER_AGENT: z.string().default('palmadev-webhooks/1'),
+
+  // ── Messaging Service — POST /send (Fase 2, H2.1) ────────────────────────
+  // Bearer required to call POST /send. Optional on purpose: if unset, the
+  // route responds 503 `send_disabled` instead of booting open — the service
+  // can never be an unauthenticated write surface, not even in dev.
+  DISPATCHER_SEND_BEARER: z.string().optional(),
+  // CSV of phones/emails allowed as `to` when context.kind='notification'
+  // (staff-only destinations — never arbitrary numbers/addresses). Empty/unset
+  // means nothing is allowlisted yet: every notification send 403s until an
+  // operator configures this (fail-closed, not fail-open).
+  STAFF_NOTIFY_ALLOWLIST: z.string().default(''),
 });
 
 const parsed = schema.safeParse(process.env);
