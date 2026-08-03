@@ -132,10 +132,14 @@ export async function resolveCategory(
  * no corrió para este contacto", y bloquear envíos legítimos por un dato que
  * todavía se está poblando es peor que pagar un 4xx de Meta.
  *
- * Matching de teléfono por los últimos 10 dígitos: es el idioma ya establecido
- * en campaigns (`campaigns-meta-status` "Mark Replied", mig 064) para absorber
- * las variantes de formato E.164 con las que Meta y la BUC guardan el mismo
- * número.
+ * Matching de teléfono: la MISMA canonicalización que usa el escritor
+ * (`bot.buc_touch_last_seen`, mig 139, heredada de `buc_upsert_contact`) —
+ * el prefijo 9 de los móviles argentinos, `+549XXXX` → `+54XXXX`. Tiene que
+ * ser simétrica con la escritura o el lector no encuentra lo que el feeder
+ * guardó. Deliberadamente NO se usa "últimos 10 dígitos": es más permisivo y
+ * podría matchear un contacto de otro país con la misma terminación, y acá un
+ * match equivocado significa rechazar un envío legítimo por la inactividad de
+ * otra persona.
  */
 export async function isWithin24hWindow(
   sql: SqlClient,
@@ -149,8 +153,8 @@ export async function isWithin24hWindow(
       FROM bot.audience_contact_channels ch
       JOIN bot.audience_contacts c ON c.id = ch.audience_contact_id
       WHERE ch.channel = ${channel}
-        AND right(regexp_replace(c.phone, '[^0-9]', '', 'g'), 10)
-          = right(regexp_replace(${to}, '[^0-9]', '', 'g'), 10)
+        AND (CASE WHEN c.phone LIKE '+549%' THEN '+54' || substring(c.phone FROM 5) ELSE c.phone END)
+          = (CASE WHEN ${to} LIKE '+549%' THEN '+54' || substring(${to} FROM 5) ELSE ${to} END)
       ORDER BY ch.last_seen_at DESC NULLS LAST
       LIMIT 1
     `;
