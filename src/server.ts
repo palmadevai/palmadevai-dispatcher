@@ -33,6 +33,7 @@ import { registerSendRoute } from './transports/http/send-route.js';
 import { registerManagementRoutes } from './transports/http/management-routes.js';
 import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
+import { normalizeAllowlist } from './lib/phone.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
@@ -110,6 +111,24 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     return reply.code(healthy ? 200 : 503).send(body);
   });
 
+  // Allowlist de notificaciones a staff. Se carga a mano en el `.env`, así que
+  // acá se normaliza a E.164 y se AVISA de lo que no normaliza: un valor que no
+  // normaliza no va a matchear nunca, y dejarlo pasar en silencio es prometer
+  // una autorización que no existe. La comparación vuelve a normalizar del lado
+  // de `sendMessage` (el MCP arma su propio `deps`).
+  const staffAllowlistRaw = env.STAFF_NOTIFY_ALLOWLIST.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  {
+    const { allowed, invalid } = normalizeAllowlist(staffAllowlistRaw);
+    if (invalid.length > 0) {
+      logger.warn(
+        { invalid_count: invalid.length, valid_count: allowed.length },
+        'STAFF_NOTIFY_ALLOWLIST: hay valores que no son un teléfono E.164 — nunca van a matchear',
+      );
+    }
+  }
+
   // ── /send (Messaging Service H2.1) ──────────────────────────────────────
   registerSendRoute(app, {
     sql,
@@ -117,7 +136,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     logger,
     metricsCollector,
     sendBearer: env.DISPATCHER_SEND_BEARER,
-    staffAllowlist: env.STAFF_NOTIFY_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean),
+    staffAllowlist: staffAllowlistRaw,
     defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
     defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
   });
@@ -140,7 +159,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
         redis: rawRedis,
         logger,
         metrics: metricsCollector,
-        staffAllowlist: env.STAFF_NOTIFY_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean),
+        staffAllowlist: staffAllowlistRaw,
         defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
         defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
       },

@@ -29,6 +29,7 @@ import type { Redis } from 'ioredis';
 import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import { checkBudget, recordSendUsage, maybeAlert } from './budget.js';
+import { toE164, normalizeAllowlist } from '../lib/phone.js';
 import { getProviderForChannel } from '../ports/channel-provider.js';
 import type { OutboundMessage } from './schemas.js';
 import type { WhatsAppSendInput } from '../providers/whatsapp.js';
@@ -225,7 +226,16 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   }
 
   // ── 3. Destino staff-only para notificaciones ─────────────────────────────
-  if (kind === 'notification' && !deps.staffAllowlist.includes(msg.to)) {
+  // La comparación va en E.164 canónico de los DOS lados. La allowlist se carga
+  // a mano en un `.env` y el destino viene de `bot.agents.phone_e164`: comparar
+  // literal hace que `549…` y `+549…` —el mismo número— no coincidan, que es
+  // exactamente lo que rechazó cada notificación de ai-recovery el 2026-08-03.
+  // Normalizamos acá y no sólo en el wiring para que la guarda sea correcta
+  // venga de donde venga el `deps` (el MCP arma el suyo).
+  const toCanonical = kind === 'notification' ? toE164(msg.to) : null;
+  const allowCanonical =
+    kind === 'notification' ? new Set(normalizeAllowlist(deps.staffAllowlist).allowed) : null;
+  if (kind === 'notification' && (!toCanonical || !allowCanonical!.has(toCanonical))) {
     deps.logger.warn(
       { feature, channel: msg.channel, to: maskDestination(msg.to) },
       'sendMessage: notification destination not in STAFF_NOTIFY_ALLOWLIST',

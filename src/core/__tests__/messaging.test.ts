@@ -166,6 +166,32 @@ describe('sendMessage — idempotency', () => {
 });
 
 describe('sendMessage — staff allowlist', () => {
+  it('acepta el mismo numero cargado sin `+` en la allowlist (incidente 2026-08-03)', async () => {
+    // `bot.agents.phone_e164` guarda `+549…`; la allowlist del `.env` se cargó
+    // como `549…`. Es el MISMO número: la comparación va en E.164 canónico.
+    const deps = makeDeps({ staffAllowlist: ['5491145402018'] });
+    const msg = makeMsg({
+      to: '+5491145402018',
+      context: { feature: 'f', client_ref: 'ref-allow-e164', kind: 'notification' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result.status).not.toBe('rejected');
+  });
+
+  it('un destino que no es un teléfono válido no se cuela', async () => {
+    const deps = makeDeps({ staffAllowlist: ['+5491145402018'] });
+    const msg = makeMsg({
+      to: 'no-soy-un-telefono',
+      context: { feature: 'f', client_ref: 'ref-allow-junk', kind: 'notification' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result).toMatchObject({ status: 'rejected', reason: 'destination_not_allowed' });
+  });
+
   it('rejects destination_not_allowed for a notification outside STAFF_NOTIFY_ALLOWLIST', async () => {
     const deps = makeDeps({ staffAllowlist: ['+5492222222222'] });
     const msg = makeMsg({
