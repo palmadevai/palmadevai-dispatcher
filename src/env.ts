@@ -138,6 +138,13 @@ const schema = z.object({
   // `campaigns-template-sync` daily cron). 0 disables the worker; on-demand
   // POST /management/templates/sync stays available either way.
   DISPATCHER_TEMPLATE_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(0).default(360),
+
+  // ── Messaging Service — MCP Tier 1 (Fase 4, H4.1) ────────────────────────
+  // Bearer PROPIO del MCP read-only (patrón *_MCP_BEARER, BW runtime-env).
+  // Deliberadamente distinto de DISPATCHER_SEND_BEARER: el consumidor del MCP
+  // (chat-site) nunca porta la credencial que autoriza writes en /send y
+  // /management. Ausente → /mcp/* responde 503 (fail-closed).
+  MESSAGING_MCP_BEARER: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);

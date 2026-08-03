@@ -11,6 +11,9 @@
  *   /management/*       — Messaging Service F3 (templates/endpoints/quality).
  *                         Mismo bearer que /send. Ver
  *                         `transports/http/management-routes.ts`.
+ *   /mcp/messaging-v0   — Messaging MCP Tier 1 (F4, read-only, SSE). Bearer
+ *                         propio MESSAGING_MCP_BEARER. Ver
+ *                         `transports/mcp/routes.ts`.
  *
  * Cockpit consume /admin/queues vía reverse-proxy interno (red Docker `net`
  * compartida): https://cockpit.<DOMAIN>/admin/queues → http://dispatcher:8080/admin/queues
@@ -28,6 +31,7 @@ import type { SqlClient } from './lib/postgres.js';
 import type { MetricsCollector } from './observability/metrics-collector.js';
 import { registerSendRoute } from './transports/http/send-route.js';
 import { registerManagementRoutes } from './transports/http/management-routes.js';
+import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
 
 export interface ServerDeps {
@@ -122,6 +126,12 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
   registerManagementRoutes(app, {
     core: managementCore,
     sendBearer: env.DISPATCHER_SEND_BEARER,
+  });
+
+  // ── /mcp/messaging-v0 (Messaging MCP Tier 1, F4) ────────────────────────
+  registerMcpRoutes(app, {
+    reads: { sql, redis: rawRedis, logger },
+    mcpBearer: env.MESSAGING_MCP_BEARER,
   });
 
   // ── /admin/queues (Bull Board) ──────────────────────────────────────────
