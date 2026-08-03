@@ -119,18 +119,25 @@ export async function resolveCategory(
  * dejar que Meta falle: un 4xx de Meta cuesta una llamada, ensucia las
  * métricas y le devuelve al agente un error de vendor en vez de uno accionable.
  *
- * Fuente: `bot.audience_contact_channels.last_seen_at`. La columna existe
- * desde la mig 039 pero nació sin alimentar; F5 la llena desde el webhook de
- * Meta (el único punto que ve el 100% de los entrantes, sin el gate de
- * `ai-stop` que sí afecta a `bot.leads`) vía la función `bot.buc_touch_last_seen`
- * — la BUC sólo se escribe por sus funciones `buc_*` (regla R7).
+ * Fuente: `bot.audience_contact_channels.last_inbound_at` (mig 140), que
+ * escribe **sólo** el feeder del webhook de Meta — el único punto que ve el
+ * 100% de los entrantes, sin el gate de `ai-stop` que sí afecta a `bot.leads` —
+ * vía `bot.buc_touch_last_inbound` (la BUC se escribe únicamente por sus
+ * funciones `buc_*`, regla R7).
  *
- * **Sólo rechaza con evidencia positiva.** Si no hay dato (contacto sin fila,
- * `last_seen_at` NULL, o la query falla) hace fail-open y deja que Meta
- * decida, que es el comportamiento previo a F5. La razón: un `last_seen_at`
- * vacío no distingue "este contacto nunca escribió" de "el alimentador todavía
- * no corrió para este contacto", y bloquear envíos legítimos por un dato que
- * todavía se está poblando es peor que pagar un 4xx de Meta.
+ * **NO se usa `last_seen_at`**, que es la trampa obvia: esa columna nace
+ * `NOT NULL DEFAULT now()` y `buc_upsert_contact` la pisa en cada upsert, así
+ * que significa "última vez que tocamos el registro", no "el contacto nos
+ * escribió". Siempre tiene valor y casi siempre es viejo: leerla como
+ * evidencia haría que el servicio rechazara texto libre a todos los contactos.
+ * Un dato que siempre existe pero no significa lo que se le pide es peor que
+ * no tener dato.
+ *
+ * **Sólo rechaza con evidencia positiva.** Sin dato (`last_inbound_at` NULL,
+ * contacto sin fila, o la query falla) hace fail-open y deja que Meta decida,
+ * que es el comportamiento previo a F5: un NULL no distingue "nunca escribió"
+ * de "el feeder todavía no vio a este contacto", y bloquear envíos legítimos
+ * por un dato que recién se está poblando es peor que pagar un 4xx de Meta.
  *
  * Matching de teléfono: la MISMA canonicalización que usa el escritor
  * (`bot.buc_touch_last_seen`, mig 139, heredada de `buc_upsert_contact`) —
@@ -148,17 +155,17 @@ export async function isWithin24hWindow(
   to: string,
 ): Promise<{ within: boolean; known: boolean; lastInboundAt: string | null }> {
   try {
-    const rows = await sql<Array<{ last_seen_at: Date | null }>>`
-      SELECT ch.last_seen_at
+    const rows = await sql<Array<{ last_inbound_at: Date | null }>>`
+      SELECT ch.last_inbound_at
       FROM bot.audience_contact_channels ch
       JOIN bot.audience_contacts c ON c.id = ch.audience_contact_id
       WHERE ch.channel = ${channel}
         AND (CASE WHEN c.phone LIKE '+549%' THEN '+54' || substring(c.phone FROM 5) ELSE c.phone END)
           = (CASE WHEN ${to} LIKE '+549%' THEN '+54' || substring(${to} FROM 5) ELSE ${to} END)
-      ORDER BY ch.last_seen_at DESC NULLS LAST
+      ORDER BY ch.last_inbound_at DESC NULLS LAST
       LIMIT 1
     `;
-    const last = rows[0]?.last_seen_at;
+    const last = rows[0]?.last_inbound_at;
     if (!last) {
       // Sin dato ≠ fuera de ventana. Ver el comentario de arriba.
       return { within: true, known: false, lastInboundAt: null };

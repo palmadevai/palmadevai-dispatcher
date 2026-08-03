@@ -248,7 +248,7 @@ describe('sendMessage — 24h service window (free-form whatsapp text)', () => {
   it('sends free-form text when the contact wrote within the last 24h', async () => {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
     mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-within' });
-    const sql = makeFakeSql([[], [{ last_seen_at: twoHoursAgo }]]);
+    const sql = makeFakeSql([[], [{ last_inbound_at: twoHoursAgo }]]);
     const deps = makeDeps({ sql });
     const msg = makeMsg({ context: { feature: 'f', client_ref: 'ref-within' } });
 
@@ -259,7 +259,7 @@ describe('sendMessage — 24h service window (free-form whatsapp text)', () => {
 
   it('rejects outside_24h_window for free-form text after 24h, and points to a template', async () => {
     const thirtyHoursAgo = new Date(Date.now() - 30 * 60 * 60 * 1000);
-    const sql = makeFakeSql([[], [{ last_seen_at: thirtyHoursAgo }]]);
+    const sql = makeFakeSql([[], [{ last_inbound_at: thirtyHoursAgo }]]);
     const deps = makeDeps({ sql });
     const msg = makeMsg({ context: { feature: 'f', client_ref: 'ref-outside' } });
 
@@ -273,7 +273,7 @@ describe('sendMessage — 24h service window (free-form whatsapp text)', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('fail-opens (sends) when there is no last_seen_at data at all', async () => {
+  it('fail-opens (sends) when there is no last_inbound_at data at all', async () => {
     mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-nodata' });
     const sql = makeFakeSql([[], []]); // opt-out empty, window query empty
     const deps = makeDeps({ sql });
@@ -304,7 +304,7 @@ describe('sendMessage — 24h service window (free-form whatsapp text)', () => {
 
   it('sends a notification kind text even outside the window (staff exemption)', async () => {
     mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-notif' });
-    const deps = makeDeps(); // default sql never returns a last_seen_at row anyway
+    const deps = makeDeps(); // default sql never returns a last_inbound_at row anyway
     const msg = makeMsg({
       to: '+5491111111111',
       context: { feature: 'f', client_ref: 'ref-notif-window', kind: 'notification' },
@@ -391,8 +391,8 @@ describe('sendMessage — missing configuration', () => {
 });
 
 describe('isWithin24hWindow', () => {
-  it('returns within=true known=true for a recent last_seen_at', async () => {
-    const sql = makeFakeSql([[{ last_seen_at: new Date(Date.now() - 60 * 60 * 1000) }]]);
+  it('returns within=true known=true for a recent last_inbound_at', async () => {
+    const sql = makeFakeSql([[{ last_inbound_at: new Date(Date.now() - 60 * 60 * 1000) }]]);
     const logger = makeFakeLogger();
 
     const result = await isWithin24hWindow(sql, logger, 'whatsapp', '+5491111111111');
@@ -401,8 +401,8 @@ describe('isWithin24hWindow', () => {
     expect(result.known).toBe(true);
   });
 
-  it('returns within=false known=true for a stale last_seen_at', async () => {
-    const sql = makeFakeSql([[{ last_seen_at: new Date(Date.now() - 25 * 60 * 60 * 1000) }]]);
+  it('returns within=false known=true for a stale last_inbound_at', async () => {
+    const sql = makeFakeSql([[{ last_inbound_at: new Date(Date.now() - 25 * 60 * 60 * 1000) }]]);
     const logger = makeFakeLogger();
 
     const result = await isWithin24hWindow(sql, logger, 'whatsapp', '+5491111111111');
