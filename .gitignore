@@ -28,3 +28,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Worktrees de sesión (política handbook#179: van DENTRO del repo, en tmp/)
+tmp/
