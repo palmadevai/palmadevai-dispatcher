@@ -94,6 +94,47 @@ export interface RateLimiter {
   acquire(stoppingCheck: () => boolean): Promise<void>;
 }
 
+/**
+ * Variante NO bloqueante del mismo bucket, para el rate limit por emisor de
+ * las tools MCP Tier 3 (F5/H5.2).
+ *
+ * El `acquire()` de arriba espera hasta tener token: es lo correcto para el
+ * worker de campañas, que quiere pacing y no pérdida. Una tool MCP es lo
+ * contrario — el agente está esperando la respuesta, así que pasarse del
+ * límite se responde al toque con un error accionable ("esperá N ms") en vez
+ * de colgar la llamada.
+ *
+ * Fail-open ante Redis caído, igual que el resto de las guardas de
+ * infraestructura del servicio: el techo de gasto real lo pone el budget
+ * enforcement (que además persiste en Postgres), este limitador es la segunda
+ * línea contra un agente en loop.
+ */
+export async function tryAcquireToken(cfg: {
+  redis: Redis;
+  key: string;
+  maxBurst: number;
+  refillPerSec: number;
+  logger?: { warn: (obj: object, msg: string) => void };
+}): Promise<{ acquired: boolean; waitMs: number }> {
+  try {
+    const result = (await cfg.redis.eval(
+      LUA_SCRIPT,
+      1,
+      cfg.key,
+      String(cfg.maxBurst),
+      String(cfg.refillPerSec),
+      String(Date.now()),
+    )) as [number, number];
+    return { acquired: result[0] === 1, waitMs: Number(result[1]) || 0 };
+  } catch (err) {
+    cfg.logger?.warn(
+      { err: (err as Error).message, key: cfg.key },
+      'tryAcquireToken: Redis EVAL failed — fail-open (budget sigue siendo el techo real)',
+    );
+    return { acquired: true, waitMs: 0 };
+  }
+}
+
 export function createRedisRateLimiter(cfg: RateLimiterConfig): RateLimiter {
   const key = `${cfg.keyPrefix}:${cfg.scope}`;
   let consecutiveErrors = 0;

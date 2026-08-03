@@ -128,10 +128,27 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     sendBearer: env.DISPATCHER_SEND_BEARER,
   });
 
-  // ── /mcp/messaging-v0 (Messaging MCP Tier 1, F4) ────────────────────────
+  // ── /mcp/messaging-v0 (Messaging MCP: Tier 1 F4, Tier 2/3 F5) ───────────
+  // Los tres cores se pasan siempre; qué tools se registran lo decide el scope
+  // de la identidad que resuelva el bearer de cada conexión (identity.ts).
   registerMcpRoutes(app, {
-    reads: { sql, redis: rawRedis, logger },
-    mcpBearer: env.MESSAGING_MCP_BEARER,
+    tools: {
+      reads: { sql, redis: rawRedis, logger },
+      management: managementCore,
+      send: {
+        sql,
+        redis: rawRedis,
+        logger,
+        metrics: metricsCollector,
+        staffAllowlist: env.STAFF_NOTIFY_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean),
+        defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
+        defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+      },
+    },
+    bearers: {
+      read: env.MESSAGING_MCP_BEARER,
+      write: env.MESSAGING_MCP_WRITE_BEARER,
+    },
   });
 
   // ── /admin/queues (Bull Board) ──────────────────────────────────────────

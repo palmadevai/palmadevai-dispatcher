@@ -145,6 +145,15 @@ const schema = z.object({
   // (chat-site) nunca porta la credencial que autoriza writes en /send y
   // /management. Ausente → /mcp/* responde 503 (fail-closed).
   MESSAGING_MCP_BEARER: z.string().optional(),
+
+  // ── Messaging Service — MCP Tier 2/3 (Fase 5, H5.1-H5.2) ─────────────────
+  // Bearer de ESCRITURA del MCP: habilita las tools de management (sync/create
+  // de templates y endpoints) y las de envío (send_template, send_message,
+  // send_internal_notification), y resuelve a la identidad `messaging-mcp-staff`
+  // en el audit. Separado del read-only a propósito: quien sólo consulta nunca
+  // tiene en memoria la credencial que autoriza gastar plata. Ausente → esas
+  // tools no se registran (el MCP sigue sirviendo Tier 1 con el otro bearer).
+  MESSAGING_MCP_WRITE_BEARER: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);
