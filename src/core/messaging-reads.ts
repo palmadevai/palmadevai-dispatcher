@@ -222,6 +222,10 @@ export interface DeliveryStatus {
 /**
  * Estado de un envío por `client_ref` o id de delivery. Responde "¿por qué no
  * le llegó el mensaje a X?" con la categoría de error neutral (`provider_*`).
+ *
+ * Ambas columnas son uuid — se comparan con `::text` sobre la COLUMNA para
+ * que un input no-uuid del agente devuelva `found:false` en vez de reventar
+ * con "invalid input syntax for type uuid" (incidente del primer smoke F4).
  */
 export async function getDeliveryStatus(
   deps: ReadDeps,
@@ -235,7 +239,7 @@ export async function getDeliveryStatus(
            d.error_code, d.error_message, d.failure_reason, d.retry_count
     FROM bot.campaign_deliveries d
     LEFT JOIN bot.campaigns c ON c.id = d.campaign_id
-    WHERE (${args.client_ref ?? null}::text IS NOT NULL AND d.client_ref = ${args.client_ref ?? null})
+    WHERE (${args.client_ref ?? null}::text IS NOT NULL AND d.client_ref::text = ${args.client_ref ?? null})
        OR (${args.delivery_id ?? null}::text IS NOT NULL AND d.id::text = ${args.delivery_id ?? null})
     ORDER BY d.queued_at DESC
     LIMIT 1
