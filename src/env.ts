@@ -105,11 +105,16 @@ const schema = z.object({
   // `error_code='resend_api_key_missing'` (classified payload_invalid, no retry).
   // The dispatcher boots fine — only campaigns with channel='email' are blocked.
   RESEND_API_KEY: z.string().optional(),
-  // Default From for email campaigns. Per-campaign override comes from
-  // template.body.from once cockpit UI ships (PR3). Sandbox default below
-  // works only for the Resend account owner; configure a verified domain
-  // before launching real campaigns.
-  CAMPAIGNS_DEFAULT_FROM_EMAIL: z.string().default('onboarding@resend.dev'),
+  // Fallback del remitente por defecto. La fuente real es
+  // `bot.config['branding'].email_from` (ver lib/providers.ts); esta env es el
+  // fallback de transición de T5.6, no la fuente de verdad.
+  //
+  // ⚠ SIN default a propósito. Tenía `onboarding@resend.dev`, el sandbox de
+  // Resend, que devuelve 200 y entrega **al dueño de la cuenta**: una campaña
+  // por email se reportaba enviada y no llegaba a nadie. Sacarlo del compose no
+  // alcanzaba — este `.default()` de zod lo reintroducía en cuanto la variable
+  // no llegara. Sin remitente no se manda, igual que el gate de los workflows.
+  CAMPAIGNS_DEFAULT_FROM_EMAIL: z.string().optional(),
   // Public unsubscribe link prefix injected in every email footer. Final URL is
   // `<base>/u/<audience_contact_id>`. Default derives from DOMAIN at boot.
   CAMPAIGNS_UNSUBSCRIBE_BASE_URL: z.string().optional(),

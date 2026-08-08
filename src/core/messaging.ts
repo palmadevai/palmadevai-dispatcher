@@ -50,7 +50,8 @@ export interface SendDeps {
   /** `env.META_WA_DEFAULT_PHONE_NUMBER_ID`. Undefined → whatsapp falla. */
   defaultWaPhoneNumberId: string | undefined;
   /** `env.CAMPAIGNS_DEFAULT_FROM_EMAIL` — reusado, sin env nueva para /send. */
-  defaultFromEmail: string;
+  /** Fallback de transición (T5.6). La fuente real es bot.config[branding].email_from. */
+  defaultFromEmail: string | undefined;
 }
 
 /** Motivos de rechazo por guarda — el mensaje NO salió y no es culpa del provider. */
@@ -339,8 +340,21 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   } else {
     // msg.channel === 'email', msg.content.type === 'text' (guardado arriba)
     const text = msg.content.type === 'text' ? msg.content.text : '';
+    // ⚠ El remitente lo define LA APLICACIÓN QUE LLAMA, no este servicio. El
+    // messaging service ejecuta el envío y aporta la credencial de la cuenta;
+    // con qué dirección sale y a quién es decisión de quien llama. `deps` es
+    // sólo el fallback de transición hasta que `/send` v2 lo exija en el
+    // payload (T9.1).
+    const from = deps.defaultFromEmail;
+    if (!from) {
+      return {
+        status: 'failed',
+        error_code: 'email_from_missing',
+        error_message: 'sin remitente: la aplicación que llama tiene que declararlo',
+      };
+    }
     sendInput = {
-      from: deps.defaultFromEmail,
+      from,
       to: msg.to,
       subject: text.slice(0, EMAIL_SUBJECT_MAX_CHARS),
       html: `<p>${escapeHtml(text)}</p>`,
