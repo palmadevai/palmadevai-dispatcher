@@ -153,8 +153,10 @@ export async function moveToDLQ(
             const link = env.COCKPIT_URL
               ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
               : '';
+            // Sin remitente no se manda ni la alerta: mandar desde un
+            // remitente equivocado es peor que no avisar.
             void sendEmail({
-              from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+              from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL ?? '',
               to: alertEmail,
               subject: `Campaña pausada automáticamente: ${name}`,
               html:

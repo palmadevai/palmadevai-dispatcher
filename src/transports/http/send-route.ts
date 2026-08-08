@@ -33,7 +33,7 @@ export interface SendRouteDeps {
   /** `env.META_WA_DEFAULT_PHONE_NUMBER_ID`. Undefined → whatsapp da 502. */
   defaultWaPhoneNumberId: string | undefined;
   /** `env.CAMPAIGNS_DEFAULT_FROM_EMAIL` — reusado, sin env nueva para `/send`. */
-  defaultFromEmail: string;
+  defaultFromEmail: string | undefined;
 }
 
 /**

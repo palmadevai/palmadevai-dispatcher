@@ -25,6 +25,7 @@
  */
 import { request } from 'undici';
 import { env } from '../env.js';
+import { resolveProviderKey } from '../lib/providers.js';
 import { logger } from '../lib/logger.js';
 import { classifyResendError } from '../classify/email-error-classifier.js';
 import type { DeliveryContext } from '../dispatch/audience-resolver.js';
@@ -54,15 +55,18 @@ interface ResendErrorResponse {
 }
 
 export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResult> {
-  if (!env.RESEND_API_KEY) {
-    // Treat as terminal config error — operator forgot the env var.
-    // Returning ok=false (not throwing) lets the retry layer ack and the
-    // classifier mark it failed without retry cycles.
+  // La credencial se resuelve por llamada (T5.4): `ownership` puede cambiar en
+  // caliente (BYOK) y con lectura en module-load un cutover no tomaba efecto
+  // hasta reiniciar el contenedor. El resolver cachea 30 s.
+  const key = await resolveProviderKey('resend');
+  if (!key.ok) {
+    // Error de config TERMINAL: se devuelve ok=false en vez de tirar, para que
+    // la capa de retry ackee y el clasificador lo marque failed sin ciclos.
     return {
       ok: false,
       http_status: 0,
       error_code: 'resend_api_key_missing',
-      error_message: 'RESEND_API_KEY is not configured in the dispatcher env',
+      error_message: key.error,
     };
   }
 
@@ -82,7 +86,7 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
     res = await request(RESEND_API_URL, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${env.RESEND_API_KEY}`,
+        authorization: `Bearer ${key.apiKey}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -276,10 +280,25 @@ export async function prepareEmail(
     unsubscribeBaseUrl: unsubBase,
   });
 
+  // Remitente de CAMPAÑAS: lo define la aplicación (el template, o el default
+  // configurado de campañas), no el messaging service. Sin remitente no se
+  // manda: el sandbox de Resend entregaba al dueño de la cuenta, así que una
+  // campaña se reportaba enviada y no llegaba a nadie.
   const fromOverride =
     typeof ctx.template.body.from === 'string'
       ? (ctx.template.body.from as string)
       : env.CAMPAIGNS_DEFAULT_FROM_EMAIL;
+
+  if (!fromOverride) {
+    // Terminal, no retry: reintentar sin remitente da exactamente lo mismo.
+    return {
+      kind: 'terminal',
+      error_code: 'email_from_missing',
+      error_message:
+        'sin remitente: ni template.body.from, ni bot.config[branding].email_from, ni CAMPAIGNS_DEFAULT_FROM_EMAIL',
+      failure_reason: 'payload_invalid',
+    };
+  }
 
   const sendInput: EmailSendInput = {
     from: fromOverride,

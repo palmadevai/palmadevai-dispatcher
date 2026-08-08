@@ -191,9 +191,34 @@ describe('prepareEmail', () => {
     });
   });
 
-  it('returns a ready outcome with rendered subject/html and no endpoint row', async () => {
+  it('sin remitente declarado por la aplicación, el outcome es terminal', async () => {
+    // No hay default de remitente en ninguna capa, a propósito: el messaging
+    // service ejecuta el envío, pero CON QUÉ DIRECCIÓN SALE lo define la
+    // aplicación que llama. Un default hace que "no configurado" se vea igual
+    // que "configurado" y falle en silencio.
     const ctx = makeCtx({
-      templateBody: { subject: 'Hola {{name}}', html: '<p>Hola {{name}}</p>' },
+      templateBody: { subject: 'Hola', html: '<p>Hola</p>' },
+    });
+    const outcome = await prepareEmail(fakeTx, ctx, {});
+    expect(outcome.kind).toBe('terminal');
+    if (outcome.kind !== 'terminal') throw new Error('unreachable');
+    expect(outcome.error_code).toBe('email_from_missing');
+    // Terminal, no retry: reintentar sin remitente da exactamente lo mismo.
+    expect(outcome.failure_reason).toBe('payload_invalid');
+  });
+
+  it('returns a ready outcome with rendered subject/html and no endpoint row', async () => {
+    // El `from` lo declara LA APLICACIÓN. Antes este test pasaba sin declararlo
+    // porque el schema de env traía `onboarding@resend.dev` como default de
+    // zod — o sea que el test dependía del bug: el sandbox sólo entrega al
+    // dueño de la cuenta, así que una campaña se reportaba enviada y no
+    // llegaba a nadie.
+    const ctx = makeCtx({
+      templateBody: {
+        subject: 'Hola {{name}}',
+        html: '<p>Hola {{name}}</p>',
+        from: 'campanas@ejemplo.com',
+      },
     });
     const outcome = await prepareEmail(fakeTx, ctx, {});
     expect(outcome.kind).toBe('ready');
