@@ -38,6 +38,12 @@ export interface EmailSendInput {
   subject: string;
   html: string;
   text?: string;
+  /**
+   * Adjuntos en vocabulario NEUTRO (T9.1 / R8). El mapeo a los nombres de
+   * Resend vive abajo, en el armado del body — que es el único lugar de este
+   * archivo que puede saber de Resend.
+   */
+  attachments?: { filename: string; content_base64: string; content_type?: string }[];
   biz_opaque_callback_data: string;
 }
 
@@ -76,6 +82,18 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
     subject: input.subject,
     html: input.html,
     ...(input.text ? { text: input.text } : {}),
+    // ↓ ÚNICO punto donde el vocabulario neutro se traduce al del proveedor
+    // (R8). Resend llama `content` al base64 y `content_type` al MIME; si
+    // mañana el proveedor cambia, cambia esta línea y nada más.
+    ...(input.attachments?.length
+      ? {
+          attachments: input.attachments.map((a) => ({
+            filename: a.filename,
+            content: a.content_base64,
+            ...(a.content_type ? { content_type: a.content_type } : {}),
+          })),
+        }
+      : {}),
     tags: [
       { name: 'client_ref', value: input.biz_opaque_callback_data },
     ],

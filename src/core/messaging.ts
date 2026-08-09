@@ -37,7 +37,6 @@ import type { EmailSendInput } from '../providers/email.js';
 import type { ProviderSendResult } from '../providers/types.js';
 
 const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
-const EMAIL_SUBJECT_MAX_CHARS = 60;
 
 export interface SendDeps {
   sql: SqlClient;
@@ -94,18 +93,34 @@ export async function resolveCategory(
   logger: Logger,
   msg: OutboundMessage,
 ): Promise<string> {
-  if (msg.content.type === 'text') return 'service';
+  // T9.2 — categoría propia para lo transaccional. Un comprobante fiscal no
+  // es `service` ni `marketing`: es una obligación con el cliente final, y
+  // mezclarlo con el resto haría que compita por el mismo tope de US$5/mes que
+  // fijó la mig 137 para mensajería.
+  //
+  // Se decide por `context.kind`, que ya existía en el schema y estaba sin
+  // usar del lado del budget: es una declaración de la app que llama, no algo
+  // que este servicio pueda deducir del contenido.
+  if (msg.context.kind === 'transactional') return 'transactional';
+
+  // Sólo un `template` tiene categoría que mirar. `text` y —desde T9.1—
+  // `mail` son conversacionales: no hay fila en `message_templates` que
+  // consultar. Se chequea la variante que SÍ la tiene, en vez de asumir que
+  // "lo que no es text es template" — que es lo que se rompió al sumar la
+  // tercera.
+  if (msg.content.type !== 'template') return 'service';
+  const template = msg.content;
   try {
     const rows = await sql<Array<{ category: string }>>`
       SELECT category FROM bot.message_templates
-      WHERE channel = ${msg.channel} AND name = ${msg.content.name}
+      WHERE channel = ${msg.channel} AND name = ${template.name}
       ORDER BY updated_at DESC
       LIMIT 1
     `;
     return rows[0]?.category ?? 'marketing';
   } catch (err) {
     logger.warn(
-      { err: (err as Error).message, channel: msg.channel, template_name: msg.content.name },
+      { err: (err as Error).message, channel: msg.channel, template_name: template.name },
       'message_templates category lookup failed — defaulting to marketing (conservative)',
     );
     return 'marketing';
@@ -196,11 +211,22 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   const { feature, client_ref, kind } = msg.context;
 
   // ── 1. Combos canal × contenido no soportados (v1) ────────────────────────
-  if (msg.channel === 'email' && msg.content.type !== 'text') {
+  if (msg.channel === 'email' && msg.content.type !== 'mail') {
     return {
       status: 'rejected',
       reason: 'unsupported_content_type',
-      detail: 'email only supports content.type=text in v1',
+      detail: 'email requiere content.type=mail (subject + html/text, adjuntos opcionales)',
+    };
+  }
+  // El simétrico, que faltaba: `mail` es contenido de correo y no existe en
+  // whatsapp. Sin esta guarda un `whatsapp` + `mail` pasaba de largo hasta el
+  // armado del payload — o sea, un 500 por un body que el servicio puede
+  // rechazar con un 400 y un motivo.
+  if (msg.channel === 'whatsapp' && msg.content.type === 'mail') {
+    return {
+      status: 'rejected',
+      reason: 'unsupported_content_type',
+      detail: 'whatsapp no soporta content.type=mail (usá text o template)',
     };
   }
 
@@ -248,12 +274,38 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     };
   }
 
-  // ── 4. Opt-out (whatsapp; las notificaciones van a destinos internos) ─────
-  if (msg.channel === 'whatsapp' && kind !== 'notification') {
+  // ── 4. Opt-out ────────────────────────────────────────────────────────────
+  //
+  // T9.3 — **el criterio es el TIPO de mensaje, no el canal.**
+  //
+  // Antes la condición era `channel === 'whatsapp' && kind !== 'notification'`,
+  // así que todo el email quedaba exento **por omisión**: no porque se hubiera
+  // decidido, sino porque la guarda nunca lo miraba. Con F6 metiendo *todo* el
+  // correo por acá, esa exención accidental pasaría a cubrir también las
+  // campañas por email — que son exactamente lo que el opt-out existe para
+  // frenar. La baja de la BUC es sobre **marketing**.
+  //
+  // Las dos exenciones quedan EXPLÍCITAS y por motivo propio:
+  //   `notification`  → destinos internos de staff, que no están en la BUC.
+  //   `transactional` → nadie se da de baja de su propia factura (T9.2/T9.3).
+  //
+  // Un `kind` ausente NO está exento: el default es chequear. Si mañana entra
+  // un emisor que se olvida de declararlo, el error es de más y no de menos.
+  const optOutExempt = kind === 'notification' || kind === 'transactional';
+  if (!optOutExempt) {
     try {
-      const rows = await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
-        SELECT unsubscribed_at FROM bot.audience_contacts WHERE phone = ${msg.to} LIMIT 1
-      `;
+      // El identificador del contacto depende del canal: teléfono para
+      // whatsapp, dirección para email. Es la misma pregunta —«¿este contacto
+      // se dio de baja?»— hecha por la columna que corresponde.
+      const rows =
+        msg.channel === 'email'
+          ? await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
+              SELECT unsubscribed_at FROM bot.audience_contacts
+               WHERE lower(email) = lower(${msg.to}) LIMIT 1
+            `
+          : await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
+              SELECT unsubscribed_at FROM bot.audience_contacts WHERE phone = ${msg.to} LIMIT 1
+            `;
       if (rows[0]?.unsubscribed_at) {
         return {
           status: 'rejected',
@@ -297,7 +349,23 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   await maybeAlert(deps.redis, deps.logger, msg.channel, category, budgetResult);
 
   const criticalBypass = kind === 'notification' && msg.context.critical === true;
-  if (!budgetResult.allowed && !criticalBypass) {
+
+  // T9.2 — lo transaccional SE CUENTA PERO NO SE BLOQUEA.
+  //
+  // Contar y capar son cosas distintas, y acá se separan a propósito: un
+  // comprobante fiscal es una obligación con el cliente final, así que un tope
+  // de mensajería no puede ser lo que decida si sale. Pero el gasto se registra
+  // igual (`recordSendUsage` corre después del envío, fuera de esta guarda) y
+  // **la alerta sigue disparando**, así que si el volumen se dispara se ve —
+  // simplemente no se traduce en un mail no enviado.
+  //
+  // ⚠ Es distinto del bypass `critical`, que es una excepción puntual de
+  // `safety-trigger`. Esto es una CATEGORÍA con semántica propia, y por eso no
+  // hereda el tope de US$5/mes de la mig 137: hasta que tenga uno pensado, no
+  // tener tope es más honesto que heredar uno que se eligió para otra cosa.
+  const transactionalBypass = category === 'transactional';
+
+  if (!budgetResult.allowed && !criticalBypass && !transactionalBypass) {
     deps.logger.warn(
       { feature, channel: msg.channel, category, ...budgetResult },
       'sendMessage: budget_exceeded',
@@ -328,7 +396,14 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
             type: 'text',
             body: msg.content.text,
           }
-        : {
+        : msg.content.type !== 'template'
+          ? // `mail` en whatsapp no existe: lo rechaza la guarda 1. El caso está
+            // acá para que el compilador no tenga que adivinar, no porque pueda
+            // pasar — y si algún día pasa, falla ruidoso en vez de mandar vacío.
+            (() => {
+              throw new Error(`content.type=${msg.content.type} no es válido para whatsapp`);
+            })()
+          : {
             phone_number_id: deps.defaultWaPhoneNumberId,
             to: msg.to,
             biz_opaque_callback_data: client_ref,
@@ -338,14 +413,25 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
             components: msg.content.components ?? [],
           };
   } else {
-    // msg.channel === 'email', msg.content.type === 'text' (guardado arriba)
-    const text = msg.content.type === 'text' ? msg.content.text : '';
-    // ⚠ El remitente lo define LA APLICACIÓN QUE LLAMA, no este servicio. El
-    // messaging service ejecuta el envío y aporta la credencial de la cuenta;
-    // con qué dirección sale y a quién es decisión de quien llama. `deps` es
-    // sólo el fallback de transición hasta que `/send` v2 lo exija en el
-    // payload (T9.1).
-    const from = deps.defaultFromEmail;
+    // msg.channel === 'email', msg.content.type === 'mail' (guardado arriba)
+    const mail = msg.content.type === 'mail' ? msg.content : null;
+    if (!mail) {
+      return {
+        status: 'failed',
+        error_code: 'email_content_invalid',
+        error_message: 'contenido de mail ausente tras la validación',
+      };
+    }
+    // ⚠ El remitente lo define LA APLICACIÓN QUE LLAMA, no este servicio (R9).
+    // El messaging service ejecuta el envío y aporta la credencial de la
+    // cuenta; con qué dirección sale es decisión de negocio de quien llama —
+    // `onboarding@` para acceso, `noreply@` para transaccional (T12).
+    //
+    // `deps.defaultFromEmail` queda como fallback de transición y NO como
+    // default de producto: un default fue lo que hizo que el sandbox de Resend
+    // y el dominio del laboratorio se colaran como remitente de clientes
+    // reales. Cuando todos los emisores declaren `from` (T9.4/T9.5), se saca.
+    const from = msg.from ?? deps.defaultFromEmail;
     if (!from) {
       return {
         status: 'failed',
@@ -356,8 +442,13 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     sendInput = {
       from,
       to: msg.to,
-      subject: text.slice(0, EMAIL_SUBJECT_MAX_CHARS),
-      html: `<p>${escapeHtml(text)}</p>`,
+      subject: mail.subject,
+      // Uno de los dos existe (lo garantiza el schema). Si sólo vino texto
+      // plano se envuelve para tener cuerpo HTML, pero el texto viaja igual
+      // como `text` — no se pierde el original ni se inventa formato.
+      html: mail.html ?? `<p>${escapeHtml(mail.text ?? '')}</p>`,
+      ...(mail.text ? { text: mail.text } : {}),
+      ...(mail.attachments?.length ? { attachments: mail.attachments } : {}),
       biz_opaque_callback_data: client_ref,
     };
   }
