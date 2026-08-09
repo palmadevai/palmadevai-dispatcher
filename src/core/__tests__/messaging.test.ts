@@ -210,6 +210,96 @@ describe('sendMessage — staff allowlist', () => {
   });
 });
 
+// La guarda de destino de una notificación por MAIL. Antes de esto la rama de
+// teléfonos corría para todo canal, así que `kind:'notification'` +
+// `channel:'email'` daba 403 SIEMPRE (`toE164()` sobre una dirección devuelve
+// `null`). No era una lista vacía: era que el canal email no tenía lista.
+describe('sendMessage — staff allowlist por mail', () => {
+  function mailNotification(to: string, ref: string): OutboundMessage {
+    return makeMsg({
+      channel: 'email',
+      to,
+      from: 'noreply@ejemplo.test',
+      content: { type: 'mail', subject: 'aviso', text: 'cuerpo' },
+      context: { feature: 'f', client_ref: ref, kind: 'notification' },
+    });
+  }
+
+  it('una notificación a la admin_email del cliente SALE (antes daba 403 siempre)', async () => {
+    const sql = makeFakeSql([[{ admin_email: 'ops@ejemplo.test' }]]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('ops@ejemplo.test', 'ref-mail-ok'));
+
+    expect(result.status).not.toBe('rejected');
+    expect(mockSend).toHaveBeenCalled();
+  });
+
+  it('compara sin distinguir mayúsculas ni espacios de los dos lados', async () => {
+    // Es un dato cargado a mano desde la UI: exigir coincidencia literal repite
+    // el incidente del 2026-08-03 con otro identificador.
+    const sql = makeFakeSql([[{ admin_email: '  OPS@Ejemplo.TEST ' }]]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification(' ops@ejemplo.test ', 'ref-mail-case'));
+
+    expect(result.status).not.toBe('rejected');
+  });
+
+  it('rechaza cualquier otra dirección, y el detail dice DÓNDE se configura', async () => {
+    const sql = makeFakeSql([[{ admin_email: 'ops@ejemplo.test' }]]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('ajeno@otro.test', 'ref-mail-no'));
+
+    expect(result).toEqual({
+      status: 'rejected',
+      reason: 'destination_not_allowed',
+      detail: "destination is not a staff address (bot.config['branding'].admin_email)",
+    });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('sin admin_email cargada NO se manda (fail-closed, no fail-open)', async () => {
+    const sql = makeFakeSql([[{ admin_email: null }]]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('ops@ejemplo.test', 'ref-mail-vacia'));
+
+    expect(result).toMatchObject({ status: 'rejected', reason: 'destination_not_allowed' });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('con la query rota tampoco se manda: es una guarda de destino', async () => {
+    // El opt-out falla ABIERTO a propósito (§4); esto no. Fallar abierta una
+    // guarda de destino la anula justo cuando la base no puede desmentirte.
+    const deps = makeDeps({ sql: makeThrowingSql() });
+
+    const result = await sendMessage(deps, mailNotification('ops@ejemplo.test', 'ref-mail-dbdown'));
+
+    expect(result).toMatchObject({ status: 'rejected', reason: 'destination_not_allowed' });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('un mail SIN kind:notification no pasa por esta guarda', async () => {
+    // La guarda es de notificaciones. Un comprobante va a un tercero por
+    // diseño: si esto lo filtrara, no saldría ninguna factura.
+    const sql = makeFakeSql([[], []]); // opt-out vacío
+    const deps = makeDeps({ sql });
+    const msg = makeMsg({
+      channel: 'email',
+      to: 'cliente-final@otro.test',
+      from: 'noreply@ejemplo.test',
+      content: { type: 'mail', subject: 'factura', text: 'cuerpo' },
+      context: { feature: 'facturacion', client_ref: 'ref-mail-tx', kind: 'transactional' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result.status).not.toBe('rejected');
+  });
+});
+
 describe('sendMessage — opt-out', () => {
   it('rejects opted_out when the contact has unsubscribed_at set', async () => {
     const sql = makeFakeSql([[{ unsubscribed_at: new Date('2026-01-01') }]]);

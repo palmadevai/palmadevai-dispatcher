@@ -128,6 +128,69 @@ export async function resolveCategory(
 }
 
 /**
+ * Direcciones de staff del cliente, para la guarda de destino de las
+ * notificaciones por **email**.
+ *
+ * Hoy es UNA: `bot.config['branding'].admin_email` — el mismo dato que el
+ * cockpit ya usa como destinatario de sus avisos y que el operador edita desde
+ * la UI. **Es configuración, no secreto**, así que su lugar es la DB y no el
+ * `.env` (frontera del handbook: "¿habría que rotarlo si se filtra?" → no).
+ *
+ * Si mañana hacen falta varias, la lista va en una key propia de `bot.config`
+ * con ésta como default — no en una env nueva, que además repetiría el modo de
+ * falla del 2026-08-03 (valor cargado a mano que no matchea nunca).
+ *
+ * **Fail-closed**: sin dato, o con la query rota, devuelve vacío y la
+ * notificación se rechaza. Es una guarda de destino; fallar abierta la anula.
+ */
+export async function resolveStaffEmails(sql: SqlClient, logger: Logger): Promise<Set<string>> {
+  try {
+    const rows = await sql<Array<{ admin_email: string | null }>>`
+      SELECT value->>'admin_email' AS admin_email FROM bot.config WHERE key = 'branding'
+    `;
+    const v = rows[0]?.admin_email;
+    return typeof v === 'string' && v.trim() ? new Set([v.trim().toLowerCase()]) : new Set();
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'staff email allowlist lookup failed — rejecting the notification (fail-closed)',
+    );
+    return new Set();
+  }
+}
+
+/**
+ * ¿El destino de una notificación es un destino de **staff**?
+ *
+ * La pregunta es la misma para los dos canales —«¿esto va para adentro?»— pero
+ * **el identificador no**: un teléfono se compara en E.164 y una dirección de
+ * mail se compara como dirección.
+ *
+ * ⚠ Hasta acá esto era una sola rama de teléfonos que corría para **todo**
+ * canal, así que una notificación por mail daba `403` **siempre**: `toE164()`
+ * sobre una dirección devuelve `null`, y `null` no está en ninguna lista. No es
+ * que la lista estuviera vacía — es que el canal email no tenía lista. Se
+ * descubrió al migrar los emisores del cockpit (T9.4) y frenaba T9.5, porque
+ * los avisos a staff de los seis workflows caen justo acá.
+ *
+ * La rama de teléfono queda igual, incluido el porqué de normalizar de los DOS
+ * lados: la allowlist se carga a mano en un `.env` y el destino viene de
+ * `bot.agents.phone_e164`, así que comparar literal hace que `549…` y `+549…`
+ * —el mismo número— no coincidan. Eso rechazó cada notificación de ai-recovery
+ * el 2026-08-03. Se normaliza acá y no sólo en el wiring para que la guarda sea
+ * correcta venga de donde venga el `deps` (el MCP arma el suyo).
+ */
+async function isStaffDestination(deps: SendDeps, msg: OutboundMessage): Promise<boolean> {
+  if (msg.channel === 'email') {
+    const staff = await resolveStaffEmails(deps.sql, deps.logger);
+    return staff.has(msg.to.trim().toLowerCase());
+  }
+  const toCanonical = toE164(msg.to);
+  if (!toCanonical) return false;
+  return new Set(normalizeAllowlist(deps.staffAllowlist).allowed).has(toCanonical);
+}
+
+/**
  * Ventana de servicio de 24h de WhatsApp: sólo se puede mandar texto libre si
  * el contacto escribió en las últimas 24 horas. Fuera de la ventana hay que
  * usar un template.
@@ -253,24 +316,18 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   }
 
   // ── 3. Destino staff-only para notificaciones ─────────────────────────────
-  // La comparación va en E.164 canónico de los DOS lados. La allowlist se carga
-  // a mano en un `.env` y el destino viene de `bot.agents.phone_e164`: comparar
-  // literal hace que `549…` y `+549…` —el mismo número— no coincidan, que es
-  // exactamente lo que rechazó cada notificación de ai-recovery el 2026-08-03.
-  // Normalizamos acá y no sólo en el wiring para que la guarda sea correcta
-  // venga de donde venga el `deps` (el MCP arma el suyo).
-  const toCanonical = kind === 'notification' ? toE164(msg.to) : null;
-  const allowCanonical =
-    kind === 'notification' ? new Set(normalizeAllowlist(deps.staffAllowlist).allowed) : null;
-  if (kind === 'notification' && (!toCanonical || !allowCanonical!.has(toCanonical))) {
+  if (kind === 'notification' && !(await isStaffDestination(deps, msg))) {
     deps.logger.warn(
       { feature, channel: msg.channel, to: maskDestination(msg.to) },
-      'sendMessage: notification destination not in STAFF_NOTIFY_ALLOWLIST',
+      'sendMessage: notification destination is not a staff destination',
     );
     return {
       status: 'rejected',
       reason: 'destination_not_allowed',
-      detail: 'destination is not in the staff allowlist',
+      detail:
+        msg.channel === 'email'
+          ? "destination is not a staff address (bot.config['branding'].admin_email)"
+          : 'destination is not in the staff allowlist',
     };
   }
 
