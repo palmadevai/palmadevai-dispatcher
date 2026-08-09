@@ -274,12 +274,38 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     };
   }
 
-  // ── 4. Opt-out (whatsapp; las notificaciones van a destinos internos) ─────
-  if (msg.channel === 'whatsapp' && kind !== 'notification') {
+  // ── 4. Opt-out ────────────────────────────────────────────────────────────
+  //
+  // T9.3 — **el criterio es el TIPO de mensaje, no el canal.**
+  //
+  // Antes la condición era `channel === 'whatsapp' && kind !== 'notification'`,
+  // así que todo el email quedaba exento **por omisión**: no porque se hubiera
+  // decidido, sino porque la guarda nunca lo miraba. Con F6 metiendo *todo* el
+  // correo por acá, esa exención accidental pasaría a cubrir también las
+  // campañas por email — que son exactamente lo que el opt-out existe para
+  // frenar. La baja de la BUC es sobre **marketing**.
+  //
+  // Las dos exenciones quedan EXPLÍCITAS y por motivo propio:
+  //   `notification`  → destinos internos de staff, que no están en la BUC.
+  //   `transactional` → nadie se da de baja de su propia factura (T9.2/T9.3).
+  //
+  // Un `kind` ausente NO está exento: el default es chequear. Si mañana entra
+  // un emisor que se olvida de declararlo, el error es de más y no de menos.
+  const optOutExempt = kind === 'notification' || kind === 'transactional';
+  if (!optOutExempt) {
     try {
-      const rows = await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
-        SELECT unsubscribed_at FROM bot.audience_contacts WHERE phone = ${msg.to} LIMIT 1
-      `;
+      // El identificador del contacto depende del canal: teléfono para
+      // whatsapp, dirección para email. Es la misma pregunta —«¿este contacto
+      // se dio de baja?»— hecha por la columna que corresponde.
+      const rows =
+        msg.channel === 'email'
+          ? await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
+              SELECT unsubscribed_at FROM bot.audience_contacts
+               WHERE lower(email) = lower(${msg.to}) LIMIT 1
+            `
+          : await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
+              SELECT unsubscribed_at FROM bot.audience_contacts WHERE phone = ${msg.to} LIMIT 1
+            `;
       if (rows[0]?.unsubscribed_at) {
         return {
           status: 'rejected',

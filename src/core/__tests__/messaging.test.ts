@@ -307,6 +307,41 @@ describe('sendMessage — budget', () => {
   });
 });
 
+describe('opt-out — el criterio es el TIPO de mensaje, no el canal (T9.3)', () => {
+  it('un comprobante NO se frena por la baja de la BUC', async () => {
+    // Nadie se da de baja de su propia factura. La exencion es EXPLICITA por
+    // `kind`, no un efecto de que la guarda no mirara el canal email.
+    mockSend.mockResolvedValue({ ok: true, message_id: 'id-tx-optout' });
+    const deps = makeDeps();
+    // sql devolveria una baja, pero ni se consulta.
+    const msg = makeMsg({
+      to: '+5491111111111',
+      context: { feature: 'facturacion', client_ref: 'ref-tx-optout', kind: 'transactional' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result).toEqual({ status: 'sent', message_id: 'id-tx-optout' });
+  });
+
+  it('sin `kind` declarado SE CHEQUEA: el default es no estar exento', async () => {
+    // Si un emisor se olvida de declarar el kind, el error tiene que ser de
+    // mas (chequear) y no de menos (colarse).
+    const deps = makeDeps();
+    deps.sql = makeFakeSql([[{ unsubscribed_at: new Date() }]]) as unknown as SqlClient;
+    const msg = makeMsg({ context: { feature: 'f', client_ref: 'ref-noKind' } });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result).toEqual({
+      status: 'rejected',
+      reason: 'opted_out',
+      detail: 'contact opted out of messaging',
+    });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+});
+
 describe('sendMessage — 24h service window (free-form whatsapp text)', () => {
   it('sends free-form text when the contact wrote within the last 24h', async () => {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
