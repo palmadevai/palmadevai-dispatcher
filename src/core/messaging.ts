@@ -93,6 +93,16 @@ export async function resolveCategory(
   logger: Logger,
   msg: OutboundMessage,
 ): Promise<string> {
+  // T9.2 — categoría propia para lo transaccional. Un comprobante fiscal no
+  // es `service` ni `marketing`: es una obligación con el cliente final, y
+  // mezclarlo con el resto haría que compita por el mismo tope de US$5/mes que
+  // fijó la mig 137 para mensajería.
+  //
+  // Se decide por `context.kind`, que ya existía en el schema y estaba sin
+  // usar del lado del budget: es una declaración de la app que llama, no algo
+  // que este servicio pueda deducir del contenido.
+  if (msg.context.kind === 'transactional') return 'transactional';
+
   // Sólo un `template` tiene categoría que mirar. `text` y —desde T9.1—
   // `mail` son conversacionales: no hay fila en `message_templates` que
   // consultar. Se chequea la variante que SÍ la tiene, en vez de asumir que
@@ -313,7 +323,23 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   await maybeAlert(deps.redis, deps.logger, msg.channel, category, budgetResult);
 
   const criticalBypass = kind === 'notification' && msg.context.critical === true;
-  if (!budgetResult.allowed && !criticalBypass) {
+
+  // T9.2 — lo transaccional SE CUENTA PERO NO SE BLOQUEA.
+  //
+  // Contar y capar son cosas distintas, y acá se separan a propósito: un
+  // comprobante fiscal es una obligación con el cliente final, así que un tope
+  // de mensajería no puede ser lo que decida si sale. Pero el gasto se registra
+  // igual (`recordSendUsage` corre después del envío, fuera de esta guarda) y
+  // **la alerta sigue disparando**, así que si el volumen se dispara se ve —
+  // simplemente no se traduce en un mail no enviado.
+  //
+  // ⚠ Es distinto del bypass `critical`, que es una excepción puntual de
+  // `safety-trigger`. Esto es una CATEGORÍA con semántica propia, y por eso no
+  // hereda el tope de US$5/mes de la mig 137: hasta que tenga uno pensado, no
+  // tener tope es más honesto que heredar uno que se eligió para otra cosa.
+  const transactionalBypass = category === 'transactional';
+
+  if (!budgetResult.allowed && !criticalBypass && !transactionalBypass) {
     deps.logger.warn(
       { feature, channel: msg.channel, category, ...budgetResult },
       'sendMessage: budget_exceeded',

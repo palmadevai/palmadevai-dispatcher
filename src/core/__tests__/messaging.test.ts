@@ -268,6 +268,43 @@ describe('sendMessage — budget', () => {
     expect(result).toEqual({ status: 'sent', message_id: 'wamid-critical' });
     expect(mockSend).toHaveBeenCalledTimes(1);
   });
+  // ── T9.2 — la categoria transaccional ─────────────────────────────────────
+  it('un comprobante NO se bloquea por el tope de mensajeria', async () => {
+    // Contar y capar son cosas distintas: un comprobante fiscal es una
+    // obligacion con el cliente final, asi que el tope no puede decidir si sale.
+    mockCheckBudget.mockResolvedValue({ allowed: false, spent_usd: 10, cap_usd: 5, pct: 2 });
+    mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-tx' });
+    const deps = makeDeps();
+    const msg = makeMsg({
+      to: '+5491111111111',
+      context: { feature: 'facturacion', client_ref: 'ref-tx', kind: 'transactional' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result).toEqual({ status: 'sent', message_id: 'wamid-tx' });
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('pero SI se cuenta: la alerta de budget sigue mirandolo', async () => {
+    // El bypass es sobre el bloqueo, no sobre la visibilidad. Si el volumen
+    // transaccional se dispara tiene que verse.
+    mockCheckBudget.mockResolvedValue({ allowed: false, spent_usd: 10, cap_usd: 5, pct: 2 });
+    mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-tx2' });
+    const deps = makeDeps();
+    const msg = makeMsg({
+      to: '+5491111111111',
+      context: { feature: 'facturacion', client_ref: 'ref-tx2', kind: 'transactional' },
+    });
+
+    await sendMessage(deps, msg);
+
+    expect(mockMaybeAlert).toHaveBeenCalled();
+    // Y con su categoria propia, no mezclado en `service`.
+    expect(mockCheckBudget).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(), 'whatsapp', 'transactional',
+    );
+  });
 });
 
 describe('sendMessage — 24h service window (free-form whatsapp text)', () => {

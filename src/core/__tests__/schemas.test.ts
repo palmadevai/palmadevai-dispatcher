@@ -89,3 +89,21 @@ describe('adjuntos — el límite de 500 KB (T9.1)', () => {
     }
   });
 });
+
+describe('categoría transaccional para el budget (T9.2)', () => {
+  it('`kind: transactional` es parte del contrato, no un campo libre', () => {
+    const r = OutboundMessageSchema.safeParse({
+      ...mail(),
+      context: { feature: 'facturacion', client_ref: 'inv-2', kind: 'transactional' },
+    });
+    expect(r.success).toBe(true);
+
+    // Y un `kind` inventado no pasa: la categoría decide si algo esquiva el
+    // tope, así que no puede depender de un string arbitrario del llamador.
+    const inventado = OutboundMessageSchema.safeParse({
+      ...mail(),
+      context: { feature: 'facturacion', client_ref: 'inv-3', kind: 'fiscal' },
+    });
+    expect(inventado.success).toBe(false);
+  });
+});
