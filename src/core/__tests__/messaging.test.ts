@@ -371,7 +371,7 @@ describe('sendMessage — content/channel combos', () => {
     expect(result).toEqual({
       status: 'rejected',
       reason: 'unsupported_content_type',
-      detail: 'email only supports content.type=text in v1',
+      detail: 'email requiere content.type=mail (subject + html/text, adjuntos opcionales)',
     });
     expect(mockSend).not.toHaveBeenCalled();
   });

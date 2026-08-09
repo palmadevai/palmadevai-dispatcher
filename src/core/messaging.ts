@@ -37,7 +37,6 @@ import type { EmailSendInput } from '../providers/email.js';
 import type { ProviderSendResult } from '../providers/types.js';
 
 const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
-const EMAIL_SUBJECT_MAX_CHARS = 60;
 
 export interface SendDeps {
   sql: SqlClient;
@@ -94,18 +93,24 @@ export async function resolveCategory(
   logger: Logger,
   msg: OutboundMessage,
 ): Promise<string> {
-  if (msg.content.type === 'text') return 'service';
+  // Sólo un `template` tiene categoría que mirar. `text` y —desde T9.1—
+  // `mail` son conversacionales: no hay fila en `message_templates` que
+  // consultar. Se chequea la variante que SÍ la tiene, en vez de asumir que
+  // "lo que no es text es template" — que es lo que se rompió al sumar la
+  // tercera.
+  if (msg.content.type !== 'template') return 'service';
+  const template = msg.content;
   try {
     const rows = await sql<Array<{ category: string }>>`
       SELECT category FROM bot.message_templates
-      WHERE channel = ${msg.channel} AND name = ${msg.content.name}
+      WHERE channel = ${msg.channel} AND name = ${template.name}
       ORDER BY updated_at DESC
       LIMIT 1
     `;
     return rows[0]?.category ?? 'marketing';
   } catch (err) {
     logger.warn(
-      { err: (err as Error).message, channel: msg.channel, template_name: msg.content.name },
+      { err: (err as Error).message, channel: msg.channel, template_name: template.name },
       'message_templates category lookup failed — defaulting to marketing (conservative)',
     );
     return 'marketing';
@@ -196,11 +201,22 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   const { feature, client_ref, kind } = msg.context;
 
   // ── 1. Combos canal × contenido no soportados (v1) ────────────────────────
-  if (msg.channel === 'email' && msg.content.type !== 'text') {
+  if (msg.channel === 'email' && msg.content.type !== 'mail') {
     return {
       status: 'rejected',
       reason: 'unsupported_content_type',
-      detail: 'email only supports content.type=text in v1',
+      detail: 'email requiere content.type=mail (subject + html/text, adjuntos opcionales)',
+    };
+  }
+  // El simétrico, que faltaba: `mail` es contenido de correo y no existe en
+  // whatsapp. Sin esta guarda un `whatsapp` + `mail` pasaba de largo hasta el
+  // armado del payload — o sea, un 500 por un body que el servicio puede
+  // rechazar con un 400 y un motivo.
+  if (msg.channel === 'whatsapp' && msg.content.type === 'mail') {
+    return {
+      status: 'rejected',
+      reason: 'unsupported_content_type',
+      detail: 'whatsapp no soporta content.type=mail (usá text o template)',
     };
   }
 
@@ -328,7 +344,14 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
             type: 'text',
             body: msg.content.text,
           }
-        : {
+        : msg.content.type !== 'template'
+          ? // `mail` en whatsapp no existe: lo rechaza la guarda 1. El caso está
+            // acá para que el compilador no tenga que adivinar, no porque pueda
+            // pasar — y si algún día pasa, falla ruidoso en vez de mandar vacío.
+            (() => {
+              throw new Error(`content.type=${msg.content.type} no es válido para whatsapp`);
+            })()
+          : {
             phone_number_id: deps.defaultWaPhoneNumberId,
             to: msg.to,
             biz_opaque_callback_data: client_ref,
@@ -338,14 +361,25 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
             components: msg.content.components ?? [],
           };
   } else {
-    // msg.channel === 'email', msg.content.type === 'text' (guardado arriba)
-    const text = msg.content.type === 'text' ? msg.content.text : '';
-    // ⚠ El remitente lo define LA APLICACIÓN QUE LLAMA, no este servicio. El
-    // messaging service ejecuta el envío y aporta la credencial de la cuenta;
-    // con qué dirección sale y a quién es decisión de quien llama. `deps` es
-    // sólo el fallback de transición hasta que `/send` v2 lo exija en el
-    // payload (T9.1).
-    const from = deps.defaultFromEmail;
+    // msg.channel === 'email', msg.content.type === 'mail' (guardado arriba)
+    const mail = msg.content.type === 'mail' ? msg.content : null;
+    if (!mail) {
+      return {
+        status: 'failed',
+        error_code: 'email_content_invalid',
+        error_message: 'contenido de mail ausente tras la validación',
+      };
+    }
+    // ⚠ El remitente lo define LA APLICACIÓN QUE LLAMA, no este servicio (R9).
+    // El messaging service ejecuta el envío y aporta la credencial de la
+    // cuenta; con qué dirección sale es decisión de negocio de quien llama —
+    // `onboarding@` para acceso, `noreply@` para transaccional (T12).
+    //
+    // `deps.defaultFromEmail` queda como fallback de transición y NO como
+    // default de producto: un default fue lo que hizo que el sandbox de Resend
+    // y el dominio del laboratorio se colaran como remitente de clientes
+    // reales. Cuando todos los emisores declaren `from` (T9.4/T9.5), se saca.
+    const from = msg.from ?? deps.defaultFromEmail;
     if (!from) {
       return {
         status: 'failed',
@@ -356,8 +390,13 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     sendInput = {
       from,
       to: msg.to,
-      subject: text.slice(0, EMAIL_SUBJECT_MAX_CHARS),
-      html: `<p>${escapeHtml(text)}</p>`,
+      subject: mail.subject,
+      // Uno de los dos existe (lo garantiza el schema). Si sólo vino texto
+      // plano se envuelve para tener cuerpo HTML, pero el texto viaja igual
+      // como `text` — no se pierde el original ni se inventa formato.
+      html: mail.html ?? `<p>${escapeHtml(mail.text ?? '')}</p>`,
+      ...(mail.text ? { text: mail.text } : {}),
+      ...(mail.attachments?.length ? { attachments: mail.attachments } : {}),
       biz_opaque_callback_data: client_ref,
     };
   }
