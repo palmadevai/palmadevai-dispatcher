@@ -382,6 +382,84 @@ describe('sendMessage — clase auth (T9.8)', () => {
   });
 });
 
+// ── T6.5 — el estado REAL del proveedor se registra desde el envío ──────────
+//
+// El schema y la card existen desde T6; lo que faltaba era el escritor. Estos
+// casos fijan la parte que importa: **qué cuenta como estado del proveedor y
+// qué no**. Si una guarda nuestra —opt-out, tope— pintara la card de rojo, el
+// estado volvería a mentir, ahora en la otra dirección.
+describe('sendMessage — estado del proveedor (T6.5)', () => {
+  function capturingSql(responses: unknown[][] = []) {
+    const seen: string[] = [];
+    let i = 0;
+    const fn = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      seen.push(strings.join(' ? ') + ' :: ' + JSON.stringify(values));
+      const r = responses[i] ?? [];
+      i += 1;
+      return Promise.resolve(r);
+    }) as unknown as SqlClient;
+    return { sql: fn, writes: () => seen.filter((q) => /client_providers/.test(q)) };
+  }
+
+  const mail = (ref: string): OutboundMessage =>
+    makeMsg({
+      channel: 'email',
+      to: 'quien.sea@otro.test',
+      from: 'noreply@ejemplo.test',
+      content: { type: 'mail', subject: 's', text: 't' },
+      context: { feature: 'f', client_ref: ref, kind: 'transactional' },
+    });
+
+  it('un envío OK deja el proveedor en ok', async () => {
+    const c = capturingSql();
+    await sendMessage(makeDeps({ sql: c.sql }), mail('ref-ps-ok'));
+    const w = c.writes();
+    expect(w).toHaveLength(1);
+    expect(w[0]).toContain('"ok"');
+  });
+
+  it('un fallo del proveedor deja failed CON el detalle', async () => {
+    mockSend.mockResolvedValue({
+      ok: false, http_status: 403,
+      error_code: 'validation_error', error_message: 'domain is not verified',
+    });
+    const c = capturingSql();
+    await sendMessage(makeDeps({ sql: c.sql }), mail('ref-ps-fail'));
+    const w = c.writes();
+    expect(w).toHaveLength(1);
+    expect(w[0]).toContain('"failed"');
+    // El detalle es lo unico accionable de la card: sin el, dice "algo anda mal".
+    expect(w[0]).toContain('validation_error: domain is not verified');
+  });
+
+  it('un rechazo de NUESTRAS guardas no toca el estado del proveedor', async () => {
+    // El tope no dice nada de la salud de la cuenta. Pintar la card de rojo por
+    // un mensaje que decidimos no mandar seria el mismo estado mentiroso que
+    // este escritor viene a arreglar, en la otra direccion.
+    mockCheckBudget.mockResolvedValue({ allowed: false, spent_usd: 10, cap_usd: 5, pct: 2 });
+    const c = capturingSql([[]]);
+    const msg = mail('ref-ps-budget');
+    msg.context.kind = undefined; // sin exencion: el tope aplica
+    const r = await sendMessage(makeDeps({ sql: c.sql }), msg);
+    expect(r).toMatchObject({ status: 'rejected', reason: 'budget_exceeded' });
+    expect(c.writes()).toHaveLength(0);
+  });
+
+  it('whatsapp no escribe estado: no tiene card de servicio', async () => {
+    const c = capturingSql([[], [{ category: 'marketing' }]]);
+    await sendMessage(makeDeps({ sql: c.sql }), makeMsg({ context: { feature: 'f', client_ref: 'ref-ps-wa' } }));
+    expect(c.writes()).toHaveLength(0);
+  });
+
+  it('si el registro falla, el envío igual cuenta como enviado', async () => {
+    // El mail ya salio. Un error escribiendo metadata no puede convertirse en
+    // un envio perdido.
+    mockSend.mockResolvedValue({ ok: true, message_id: 'msg-ps' });
+    const r = await sendMessage(makeDeps({ sql: makeThrowingSql() }), mail('ref-ps-dbdown'));
+    expect(r).toEqual({ status: 'sent', message_id: 'msg-ps' });
+  });
+});
+
 describe('sendMessage — opt-out', () => {
   it('rejects opted_out when the contact has unsubscribed_at set', async () => {
     const sql = makeFakeSql([[{ unsubscribed_at: new Date('2026-01-01') }]]);

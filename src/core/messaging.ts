@@ -29,6 +29,7 @@ import type { Redis } from 'ioredis';
 import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import { checkBudget, recordSendUsage, maybeAlert } from './budget.js';
+import { providerForChannel, recordProviderOutcome } from './provider-status.js';
 import { toE164, normalizeAllowlist } from '../lib/phone.js';
 import { getProviderForChannel } from '../ports/channel-provider.js';
 import type { OutboundMessage } from './schemas.js';
@@ -66,6 +67,21 @@ export type SendOutcome =
   | { status: 'duplicate' }
   | { status: 'rejected'; reason: SendRejection; detail: string }
   | { status: 'failed'; error_code: string; error_message: string };
+
+/**
+ * Registra el resultado del proveedor si ese canal tiene uno con card de
+ * servicio. Se llama SÓLO en los tres puntos donde ya se sabe cómo respondió el
+ * proveedor de verdad — nunca desde las guardas, que rechazan antes de llegar.
+ */
+async function recordOutcomeIfProvider(
+  deps: SendDeps,
+  channel: string,
+  outcome: Parameters<typeof recordProviderOutcome>[3],
+): Promise<void> {
+  const providerId = providerForChannel(channel);
+  if (!providerId) return;
+  await recordProviderOutcome(deps.sql, deps.logger, providerId, outcome);
+}
 
 export function maskDestination(to: string): string {
   return `***${to.slice(-4)}`;
@@ -550,6 +566,15 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       },
       'sendMessage: provider.send threw — no retry, caller decides',
     );
+    // Llegó al proveedor y no volvió bien: cuenta como estado del proveedor
+    // (T6.5). Una caída de red o un 5xx de Resend es un problema de la cuenta
+    // tanto como un 403 — `last_checked_at` dice cuándo, y ahí se ve si es
+    // transitorio o no.
+    await recordOutcomeIfProvider(deps, msg.channel, {
+      ok: false,
+      error_code: e.error_code ?? 'send_threw',
+      error_message: e.message,
+    });
     return {
       status: 'failed',
       error_code: e.error_code ?? 'send_threw',
@@ -569,6 +594,11 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       },
       'sendMessage: provider returned non-ok — no retry, caller decides',
     );
+    await recordOutcomeIfProvider(deps, msg.channel, {
+      ok: false,
+      error_code: result.error_code ?? 'unknown',
+      error_message: result.error_message ?? 'provider returned a non-ok result',
+    });
     return {
       status: 'failed',
       error_code: result.error_code ?? 'unknown',
@@ -576,6 +606,7 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     };
   }
 
+  await recordOutcomeIfProvider(deps, msg.channel, { ok: true });
   await recordSendUsage(deps.redis, deps.logger, msg.channel, category);
   deps.metrics?.recordSend(Date.now() - startMs);
   deps.logger.info(
