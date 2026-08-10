@@ -300,6 +300,88 @@ describe('sendMessage — staff allowlist por mail', () => {
   });
 });
 
+// ── T9.8 — la clase `auth` ───────────────────────────────────────────────────
+//
+// Invitacion, primer acceso y reset de contrasena. Comparte la FORMA de
+// `transactional` (se cuenta, no bloquea) y no su motivo: aca el modo de falla
+// que se evita no es "se gasto de mas", es que nadie pueda entrar — y el camino
+// para arreglarlo pasa por entrar.
+describe('sendMessage — clase auth (T9.8)', () => {
+  function authMail(to: string, ref: string): OutboundMessage {
+    return makeMsg({
+      channel: 'email',
+      to,
+      from: 'onboarding@ejemplo.test',
+      content: { type: 'mail', subject: 'Configura tu acceso', text: 'link' },
+      context: { feature: 'cockpit-auth', client_ref: ref, kind: 'auth' },
+    });
+  }
+
+  it('NO pasa por la allowlist de staff: va a quien se esta dando de alta', async () => {
+    // Es la diferencia con `notification`. Un invitado no es staff todavia —
+    // por definicion, es alguien que aun no tiene acceso.
+    const deps = makeDeps({ sql: makeThrowingSql() }); // ninguna guarda debe consultar la DB
+    const result = await sendMessage(deps, authMail('flamante@otro.test', 'ref-auth-dest'));
+
+    expect(result.status).not.toBe('rejected');
+    expect(mockSend).toHaveBeenCalled();
+  });
+
+  it('esta exento de opt-out: la baja de la BUC es sobre marketing', async () => {
+    // Un contacto que se dio de baja de las campanas y despues es dado de alta
+    // como usuario tiene que recibir su invitacion igual, o queda sin acceso
+    // por una decision que tomo sobre otra cosa.
+    const sql = makeFakeSql([[{ unsubscribed_at: new Date('2026-01-01') }]]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, authMail('dado-de-baja@otro.test', 'ref-auth-optout'));
+
+    expect(result.status).not.toBe('rejected');
+  });
+
+  it('tiene categoria propia, no se disuelve en transactional', async () => {
+    // Sin categoria propia, el gasto de auth queda mezclado justo cuando hay
+    // que investigar por que nadie pudo loguearse.
+    mockCheckBudget.mockResolvedValue({ allowed: true, spent_usd: 0, cap_usd: null, pct: 0 });
+    const deps = makeDeps();
+
+    await sendMessage(deps, authMail('quien.sea@otro.test', 'ref-auth-cat'));
+
+    expect(mockCheckBudget).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(), 'email', 'auth',
+    );
+  });
+
+  it('SE CUENTA PERO NO BLOQUEA: con el tope pasado, el mail sale igual', async () => {
+    mockCheckBudget.mockResolvedValue({ allowed: false, spent_usd: 99, cap_usd: 5, pct: 20 });
+    mockSend.mockResolvedValue({ ok: true, message_id: 'auth-1' });
+    const deps = makeDeps();
+
+    const result = await sendMessage(deps, authMail('quien.sea@otro.test', 'ref-auth-budget'));
+
+    expect(result).toEqual({ status: 'sent', message_id: 'auth-1' });
+    // La alerta dispara igual: se cuenta, no se tapa.
+    expect(mockMaybeAlert).toHaveBeenCalled();
+  });
+
+  it('el default NO hereda la exencion: sin kind, el tope sigue capando', async () => {
+    mockCheckBudget.mockResolvedValue({ allowed: false, spent_usd: 99, cap_usd: 5, pct: 20 });
+    const sql = makeFakeSql([[]]); // opt-out vacio
+    const deps = makeDeps({ sql });
+    const msg = makeMsg({
+      channel: 'email',
+      to: 'quien.sea@otro.test',
+      from: 'noreply@ejemplo.test',
+      content: { type: 'mail', subject: 'x', text: 'y' },
+      context: { feature: 'f', client_ref: 'ref-sin-kind-budget' },
+    });
+
+    const result = await sendMessage(deps, msg);
+
+    expect(result).toMatchObject({ status: 'rejected', reason: 'budget_exceeded' });
+  });
+});
+
 describe('sendMessage — opt-out', () => {
   it('rejects opted_out when the contact has unsubscribed_at set', async () => {
     const sql = makeFakeSql([[{ unsubscribed_at: new Date('2026-01-01') }]]);

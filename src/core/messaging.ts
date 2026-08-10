@@ -103,6 +103,14 @@ export async function resolveCategory(
   // que este servicio pueda deducir del contenido.
   if (msg.context.kind === 'transactional') return 'transactional';
 
+  // T9.8 — categoría propia para auth, por el mismo criterio que la anterior y
+  // con un motivo distinto. `transactional` existe porque un comprobante es una
+  // obligación con el cliente final; `auth` existe porque un tope de mensajería
+  // no puede ser lo que decide si alguien PUEDE ENTRAR a la plataforma. Meterla
+  // dentro de `transactional` ahorraría cinco líneas y perdería justo el dato
+  // que hace falta cuando se investiga por qué nadie pudo loguearse.
+  if (msg.context.kind === 'auth') return 'auth';
+
   // Sólo un `template` tiene categoría que mirar. `text` y —desde T9.1—
   // `mail` son conversacionales: no hay fila en `message_templates` que
   // consultar. Se chequea la variante que SÍ la tiene, en vez de asumir que
@@ -342,13 +350,19 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   // campañas por email — que son exactamente lo que el opt-out existe para
   // frenar. La baja de la BUC es sobre **marketing**.
   //
-  // Las dos exenciones quedan EXPLÍCITAS y por motivo propio:
+  // Las TRES exenciones quedan EXPLÍCITAS y cada una por motivo propio:
   //   `notification`  → destinos internos de staff, que no están en la BUC.
   //   `transactional` → nadie se da de baja de su propia factura (T9.2/T9.3).
+  //   `auth`          → nadie se da de baja de poder entrar a la plataforma
+  //                     (T9.8). Y la baja de la BUC es sobre marketing: un
+  //                     contacto que se dio de baja de las campañas y despues
+  //                     es dado de alta como usuario tiene que poder recibir
+  //                     su invitacion, o queda sin acceso por una decision que
+  //                     tomo sobre otra cosa.
   //
   // Un `kind` ausente NO está exento: el default es chequear. Si mañana entra
   // un emisor que se olvida de declararlo, el error es de más y no de menos.
-  const optOutExempt = kind === 'notification' || kind === 'transactional';
+  const optOutExempt = kind === 'notification' || kind === 'transactional' || kind === 'auth';
   if (!optOutExempt) {
     try {
       // El identificador del contacto depende del canal: teléfono para
@@ -420,9 +434,16 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   // `safety-trigger`. Esto es una CATEGORÍA con semántica propia, y por eso no
   // hereda el tope de US$5/mes de la mig 137: hasta que tenga uno pensado, no
   // tener tope es más honesto que heredar uno que se eligió para otra cosa.
-  const transactionalBypass = category === 'transactional';
+  //
+  // T9.8 — `auth` va por el mismo camino, con un motivo mas fuerte todavia: si
+  // un tope de mensajeria bloquea un reset de contrasena, el resultado no es
+  // "se gasto de mas", es que **nadie puede entrar** — y el camino para
+  // arreglarlo pasa por entrar. Se cuenta igual, en su propia categoria, asi
+  // que un pico de mails de auth (alta masiva, o alguien golpeando el reset) se
+  // ve en el gasto y dispara la alerta.
+  const countedNotCapped = category === 'transactional' || category === 'auth';
 
-  if (!budgetResult.allowed && !criticalBypass && !transactionalBypass) {
+  if (!budgetResult.allowed && !criticalBypass && !countedNotCapped) {
     deps.logger.warn(
       { feature, channel: msg.channel, category, ...budgetResult },
       'sendMessage: budget_exceeded',

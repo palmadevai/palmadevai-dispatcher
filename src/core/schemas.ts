@@ -81,7 +81,26 @@ export type OutboundContent = z.infer<typeof OutboundContentSchema>;
 export const OutboundContextSchema = z.object({
   feature: z.string().min(1),
   client_ref: z.string().min(1),
-  kind: z.enum(['notification', 'transactional']).optional(),
+  /**
+   * Qué CLASE de mensaje es. No es una etiqueta: decide tres guardas distintas
+   * (destino, opt-out, budget), y por eso cada valor existe por un motivo
+   * propio y no por simetría.
+   *
+   *   `notification`  → destino restringido a staff · exento de opt-out
+   *   `transactional` → sin restricción de destino · exento de opt-out ·
+   *                     categoría propia: se cuenta, no bloquea (T9.2)
+   *   `auth`          → invitación, primer acceso, reset de contraseña (T9.8).
+   *                     Sin restricción de destino (va a quien se está dando
+   *                     de alta), exento de opt-out y **exento de tope**.
+   *
+   * `auth` no es `transactional` con otro nombre. Comparten la forma —se cuenta,
+   * no bloquea— pero no el motivo, y separarlas es lo que permite ver el gasto
+   * de auth aparte: si un tope de US$5 dejara a alguien afuera de la plataforma,
+   * el modo de falla no es "se gastó de más", es "nadie puede entrar".
+   *
+   * Ausente NO es exento: el default es chequear.
+   */
+  kind: z.enum(['notification', 'transactional', 'auth']).optional(),
   /**
    * `critical: true` is the ONLY budget bypass in the service, and only
    * takes effect when combined with `kind: 'notification'` — reserved for
