@@ -60,6 +60,34 @@ interface ResendErrorResponse {
   statusCode?: number;
 }
 
+/**
+ * El `client_ref` viaja como **tag** de Resend, y Resend sólo acepta
+ * `[A-Za-z0-9_-]` en el valor de un tag: cualquier otra cosa hace que rechace
+ * **el mail entero** con `422 validation_error`.
+ *
+ * Se sanea ACÁ y no en el llamador porque esa restricción es del proveedor, y
+ * este archivo es el único lugar que puede saber de Resend (R8). Ponerlo del
+ * otro lado obligaría a cada app que manda un mail a conocer el charset de tags
+ * de un proveedor que —por diseño— no debería ni saber que existe.
+ *
+ * INCIDENTE QUE LO MOTIVÓ (2026-08-10, encontrado en el smoke de T9.8): los
+ * cuatro emisores del cockpit usan refs con `:` como separador de namespace
+ * (`cockpit:invoice:123-45:<uuid>`). Con eso, **todos** sus mails fallaban —
+ * incluidos los comprobantes, que ya estaban en producción. Los seis workflows
+ * de n8n no fallaban porque sus refs no llevan `:`, lo que hizo que el bug se
+ * viera como "el cockpit no manda" en vez de "el tag es inválido".
+ *
+ * Un tag es METADATO de tracking: que sea inválido no puede costar el envío.
+ * Por eso se sanea en vez de rechazar.
+ */
+export function toResendTagValue(raw: string): string {
+  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 256);
+  // Un valor vacío también lo rechaza. No debería pasar (el schema exige
+  // `client_ref` no vacío), pero el fallback cuesta una línea y evita que un
+  // ref exótico se lleve puesto el mail.
+  return cleaned || 'ref';
+}
+
 export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResult> {
   // La credencial se resuelve por llamada (T5.4): `ownership` puede cambiar en
   // caliente (BYOK) y con lectura en module-load un cutover no tomaba efecto
@@ -95,7 +123,7 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
         }
       : {}),
     tags: [
-      { name: 'client_ref', value: input.biz_opaque_callback_data },
+      { name: 'client_ref', value: toResendTagValue(input.biz_opaque_callback_data) },
     ],
   };
 
