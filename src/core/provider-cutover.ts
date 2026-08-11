@@ -137,6 +137,35 @@ async function writeState(
   `;
 }
 
+/**
+ * Resultado de un chequeo, **sin tocar el audit**.
+ *
+ * Probar una credencial no es un cambio de titularidad, así que no puede pisar
+ * `changed_by`/`changed_from`/`notes` — esos son del último cambio REAL, y son
+ * lo único que después contesta «¿quién puso a este cliente en `owned`?».
+ * Encontrado en el smoke de F3: un chequeo fallido dejaba `changed_by` en NULL.
+ *
+ * `INSERT … ON CONFLICT` porque la fila puede no existir (sin fila, el proveedor
+ * se lee con el default del catálogo). En el `INSERT` el audit nace vacío, que
+ * es correcto: no hubo ningún cambio de titularidad todavía.
+ */
+async function writeCheckOutcome(
+  deps: CredentialDeps,
+  providerId: string,
+  ownership: string,
+  statusDetail: string,
+): Promise<void> {
+  await deps.sql`
+    INSERT INTO config.client_providers
+      (provider_id, ownership, status, status_detail, last_checked_at)
+    VALUES (${providerId}, ${ownership}, 'failed', ${statusDetail}, now())
+    ON CONFLICT (provider_id) DO UPDATE
+      SET status          = 'failed',
+          status_detail   = ${statusDetail},
+          last_checked_at = now()
+  `;
+}
+
 /** El texto que ve el operador cuando el proveedor rechaza la credencial (T7.7). */
 function rejectedDetail(row: ProviderRow, code: string, message: string): string {
   const panel = PROVIDER_PANEL[row.id];
@@ -174,14 +203,7 @@ export async function checkProviderCredential(
   const check = await verifyEmailCredential(loaded.credential);
   if (!check.ok) {
     const detail = rejectedDetail(row, check.error_code, check.error_message);
-    await writeState(deps, providerId, {
-      ownership: row.ownership,
-      status: 'failed',
-      statusDetail: detail,
-      changedFrom: row.ownership,
-      changedBy: null,
-      notes: 'test de conexión (T7.3)',
-    });
+    await writeCheckOutcome(deps, providerId, row.ownership, detail);
     deps.logger.warn(
       { provider_id: providerId, error_code: check.error_code, http_status: check.http_status },
       'test de conexión: el proveedor rechazó la credencial del cliente',
