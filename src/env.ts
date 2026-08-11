@@ -159,6 +159,23 @@ const schema = z.object({
   // tiene en memoria la credencial que autoriza gastar plata. Ausente → esas
   // tools no se registran (el MCP sigue sirviendo Tier 1 con el otro bearer).
   MESSAGING_MCP_WRITE_BEARER: z.string().optional(),
+
+  // ── Secretos en reposo — el «piso 1» (infra/doc/analysis-secretos-en-reposo.md)
+  //
+  // Master key de las credenciales de aplicación del cliente, 32 bytes en
+  // base64 (`openssl rand -base64 32`). ADR-003: la recibe SÓLO el dispatcher.
+  //
+  // Es OPCIONAL a propósito, y no es laxitud: los tres clientes ya corren, y un
+  // `min(1)` acá bajaría el messaging service entero de un cliente que todavía
+  // no tiene el piso 1 cableado. Sin la llave, `resolveProviderKey` cae al env
+  // como siempre (T5.6) y cargar una credencial responde un error que nombra la
+  // env. Fail-closed en la operación, no en el boot.
+  SECRETS_MASTER_KEY: z.string().optional(),
+  SECRETS_MASTER_KEY_VERSION: z.coerce.number().int().min(1).default(1),
+  // SÓLO descifra, durante una rotación en curso (§4.6). Sin esto la rotación
+  // es un big-bang sobre todas las filas a la vez — o sea que no se hace nunca.
+  SECRETS_MASTER_KEY_PREVIOUS: z.string().optional(),
+  SECRETS_MASTER_KEY_PREVIOUS_VERSION: z.coerce.number().int().min(1).optional(),
 });
 
 const parsed = schema.safeParse(process.env);
