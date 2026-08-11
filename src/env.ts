@@ -8,6 +8,34 @@
  */
 import { z } from 'zod';
 
+/**
+ * Número OPCIONAL que llega del compose.
+ *
+ * ⚠️ En este modelo de deploy, una env opcional **nunca llega `undefined`**:
+ * la lista curada `environment:` la declara como `X: ${X:-}`, así que el
+ * container la recibe **presente y vacía**. Y `z.coerce.number()` sobre `''`
+ * da **0**, no `undefined` — o sea que `.optional()` no se evalúa nunca y un
+ * `.min(1)` de al lado rechaza el valor y **mata el proceso al boot**.
+ *
+ * Incidente 2026-08-10, causado por este mismo archivo: al sumar
+ * `SECRETS_MASTER_KEY_PREVIOUS_VERSION` con `.min(1).optional()`, el messaging
+ * service del lab entró en crash-loop —`FATAL: env validation failed`— apenas
+ * el compose empezó a pasarle la variable vacía. La var era opcional, la
+ * declaración decía opcional, y sin embargo bajó el servicio.
+ *
+ * `''` significa **no configurada**. Es la única lectura correcta acá.
+ *
+ * ⚠️ El `.optional()` va ADENTRO del preprocess, no afuera: `z.coerce.number()`
+ * sobre `undefined` da **NaN**, así que un `.optional()` externo —que evalúa el
+ * input crudo `''`, no el ya preprocesado— tampoco salva. Lo agarró el test de
+ * abajo antes de que llegara al VPS por segunda vez.
+ */
+const optionalNumber = (min?: number) => {
+  let inner = z.coerce.number().int();
+  if (min !== undefined) inner = inner.min(min);
+  return z.preprocess((v) => (v === '' ? undefined : v), inner.optional());
+};
+
 const schema = z.object({
   NODE_ENV: z.enum(['production', 'development', 'test']).default('production'),
 
@@ -48,7 +76,11 @@ const schema = z.object({
 
   // ── Rate limits ──────────────────────────────────────────────────────────
   CAMPAIGNS_DEFAULT_RATE_BURST_MPS: z.coerce.number().int().default(10),
-  CAMPAIGNS_DEFAULT_DAILY_CAP_OVERRIDE: z.coerce.number().int().optional(),
+  // Llega VACÍA del compose (`${...:-}`) → sin el preprocess resolvía a 0, o sea
+  // «tope diario 0» en vez de «sin override». Hoy no la consume nadie, así que
+  // el bug estaba latente; se arregla igual porque el día que se use, un 0
+  // silencioso es un bloqueo total de envíos.
+  CAMPAIGNS_DEFAULT_DAILY_CAP_OVERRIDE: optionalNumber(),
   // Fase 7 item 10: Redis-coordinated rate limiter cross-replica.
   // 'in_memory' (default, single-replica) | 'redis' (atómico Lua, multi-replica safe).
   CAMPAIGNS_RATE_LIMIT_BACKEND: z.enum(['in_memory', 'redis']).default('in_memory'),
@@ -175,7 +207,7 @@ const schema = z.object({
   // SÓLO descifra, durante una rotación en curso (§4.6). Sin esto la rotación
   // es un big-bang sobre todas las filas a la vez — o sea que no se hace nunca.
   SECRETS_MASTER_KEY_PREVIOUS: z.string().optional(),
-  SECRETS_MASTER_KEY_PREVIOUS_VERSION: z.coerce.number().int().min(1).optional(),
+  SECRETS_MASTER_KEY_PREVIOUS_VERSION: optionalNumber(1),
 });
 
 const parsed = schema.safeParse(process.env);
