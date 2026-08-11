@@ -31,6 +31,13 @@ export const logger = pino({
       'env.META_WA_BEARER_TOKEN',
       'env.META_WA_APP_SECRET',
       'env.COCKPIT_INTERNAL_TOKEN',
+      // Piso 1 (analysis-secretos-en-reposo.md): la master key abre TODAS las
+      // credenciales del cliente, así que es el peor valor posible en un log.
+      'env.SECRETS_MASTER_KEY',
+      'env.SECRETS_MASTER_KEY_PREVIOUS',
+      // La credencial en claro cuando el cockpit la manda a guardar.
+      '*.credential',
+      '*.secret',
       'headers.authorization',
     ],
     censor: '[REDACTED]',
