@@ -69,7 +69,19 @@ const schema = z.object({
 
   // ── Meta WhatsApp Cloud API ──────────────────────────────────────────────
   META_WA_BEARER_TOKEN: z.string().min(1, 'META_WA_BEARER_TOKEN required'),
-  META_WA_APP_SECRET: z.string().min(1, 'META_WA_APP_SECRET required'),
+  // ⚠️ OPCIONAL, y el motivo importa: **no la consume nadie**. Estaba declarada
+  // `.min(1)` para una verificación de firma de webhook que nunca se
+  // implementó, y con eso tuvo el messaging service de un cliente **caído tres
+  // días** (palmawebs, 2026-08-08 → 11: 3724 reinicios) por un secreto que
+  // ningún código lee. El único síntoma visible era que las notificaciones de
+  // lead calificado no llegaban.
+  //
+  // Cuando aparezca el consumidor, la guarda va **en el canal**, no en el boot:
+  // sin app secret, WhatsApp rechaza operar y el resto del servicio —email
+  // incluido— sigue andando. Una credencial de UN canal no puede bajar los
+  // otros; es la misma regla que ya rige para `RESEND_API_KEY` y para
+  // `META_WA_DEFAULT_PHONE_NUMBER_ID`, que degradan sin tirar el proceso.
+  META_WA_APP_SECRET: z.string().optional(),
   META_WA_WABA_ID: z.string().min(1, 'META_WA_WABA_ID required'),
   META_WA_DEFAULT_PHONE_NUMBER_ID: z.string().optional(),
   META_GRAPH_API_VERSION: z.string().default('v17.0'),

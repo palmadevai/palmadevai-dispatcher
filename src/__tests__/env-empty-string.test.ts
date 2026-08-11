@@ -82,6 +82,16 @@ describe('env: los opcionales llegan VACÍOS del compose, no ausentes', () => {
     await expect(loadEnv({ SECRETS_MASTER_KEY_PREVIOUS_VERSION: '0' })).rejects.toThrow();
   });
 
+  it('sin META_WA_APP_SECRET el servicio ARRANCA — no la lee nadie', async () => {
+    // Estaba `.min(1)` para una verificación de firma que nunca se implementó,
+    // y tuvo el messaging service de palmawebs caído 3 días (3724 reinicios).
+    // Cuando exista el consumidor, la guarda va en el CANAL, no en el boot.
+    const sinSecret = { ...BASE };
+    delete (sinSecret as Record<string, string>).META_WA_APP_SECRET;
+    const env = await loadEnv({ ...sinSecret, META_WA_APP_SECRET: '' });
+    expect(env.CLIENT_SLUG).toBe('palmadevai');
+  });
+
   it('el stack entero arranca con TODOS los opcionales en vacío', async () => {
     // Es literalmente lo que hace el compose de un cliente recién desplegado.
     const env = await loadEnv({
