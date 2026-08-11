@@ -145,6 +145,9 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
   registerManagementRoutes(app, {
     core: managementCore,
     sendBearer: env.DISPATCHER_SEND_BEARER,
+    // Custodio del piso 1 (F2). El `clientSlug` va al AAD del cifrado, así que
+    // un ciphertext no se puede mover a la base de otro cliente.
+    credentials: { sql, logger, clientSlug: env.CLIENT_SLUG },
   });
 
   // ── /mcp/messaging-v0 (Messaging MCP: Tier 1 F4, Tier 2/3 F5) ───────────
