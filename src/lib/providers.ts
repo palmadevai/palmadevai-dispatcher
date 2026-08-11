@@ -26,6 +26,7 @@
 import { sql } from './postgres.js';
 import { env } from '../env.js';
 import { logger } from './logger.js';
+import { loadProviderCredential } from '../core/provider-credentials.js';
 
 export type ProviderId = 'resend';
 
@@ -39,7 +40,7 @@ const ENV_FALLBACK: Record<ProviderId, string> = {
 // corto que el ciclo del deploy (~3 min), así que un cambio se toma solo.
 const TTL_MS = 30_000;
 
-type Row = { key_ref: string | null; status: string | null };
+type Row = { key_ref: string | null; status: string | null; ownership: string | null };
 const keyCache = new Map<string, { at: number; row: Row | null }>();
 let mailCache: { at: number; from: string | null } | null = null;
 
@@ -50,7 +51,7 @@ async function readProviderRow(id: ProviderId): Promise<Row | null> {
   let row: Row | null = null;
   try {
     const rows = await sql<Row[]>`
-      SELECT key_ref, status FROM config.v_client_providers WHERE id = ${id}
+      SELECT key_ref, status, ownership FROM config.v_client_providers WHERE id = ${id}
     `;
     row = rows[0] ?? null;
   } catch (err) {
@@ -64,12 +65,44 @@ async function readProviderRow(id: ProviderId): Promise<Row | null> {
 }
 
 export type ResolvedKey =
-  | { ok: true; apiKey: string; source: 'db' | 'env' }
+  | { ok: true; apiKey: string; source: 'vault' | 'db' | 'env' }
   | { ok: false; error: string };
 
-/** Credencial vigente del proveedor, sin exponer de quién es la cuenta. */
+/**
+ * Credencial vigente del proveedor, sin exponer de quién es la cuenta.
+ *
+ * Tres pasos, en orden (§4.7 de `analysis-secretos-en-reposo.md`):
+ *
+ *   1. `ownership='owned'` + ciphertext  → descifrar        (`vault`)
+ *   2. `key_ref` del modelo              → `env[key_ref]`   (`db`)
+ *   3. `ENV_FALLBACK[id]`                → env              (`env`)
+ *
+ * **El paso 1 se activa SÓLO con `ownership='owned'`.** Mientras el estado es
+ * `pending_verification` la credencial nueva ya está guardada pero **no se
+ * usa**: el correo sigue saliendo con la nuestra. Es lo que hace que una key
+ * mal cargada no le rompa el mail a nadie, y es la mitad del gate del cutover
+ * (T7.3 / T9.8.3).
+ */
 export async function resolveProviderKey(id: ProviderId): Promise<ResolvedKey> {
   const row = await readProviderRow(id);
+
+  // ── Paso 1: la credencial del cliente (BYOK) ────────────────────────────
+  if (row?.ownership === 'owned') {
+    const loaded = await loadProviderCredential(
+      { sql, logger, clientSlug: env.CLIENT_SLUG },
+      id,
+    );
+    if (loaded.ok) return { ok: true, apiKey: loaded.credential, source: 'vault' };
+
+    // ⚠ NO se cae al env. El cliente está en `owned`: mandar con la credencial
+    // `managed` sería emitir su correo DESDE NUESTRA CUENTA, que es justo lo
+    // que el BYOK evita. Falla cerrado y con la causa nombrada.
+    return {
+      ok: false,
+      error: `${id}: la cuenta es del cliente (owned) y su credencial no se pudo usar — ${loaded.message}`,
+    };
+  }
+
   const envName = row?.key_ref?.trim() || ENV_FALLBACK[id];
   const apiKey = (env as unknown as Record<string, string | undefined>)[envName];
 
