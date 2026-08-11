@@ -150,6 +150,24 @@ export async function resolveDefaultFrom(): Promise<string | null> {
   return from;
 }
 
+/**
+ * Invalida el cache de un proveedor (o de todos) — T7.4.
+ *
+ * El TTL de 30 s ya haría que un cutover se tome solo, y por eso esto **no es
+ * lo que hace correcto al cutover**: es lo que evita la ventana en la que el
+ * operador ve «listo» en la UI y el mail siguiente sale todavía con la
+ * credencial vieja. Media ventana de 30 s alcanza para que alguien concluya
+ * que el cutover no funcionó y lo repita.
+ *
+ * ⚠️ Es del PROCESO. Con `DISPATCHER_REPLICAS > 1` cada réplica tiene el suyo,
+ * así que las demás siguen pagando el TTL. No se resuelve con un broadcast:
+ * 30 s de convergencia es exactamente lo que el diseño ya aceptó (§5.2).
+ */
+export function invalidateProviderCache(id?: ProviderId): void {
+  if (id) keyCache.delete(id);
+  else keyCache.clear();
+}
+
 /** Sólo para tests: los caches son del proceso y no se comparten entre casos. */
 export function __resetProviderCache(): void {
   keyCache.clear();

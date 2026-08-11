@@ -11,6 +11,9 @@
  *   PUT    /management/providers/:id/credential    → core storeProviderCredential()
  *   GET    /management/providers/:id/credential    → core getProviderCredentialInfo()
  *   DELETE /management/providers/:id/credential    → core deleteProviderCredential()
+ *   POST   /management/providers/:id/credential/check → core checkProviderCredential()
+ *   POST   /management/providers/:id/cutover       → core cutoverProviderToOwned()
+ *   POST   /management/providers/:id/revert        → core revertProviderToManaged()
  *
  * Transport rule (§3.4): zero business logic here — request shape → core
  * call → HTTP status mapping. Status codes mirror what the campaign-site
@@ -33,6 +36,11 @@ import {
   deleteProviderCredential,
   type CredentialDeps,
 } from '../../core/provider-credentials.js';
+import {
+  checkProviderCredential,
+  cutoverProviderToOwned,
+  revertProviderToManaged,
+} from '../../core/provider-cutover.js';
 
 export interface ManagementRouteDeps {
   core: ManagementDeps;
@@ -56,6 +64,24 @@ export interface ManagementRouteDeps {
 const CredentialBodySchema = z.object({
   credential: z.string().min(1, 'credential vacía').max(16_384, 'credential demasiado larga'),
   created_by: z.string().max(200).optional(),
+});
+
+/**
+ * `verify_to` no tiene default, y es deliberado.
+ *
+ * El gate del cutover es que **alguien lea el mail** (T9.8.3). Un default —el
+ * `admin_email` del branding, por ejemplo— haría que el cutover se "verifique"
+ * contra una casilla que quizá nadie mira, que es la forma elegante de tener un
+ * gate que no gatea. Quien aprieta el botón elige a dónde llega la prueba.
+ */
+const CutoverBodySchema = z.object({
+  verify_to: z.string().email('verify_to tiene que ser una dirección de mail'),
+  changed_by: z.string().max(200).optional(),
+});
+
+const RevertBodySchema = z.object({
+  changed_by: z.string().max(200).optional(),
+  reason: z.string().max(500).optional(),
 });
 
 const CreateTemplateBodySchema = z.object({
@@ -169,4 +195,76 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
       return reply.code(200).send(result);
     },
   );
+
+  // ── Cutover del BYOK (piso 1, F3 / T7) ────────────────────────────────────
+  //
+  // El `ownership` NO se puede setear por PUT: no hay ruta que lo escriba a
+  // pedido. Se mueve por estas tres, que son las que traen la evidencia — un
+  // endpoint que aceptara `{ownership: 'owned'}` volvería opcional el gate y el
+  // gate es todo lo que hace seguro al cutover.
+
+  app.post<{ Params: { id: string } }>(
+    '/management/providers/:id/credential/check',
+    async (request, reply) => {
+      if (!deps.credentials) {
+        return reply.code(503).send({ error: 'credential_store_disabled' });
+      }
+      const result = await checkProviderCredential(deps.credentials, request.params.id);
+      if (!result.ok) {
+        return reply.code(cutoverStatus(result.code)).send({ error: result.code, message: result.message });
+      }
+      return reply.code(200).send({ ok: true, detail: result.detail });
+    },
+  );
+
+  app.post<{ Params: { id: string } }>('/management/providers/:id/cutover', async (request, reply) => {
+    if (!deps.credentials) {
+      return reply.code(503).send({ error: 'credential_store_disabled' });
+    }
+    const parsed = CutoverBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_body', issues: parsed.error.issues.map((i) => i.message) });
+    }
+    const result = await cutoverProviderToOwned(deps.credentials, request.params.id, {
+      verifyTo: parsed.data.verify_to,
+      changedBy: parsed.data.changed_by ?? null,
+    });
+    if (!result.ok) {
+      return reply.code(cutoverStatus(result.code)).send({ error: result.code, message: result.message });
+    }
+    return reply.code(200).send(result);
+  });
+
+  app.post<{ Params: { id: string } }>('/management/providers/:id/revert', async (request, reply) => {
+    if (!deps.credentials) {
+      return reply.code(503).send({ error: 'credential_store_disabled' });
+    }
+    const parsed = RevertBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_body', issues: parsed.error.issues.map((i) => i.message) });
+    }
+    const result = await revertProviderToManaged(deps.credentials, request.params.id, {
+      changedBy: parsed.data.changed_by ?? null,
+      reason: parsed.data.reason,
+    });
+    if (!result.ok) {
+      return reply
+        .code(result.code === 'unknown_provider' ? 404 : 409)
+        .send({ error: result.code, message: result.message });
+    }
+    return reply.code(200).send(result);
+  });
+}
+
+/**
+ * Mapeo de causa → status. La distinción que importa es **de quién es el
+ * problema**: `409` es «falta un paso tuyo» (no cargaste la credencial, el
+ * proveedor no flipea), `422` es «el proveedor rechazó lo que trajiste» y
+ * `503` es «este cliente no tiene el piso 1 cableado», que es nuestro.
+ */
+function cutoverStatus(code: string): number {
+  if (code === 'unknown_provider') return 404;
+  if (code === 'no_master_key') return 503;
+  if (code === 'not_flippable' || code === 'no_credential') return 409;
+  return 422;
 }
