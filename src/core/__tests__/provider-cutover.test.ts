@@ -107,6 +107,15 @@ function fakeSql(seed: Partial<ProviderState> = {}) {
     if (q.includes('FROM config.v_client_providers')) {
       return Promise.resolve(String(vals[0]) === providerState.id ? [{ ...providerState }] : []);
     }
+    // El outcome de un chequeo FALLIDO escribe estado sin audit, y por eso su
+    // SQL lleva `'failed'` literal en vez de pasarlo como parámetro. Va antes
+    // del write genérico: los dos son INSERT sobre la misma tabla.
+    if (q.includes('INSERT INTO config.client_providers') && q.includes("'failed'")) {
+      callOrder.push('state:check-failed');
+      providerState.status = 'failed';
+      providerState.statusDetail = String(vals[2]);
+      return Promise.resolve([]);
+    }
     if (q.includes('INSERT INTO config.client_providers')) {
       const [provider_id, ownership, status, statusDetail, changedBy, changedFrom, notes] = vals;
       stateWrites.push({ provider_id, ownership, status, statusDetail, changedBy, changedFrom, notes });
@@ -173,6 +182,28 @@ describe('checkProviderCredential (T7.3) — no toca ownership', () => {
     expect(r).toMatchObject({ ok: false, code: 'credential_rejected' });
     expect(providerState.ownership).toBe('managed');
     expect(providerState.status).toBe('failed');
+  });
+
+  it('el chequeo que falla NO pisa el audit del último cambio real', async () => {
+    // Encontrado en el smoke de F3 contra el lab: un chequeo fallido escribía
+    // `changed_by = NULL`. Probar una credencial no es un cambio de
+    // titularidad, y el audit es lo único que después contesta «¿quién puso a
+    // este cliente en owned?».
+    const { sql, stateWrites, providerState } = fakeSql();
+    vi.mocked(verifyEmailCredential).mockResolvedValue({
+      ok: false,
+      error_code: 'invalid_api_key',
+      error_message: 'API key is invalid',
+      http_status: 401,
+    });
+    await seedCredential(sql);
+
+    await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'resend');
+
+    expect(providerState.status).toBe('failed');
+    // Ninguna escritura con audit: el estado se movió por la vía que no lo toca.
+    expect(stateWrites).toHaveLength(0);
+    expect(callOrder).toContain('state:check-failed');
   });
 
   it('el chequeo que sale bien LIMPIA el failed anterior', async () => {
