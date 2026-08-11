@@ -45,9 +45,26 @@ export interface EmailSendInput {
    */
   attachments?: { filename: string; content_base64: string; content_type?: string }[];
   biz_opaque_callback_data: string;
+  /**
+   * Credencial EXPLÍCITA, en vez de la que devuelve el resolver (T9.8.3).
+   *
+   * Existe por un solo llamador: el mail de verificación del cutover. El gate
+   * pide que el flip a `owned` no se marque hecho hasta que **un mail real
+   * salió con la credencial nueva** — y mientras el estado es
+   * `pending_verification` el resolver, a propósito, **se niega a entregarla**
+   * (paso 1 sólo con `ownership='owned'`). Sin este override sólo quedan dos
+   * caminos, los dos peores: flipear primero y verificar después —dejando una
+   * ventana donde el correo del cliente sale con una key sin probar— o hablarle
+   * a Resend desde afuera de este archivo, que es lo que R9 impide.
+   *
+   * ⚠️ NO es un atajo de configuración: cualquier otro emisor que lo use se
+   * saltea el modelo entero. El único llamador legítimo es `provider-cutover`.
+   */
+  api_key?: string;
 }
 
 const RESEND_API_URL = 'https://api.resend.com/emails';
+const RESEND_DOMAINS_URL = 'https://api.resend.com/domains';
 const REQUEST_TIMEOUT_MS = 15_000;
 
 interface ResendSuccessResponse {
@@ -92,16 +109,22 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
   // La credencial se resuelve por llamada (T5.4): `ownership` puede cambiar en
   // caliente (BYOK) y con lectura en module-load un cutover no tomaba efecto
   // hasta reiniciar el contenedor. El resolver cachea 30 s.
-  const key = await resolveProviderKey('resend');
-  if (!key.ok) {
-    // Error de config TERMINAL: se devuelve ok=false en vez de tirar, para que
-    // la capa de retry ackee y el clasificador lo marque failed sin ciclos.
-    return {
-      ok: false,
-      http_status: 0,
-      error_code: 'resend_api_key_missing',
-      error_message: key.error,
-    };
+  let apiKey: string;
+  if (input.api_key) {
+    apiKey = input.api_key;
+  } else {
+    const key = await resolveProviderKey('resend');
+    if (!key.ok) {
+      // Error de config TERMINAL: se devuelve ok=false en vez de tirar, para que
+      // la capa de retry ackee y el clasificador lo marque failed sin ciclos.
+      return {
+        ok: false,
+        http_status: 0,
+        error_code: 'resend_api_key_missing',
+        error_message: key.error,
+      };
+    }
+    apiKey = key.apiKey;
   }
 
   const body = {
@@ -132,7 +155,7 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
     res = await request(RESEND_API_URL, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${key.apiKey}`,
+        authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -204,6 +227,78 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
     error_message: errorMessage,
     raw_response: responseBody,
     raw_request: body,
+  };
+}
+
+export type CredentialCheck =
+  | { ok: true; detail: string }
+  | { ok: false; error_code: string; error_message: string; http_status: number };
+
+/**
+ * Test de conexión de una credencial de Resend (T7.3), sin mandar nada.
+ *
+ * `GET /domains` es la lectura más barata que ejercita la autenticación. Vive
+ * acá y no en el core porque la URL y los nombres de error son vocabulario del
+ * proveedor (R8/R9): el core pregunta *«¿esta credencial sirve?»* y no sabe de
+ * Resend.
+ *
+ * ⚠️ **`restricted_api_key` cuenta como VÁLIDA, y esto es lo importante de esta
+ * función.** Resend emite keys con permiso *sólo de envío*, y a esas
+ * `GET /domains` les responde 401 — una key perfectamente buena para lo único
+ * que el cliente necesita. Tratar ese caso como inválido haría que el cutover
+ * rechace al cliente que hizo **bien** las cosas (una key de mínimo privilegio)
+ * y acepte al que trajo una de acceso total. El chequeo queda *inconcluso* y lo
+ * resuelve el envío real, que es el gate que de verdad manda (T9.8.3).
+ */
+export async function verifyEmailCredential(apiKey: string): Promise<CredentialCheck> {
+  let res;
+  try {
+    res = await request(RESEND_DOMAINS_URL, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${apiKey}` },
+      headersTimeout: REQUEST_TIMEOUT_MS,
+      bodyTimeout: REQUEST_TIMEOUT_MS,
+    });
+  } catch (err) {
+    // Una caída de red NO es una credencial mala. Se devuelve como fallo del
+    // chequeo con su causa; el llamador decide, y lo que decide es no flipear.
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error_code: 'network_error', error_message: message, http_status: 0 };
+  }
+
+  const status = res.statusCode;
+  let body: unknown = null;
+  try {
+    body = await res.body.json();
+  } catch {
+    try {
+      body = await res.body.text();
+    } catch {
+      body = null;
+    }
+  }
+
+  if (status >= 200 && status < 300) {
+    return { ok: true, detail: 'la credencial autenticó contra Resend' };
+  }
+
+  const err = body as ResendErrorResponse;
+  const code = err.name ?? `http_${status}`;
+
+  if (code === 'restricted_api_key') {
+    return {
+      ok: true,
+      detail:
+        'la credencial es de permiso restringido (sólo envío): autentica pero no puede listar ' +
+        'dominios. Se valida con el envío real',
+    };
+  }
+
+  return {
+    ok: false,
+    error_code: code,
+    error_message: err.message ?? `HTTP ${status}`,
+    http_status: status,
   };
 }
 
