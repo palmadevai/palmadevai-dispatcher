@@ -18,6 +18,7 @@ import type { Logger } from '../lib/logger.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
 import { env } from '../env.js';
 import { sendEmail } from '../providers/email.js';
+import { resolveProviderKey } from '../lib/providers.js';
 
 const AUTO_PAUSE_RATIO = 0.2; // 20 %
 const AUTO_PAUSE_WINDOW_MIN = 1; // last 1 minute of attempts
@@ -137,8 +138,14 @@ export async function moveToDLQ(
         // inexistente). El destinatario vive en bot.config['branding'].admin_email
         // (config de negocio no-secreta, no env var — criterio secreto-vs-config
         // del handbook, 2026-06-16; mismo patrón que llm-gateway-alerts /
-        // facturacion-abonos-cron). Si falta admin_email o RESEND_API_KEY, no-op.
-        if (env.RESEND_API_KEY) {
+        // facturacion-abonos-cron). Si falta admin_email o credencial, no-op.
+        //
+        // El gate pregunta por el RESOLVER, no por env.RESEND_API_KEY: con el
+        // cliente en `owned` (BYOK, F3) la env queda vacía a propósito y un
+        // gate por env apagaba esta alerta en silencio — la credencial real
+        // puede estar cifrada en la base. sendEmail() resuelve igual; esto
+        // sólo decide si hay con qué mandar.
+        if ((await resolveProviderKey('resend')).ok) {
           const [brandingRow] = await sql<Array<{ admin_email: string | null }>>`
             SELECT value->>'admin_email' AS admin_email
             FROM bot.config
