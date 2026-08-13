@@ -49,11 +49,13 @@ function makeCore(overrides: {
 async function buildApp(opts: {
   sendBearer?: string | undefined;
   core?: ManagementDeps;
+  domains?: import('../../../core/provider-domains.js').DomainsDeps;
 } = {}): Promise<FastifyInstance> {
   const app = Fastify();
   registerManagementRoutes(app, {
     core: opts.core ?? makeCore(),
     sendBearer: 'sendBearer' in opts ? opts.sendBearer : 'test-bearer',
+    domains: opts.domains,
   });
   await app.ready();
   return app;
@@ -183,5 +185,35 @@ describe('POST /management/endpoints/:id/quality-refresh', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe('phone no encontrado');
+  });
+});
+
+describe('GET /management/providers/resend/domains (S4.4)', () => {
+  it('siempre 200 con el DomainsResult en el body — el contrato viaja en ok/reason', async () => {
+    const app = await buildApp({
+      domains: {
+        resolveKey: vi.fn(async () => ({
+          ok: false as const,
+          error: 'resend: falta la credencial (RESEND_API_KEY sin valor)',
+        })),
+      },
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/management/providers/resend/domains',
+      headers: auth,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      ok: false,
+      reason: 'no_key',
+      detail: 'resend: falta la credencial (RESEND_API_KEY sin valor)',
+    });
+  });
+
+  it('exige el bearer como todo /management/*', async () => {
+    const app = await buildApp();
+    const res = await app.inject({ method: 'GET', url: '/management/providers/resend/domains' });
+    expect(res.statusCode).toBe(401);
   });
 });

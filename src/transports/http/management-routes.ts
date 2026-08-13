@@ -8,6 +8,7 @@
  *   DELETE /management/templates/:id               → core deleteWaTemplate()
  *   POST   /management/endpoints/sync              → core syncEndpoints()
  *   POST   /management/endpoints/:id/quality-refresh → core refreshPhoneQuality()
+ *   GET    /management/providers/resend/domains    → core listResendDomains()
  *   PUT    /management/providers/:id/credential    → core storeProviderCredential()
  *   GET    /management/providers/:id/credential    → core getProviderCredentialInfo()
  *   DELETE /management/providers/:id/credential    → core deleteProviderCredential()
@@ -41,6 +42,7 @@ import {
   cutoverProviderToOwned,
   revertProviderToManaged,
 } from '../../core/provider-cutover.js';
+import { listResendDomains, type DomainsDeps } from '../../core/provider-domains.js';
 
 export interface ManagementRouteDeps {
   core: ManagementDeps;
@@ -48,6 +50,8 @@ export interface ManagementRouteDeps {
   sendBearer: string | undefined;
   /** Custodio del piso 1 (F2). Sin esto, las rutas de credencial responden 503. */
   credentials?: CredentialDeps;
+  /** Sólo tests: stubs del listado de dominios (S4.4). */
+  domains?: DomainsDeps;
 }
 
 /**
@@ -143,6 +147,15 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
   );
 
   // ── Custodio de credenciales del cliente (piso 1, F2) ─────────────────────
+  // S4.4 / T6.2 (decisión c, infra#308): los dominios de Resend los sirve el
+  // custodio de la key. Siempre 200 con el `DomainsResult` en el body — el
+  // contrato (error ≠ lista vacía) viaja en `ok`/`reason`, y el cockpit lo
+  // dibuja sin traducción. El auth es el preHandler de todo /management/*.
+  app.get('/management/providers/resend/domains', async (_req, reply) => {
+    const result = await listResendDomains(deps.domains);
+    return reply.code(200).send(result);
+  });
+
   //
   // ⚠️ El `PUT` recibe el secreto EN CLARO por la red interna de Docker. Es el
   // mismo canal por el que ya viaja el cuerpo de los mails en `/send`, y es
