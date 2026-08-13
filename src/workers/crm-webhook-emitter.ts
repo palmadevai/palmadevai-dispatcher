@@ -272,6 +272,19 @@ export function startCrmWebhookEmitter(deps: CrmWebhookEmitterDeps): NodeJS.Time
       // Network bound: paralelismo está OK.
       await Promise.allSettled(rows.map((row) => dispatchSingle(deps, row)));
     } catch (err) {
+      // Cliente sin outbound engine provisionado (073+ gated por
+      // MODULES_OUTBOUND_ENGINE): bot.crm_webhook_deliveries no existe y el
+      // tick fallaria cada 2s para siempre (caso palmawebs 2026-08-13). Un
+      // solo warn y el worker se apaga — mismo espiritu que el gate del DLQ
+      // (#61): la ausencia del schema ES el toggle del modulo.
+      if ((err as { code?: string }).code === '42P01') {
+        logger.warn(
+          { err: (err as Error).message },
+          'crm-webhook-emitter disabled: schema del outbound engine no provisionado',
+        );
+        clearInterval(handle);
+        return;
+      }
       logger.error(
         { err: (err as Error).message },
         'crm-webhook-emitter tick failed',
