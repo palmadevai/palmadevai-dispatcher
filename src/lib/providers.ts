@@ -28,11 +28,18 @@ import { env } from '../env.js';
 import { logger } from './logger.js';
 import { loadProviderCredential } from '../core/provider-credentials.js';
 
-export type ProviderId = 'resend';
+export type ProviderId = 'resend' | 'meta' | 'openai';
 
 /** Env canónica por proveedor. Es el fallback de T5.6, no la fuente de verdad. */
 const ENV_FALLBACK: Record<ProviderId, string> = {
   resend: 'RESEND_API_KEY',
+  // S5.1 (ADR-005): los otros dos secretos que consume el dispatcher entran al
+  // MISMO resolver — piso 1 con fallback a env mientras dura la transición.
+  // `meta` es el bearer de la Cloud API (canal WhatsApp); `openai` es la key
+  // de personalización de campañas. Sin fila en el modelo ni credencial en el
+  // vault, resuelven por env como siempre — cero cambio de comportamiento.
+  meta: 'META_WA_BEARER_TOKEN',
+  openai: 'OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI',
 };
 
 // Cache corto: un envío no puede pagar un round-trip por mail, pero tampoco

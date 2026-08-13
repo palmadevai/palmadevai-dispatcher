@@ -68,7 +68,13 @@ const schema = z.object({
   DB_SCHEMA: z.string().default('bot'),
 
   // ── Meta WhatsApp Cloud API ──────────────────────────────────────────────
-  META_WA_BEARER_TOKEN: z.string().min(1, 'META_WA_BEARER_TOKEN required'),
+  // OPCIONAL desde S5.1 (ADR-005): era `.min(1)` y una credencial de UN canal
+  // no puede bajar el servicio entero — la regla del incidente
+  // META_WA_APP_SECRET (3 días caído por un secreto que nadie leía). La guarda
+  // vive EN EL CANAL: sin token, el boot pasa y es el envío/management de
+  // WhatsApp el que falla con la causa nombrada. Además es el fallback T5.6
+  // del resolver del piso 1 (`resolveProviderKey('meta')`: vault→db→env).
+  META_WA_BEARER_TOKEN: z.string().optional(),
   // ⚠️ OPCIONAL, y el motivo importa: **no la consume nadie**. Estaba declarada
   // `.min(1)` para una verificación de firma de webhook que nunca se
   // implementó, y con eso tuvo el messaging service de un cliente **caído tres

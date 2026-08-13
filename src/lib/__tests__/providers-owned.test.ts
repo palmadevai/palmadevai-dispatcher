@@ -16,7 +16,12 @@ vi.mock('../postgres.js', () => ({
   sql: (() => Promise.resolve([...rows])) as never,
 }));
 vi.mock('../../env.js', () => ({
-  env: { CLIENT_SLUG: 'palmadevai', RESEND_API_KEY: 're_NUESTRA_managed' },
+  env: {
+    CLIENT_SLUG: 'palmadevai',
+    RESEND_API_KEY: 're_NUESTRA_managed',
+    META_WA_BEARER_TOKEN: 'EAAG_bearer_env',
+    OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI: 'sk-personalize-env',
+  },
 }));
 vi.mock('../logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
@@ -93,5 +98,45 @@ describe('resolver — paso 1 (BYOK)', () => {
       apiKey: 're_NUESTRA_managed',
       source: 'env',
     });
+  });
+
+  // S5.1 (ADR-005): los otros dos secretos del dispatcher entran al MISMO
+  // resolver. Lo que se fija: el fallback env de cada uno es SU var canónica
+  // (T5.6 — sin fila ni vault, cero cambio de comportamiento), y la ausencia
+  // falla con la env nombrada — que es lo que la guarda del canal loguea.
+  it('meta resuelve por env a META_WA_BEARER_TOKEN sin fila del modelo', async () => {
+    rows.length = 0;
+    __resetProviderCache();
+    expect(await resolveProviderKey('meta')).toEqual({
+      ok: true,
+      apiKey: 'EAAG_bearer_env',
+      source: 'env',
+    });
+  });
+
+  it('openai (personalize) resuelve por env a su var canónica', async () => {
+    rows.length = 0;
+    __resetProviderCache();
+    expect(await resolveProviderKey('openai')).toEqual({
+      ok: true,
+      apiKey: 'sk-personalize-env',
+      source: 'env',
+    });
+  });
+
+  it('meta ausente falla nombrando la env — la guarda del canal muestra esto', async () => {
+    rows.length = 0;
+    __resetProviderCache();
+    const envMod = await import('../../env.js');
+    const prev = (envMod.env as Record<string, unknown>).META_WA_BEARER_TOKEN;
+    (envMod.env as Record<string, unknown>).META_WA_BEARER_TOKEN = undefined;
+    try {
+      const r = await resolveProviderKey('meta');
+      expect(r.ok).toBe(false);
+      expect((r as { error: string }).error).toContain('META_WA_BEARER_TOKEN');
+    } finally {
+      (envMod.env as Record<string, unknown>).META_WA_BEARER_TOKEN = prev;
+      __resetProviderCache();
+    }
   });
 });

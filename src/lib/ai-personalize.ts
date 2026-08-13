@@ -20,6 +20,7 @@ import crypto from 'node:crypto';
 import type { Sql } from 'postgres';
 import { env } from '../env.js';
 import { logger } from './logger.js';
+import { resolveProviderKey } from './providers.js';
 import type { AiPersonalizationConfig, DeliveryContext } from '../dispatch/audience-resolver.js';
 
 const SENTINEL = '{{ai_generated}}';
@@ -126,11 +127,14 @@ export async function resolveAiBindings(
     return bindings;
   }
 
-  const apiKey = env.OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI;
-  if (!apiKey) {
-    logger.warn({ campaign_id: campaign.id }, 'ai_personalization_enabled=true but OPENAI_API_KEY__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI is empty');
+  // S5.1 (ADR-005): la key se resuelve por el piso 1 (vault→db→env) — el
+  // fallback env es la misma var de siempre, cero cambio sin fila/vault.
+  const keyRes = await resolveProviderKey('openai');
+  if (!keyRes.ok) {
+    logger.warn({ campaign_id: campaign.id, err: keyRes.error }, 'ai_personalization_enabled=true pero sin credencial — bindings sin personalizar');
     return bindings;
   }
+  const apiKey = keyRes.apiKey;
   const baseUrl = env.OPENAI_BASE_URL__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI || 'https://api.openai.com/v1';
 
   const model = config.model ?? env.AI_PERSONALIZE_DEFAULT_MODEL;

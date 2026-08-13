@@ -22,6 +22,7 @@
  */
 import { request } from 'undici';
 import { env } from '../env.js';
+import { resolveProviderKey } from '../lib/providers.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -54,12 +55,19 @@ async function graphRequest(
   pathAndQuery: string,
   body?: unknown,
 ): Promise<{ ok: true; status: number; json: unknown } | { ok: false; http_status?: number; error: string }> {
+  // S5.1: mismo resolver del piso 1 que el canal de envío. Sin credencial, el
+  // management de WhatsApp responde su error con la causa — el resto del plano
+  // (Resend, credenciales, dominios) sigue operativo.
+  const key = await resolveProviderKey('meta');
+  if (!key.ok) {
+    return { ok: false, error: `whatsapp management sin credencial — ${key.error}` };
+  }
   let res;
   try {
     res = await request(graphUrl(pathAndQuery), {
       method,
       headers: {
-        authorization: `Bearer ${env.META_WA_BEARER_TOKEN}`,
+        authorization: `Bearer ${key.apiKey}`,
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
