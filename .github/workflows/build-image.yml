@@ -5,7 +5,12 @@ name: Build & Push Dispatcher Image (GHCR)
 # que la red de Hostinger filtra (runners Azure, IPs rotativas). Reemplaza el
 # viejo deploy.yml push-SSH (que ahora corre solo on-demand como fallback).
 #
-# Imagen: ghcr.io/palmadevai/<repo>:latest + :<sha>  (privada). Sin build-args:
+# Imagen: DUAL-PUSH (runbook machine-accounts F2, gap handbook#313):
+#   ghcr.io/palmadevai/palmadevai-dispatcher  (historico, linkeado a este repo)
+#   ghcr.io/palmadevai/palmadev-dispatcher    (linkeado a tooling-dist -> lo
+#     heredan los bots de cliente; es el que consume DISPATCHER_IMAGE)
+# El push al nuevo requiere Manage Actions access (Write) en ese package.
+# Sin build-args:
 # es un worker Node/TS, toda la config se resuelve en runtime (env/Postgres).
 # Doc canónico: handbook/docs/technical-gitops-pull-deploy.md.
 
@@ -47,5 +52,7 @@ jobs:
           tags: |
             ghcr.io/${{ steps.img.outputs.name }}:latest
             ghcr.io/${{ steps.img.outputs.name }}:${{ github.sha }}
+            ghcr.io/palmadevai/palmadev-dispatcher:latest
+            ghcr.io/palmadevai/palmadev-dispatcher:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
