@@ -26,6 +26,7 @@ import { request } from 'undici';
 import type { TransactionSql } from 'postgres';
 import { env } from '../env.js';
 import { logger } from '../lib/logger.js';
+import { resolveProviderKey } from '../lib/providers.js';
 import { resolvePinnedWaEndpoint, pickPhoneForContact } from '../dispatch/pick-phone.js';
 import { resolveTemplateComponents } from '../dispatch/audience-resolver.js';
 import type { DeliveryContext } from '../dispatch/audience-resolver.js';
@@ -81,6 +82,28 @@ interface MetaErrorResponse {
 }
 
 export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSendResult> {
+  // S5.1 (ADR-005) — la guarda del canal: la credencial de Meta se resuelve
+  // por el piso 1 (vault→db→env, mismo resolver que resend) y su AUSENCIA es
+  // una falla de ESTE envío con la causa nombrada — nunca del boot (regla del
+  // incidente META_WA_APP_SECRET). `access_token` explícito (BYOK por endpoint)
+  // sigue teniendo prioridad, como siempre.
+  let bearer = input.access_token ?? null;
+  if (!bearer) {
+    const key = await resolveProviderKey('meta');
+    if (!key.ok) {
+      logger.error(
+        { phone_number_id: input.phone_number_id, to_last4: input.to.slice(-4), err: key.error },
+        'canal WhatsApp sin credencial — envío no intentado',
+      );
+      return {
+        ok: false,
+        error_code: 'missing_credential',
+        error_message: key.error,
+      };
+    }
+    bearer = key.apiKey;
+  }
+
   const url =
     `https://graph.facebook.com/${env.META_GRAPH_API_VERSION}/` +
     `${encodeURIComponent(input.phone_number_id)}/messages`;
@@ -111,7 +134,7 @@ export async function sendWhatsApp(input: WhatsAppSendInput): Promise<ProviderSe
     res = await request(url, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${input.access_token ?? env.META_WA_BEARER_TOKEN}`,
+        authorization: `Bearer ${bearer}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
