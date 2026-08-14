@@ -32,6 +32,14 @@ vi.mock('../../providers/email.js', () => ({
   verifyEmailCredential: vi.fn(),
 }));
 
+// Los otros dos verificadores del dispatch per-proveedor: misma política.
+vi.mock('../../providers/whatsapp-management.js', () => ({
+  verifyMetaCredential: vi.fn(),
+}));
+vi.mock('../../lib/ai-personalize.js', () => ({
+  verifyOpenAiCredential: vi.fn(),
+}));
+
 // El resolver de remitente y el invalidador de cache: decisiones del core, no
 // del proveedor, pero tampoco son lo que este módulo prueba.
 vi.mock('../../lib/providers.js', () => ({
@@ -52,6 +60,8 @@ const { checkProviderCredential, cutoverProviderToOwned, revertProviderToManaged
   '../provider-cutover.js'
 );
 const { sendEmail, verifyEmailCredential } = await import('../../providers/email.js');
+const { verifyMetaCredential } = await import('../../providers/whatsapp-management.js');
+const { verifyOpenAiCredential } = await import('../../lib/ai-personalize.js');
 const { resolveDefaultFrom, invalidateProviderCache } = await import('../../lib/providers.js');
 
 const SECRET = 're_ClienteTraeLaSuya_9f2c';
@@ -89,7 +99,7 @@ let callOrder: string[] = [];
  * `config.client_providers` (lo que agrega el cutover).
  */
 function fakeSql(seed: Partial<ProviderState> = {}) {
-  const providersCatalog = new Set(['resend']);
+  const providersCatalog = new Set(['resend', 'meta', 'openai', 'arca']);
   const secrets = new Map<string, Record<string, unknown>>();
   const stateWrites: StateWrite[] = [];
   const providerState: ProviderState = {
@@ -154,8 +164,8 @@ function fakeSql(seed: Partial<ProviderState> = {}) {
 }
 
 /** Deja la credencial cargada (F2 de verdad) antes de ejercitar el cutover. */
-async function seedCredential(sql: never, secret = SECRET) {
-  await storeProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'resend', secret, 'carlos');
+async function seedCredential(sql: never, secret = SECRET, providerId = 'resend') {
+  await storeProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, providerId, secret, 'carlos');
 }
 
 beforeEach(() => {
@@ -163,6 +173,8 @@ beforeEach(() => {
   callOrder = [];
   vi.mocked(sendEmail).mockReset();
   vi.mocked(verifyEmailCredential).mockReset();
+  vi.mocked(verifyMetaCredential).mockReset();
+  vi.mocked(verifyOpenAiCredential).mockReset();
   vi.mocked(resolveDefaultFrom).mockReset();
   vi.mocked(invalidateProviderCache).mockReset();
 });
@@ -508,5 +520,103 @@ describe('revertProviderToManaged (T7.5)', () => {
     });
     expect(r).toMatchObject({ ok: false, code: 'not_owned' });
     expect(stateWrites).toHaveLength(0);
+  });
+
+  it('18. revert sobre un proveedor que NACE del cliente → not_flippable, sin escrituras', async () => {
+    // Meta es owned de nacimiento: no existe una «cuenta administrada» a la
+    // cual volver. La UI ofrece el botón sobre cualquier card owned; la
+    // autoridad tiene que ser el servicio.
+    const { sql, providerState, stateWrites } = fakeSql({
+      id: 'meta',
+      name: 'Meta',
+      ownership: 'owned',
+      ownership_flippable: false,
+    });
+    const r = await revertProviderToManaged({ sql, logger, clientSlug: 'palmadevai' }, 'meta', {
+      changedBy: 'carlos',
+    });
+    expect(r).toMatchObject({ ok: false, code: 'not_flippable' });
+    expect(providerState.ownership).toBe('owned');
+    expect(stateWrites).toHaveLength(0);
+  });
+});
+
+describe('check per-proveedor (TD S5.1 → S1.1) — cada credencial contra SU proveedor', () => {
+  it('14. meta usa el verificador de Meta, nunca el de Resend', async () => {
+    const { sql } = fakeSql({
+      id: 'meta',
+      name: 'Meta',
+      ownership: 'owned',
+      ownership_flippable: false,
+    });
+    await seedCredential(sql, 'EAAG_token_meta_nuevo', 'meta');
+    vi.mocked(verifyMetaCredential).mockResolvedValue({
+      ok: true,
+      detail: 'la credencial autenticó contra Meta y accede a la WABA «Lab»',
+    });
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'meta');
+
+    expect(r).toMatchObject({ ok: true, detail: expect.stringContaining('WABA') });
+    expect(verifyMetaCredential).toHaveBeenCalledWith('EAAG_token_meta_nuevo');
+    // El TD que esto cierra: el botón «probar» de la card de Meta respondía el
+    // 401 de Resend sobre un token perfectamente bueno.
+    expect(verifyEmailCredential).not.toHaveBeenCalled();
+  });
+
+  it('15. openai rechazada → failed con el texto de SU proveedor y SU panel', async () => {
+    const { sql, providerState } = fakeSql({ id: 'openai', name: 'OpenAI' });
+    await seedCredential(sql, 'sk-proj-mala', 'openai');
+    vi.mocked(verifyOpenAiCredential).mockResolvedValue({
+      ok: false,
+      error_code: 'invalid_api_key',
+      error_message: 'Incorrect API key provided',
+      http_status: 401,
+    });
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'openai');
+
+    expect(r).toMatchObject({ ok: false, code: 'credential_rejected' });
+    expect(providerState.status).toBe('failed');
+    const message = (r as { message: string }).message;
+    expect(message).toContain('OpenAI');
+    expect(message).toContain('https://platform.openai.com/api-keys');
+    expect(verifyEmailCredential).not.toHaveBeenCalled();
+  });
+
+  it('16. proveedor sin verificador propio → check_unsupported, sin red y sin escrituras', async () => {
+    const { sql, stateWrites, providerState } = fakeSql({ id: 'arca', name: 'ARCA' });
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'arca');
+
+    expect(r).toMatchObject({ ok: false, code: 'check_unsupported' });
+    expect(providerState.status).toBe('ok');
+    expect(stateWrites).toHaveLength(0);
+    expect(verifyEmailCredential).not.toHaveBeenCalled();
+    expect(verifyMetaCredential).not.toHaveBeenCalled();
+    expect(verifyOpenAiCredential).not.toHaveBeenCalled();
+  });
+
+  it('17. cutover de openai → cutover_unsupported: el gate de mail es de Resend, no se reusa', async () => {
+    const { sql, providerState, stateWrites } = fakeSql({
+      id: 'openai',
+      name: 'OpenAI',
+      ownership: 'managed',
+      ownership_flippable: true,
+    });
+    await seedCredential(sql, 'sk-proj-buena', 'openai');
+
+    const r = await cutoverProviderToOwned(
+      { sql, logger, clientSlug: 'palmadevai' },
+      'openai',
+      { verifyTo: VERIFY_TO, changedBy: 'carlos' },
+    );
+
+    expect(r).toMatchObject({ ok: false, code: 'cutover_unsupported' });
+    expect(providerState.ownership).toBe('managed');
+    expect(stateWrites).toHaveLength(0);
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(verifyEmailCredential).not.toHaveBeenCalled();
+    expect(verifyOpenAiCredential).not.toHaveBeenCalled();
   });
 });

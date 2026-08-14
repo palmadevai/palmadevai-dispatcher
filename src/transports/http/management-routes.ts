@@ -278,6 +278,16 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
 function cutoverStatus(code: string): number {
   if (code === 'unknown_provider') return 404;
   if (code === 'no_master_key') return 503;
-  if (code === 'not_flippable' || code === 'no_credential') return 409;
+  if (
+    code === 'not_flippable' ||
+    code === 'no_credential' ||
+    // La operación no existe para este proveedor (sin verificador propio, o un
+    // flip cuyo gate no está construido): es un límite nuestro, no un rechazo
+    // del proveedor — 422 diría «lo que trajiste está mal», que es falso.
+    code === 'check_unsupported' ||
+    code === 'cutover_unsupported'
+  ) {
+    return 409;
+  }
   return 422;
 }

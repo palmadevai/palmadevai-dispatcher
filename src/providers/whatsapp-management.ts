@@ -23,6 +23,7 @@
 import { request } from 'undici';
 import { env } from '../env.js';
 import { resolveProviderKey } from '../lib/providers.js';
+import type { CredentialCheck } from './types.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -100,6 +101,62 @@ async function graphRequest(
     errObj?.message ??
     (typeof responseBody === 'string' ? responseBody.slice(0, 200) : `HTTP ${status}`);
   return { ok: false, http_status: status, error: `HTTP ${status}: ${detail}` };
+}
+
+/**
+ * Test de conexión de una credencial de Meta (T7.3 / F4), sin mandar nada.
+ *
+ * Va con el bearer CANDIDATO —el que el operador acaba de cargar en el vault—
+ * y no con el que entrega el resolver: lo que se prueba es la credencial nueva.
+ *
+ * `GET /{waba_id}` y no `/me` a propósito: leer la WABA contesta las DOS cosas
+ * que el botón «probar» tiene que contestar en una rotación (S1.1) — que el
+ * token autentica Y que accede a la WABA de ESTE cliente. Un token válido de
+ * otro Business Manager autentica igual contra `/me`, y aceptarlo repetiría el
+ * modo de falla del token compartido que la rotación viene a separar.
+ */
+export async function verifyMetaCredential(bearer: string): Promise<CredentialCheck> {
+  let res;
+  try {
+    res = await request(graphUrl(`${encodeURIComponent(env.META_WA_WABA_ID)}?fields=id,name`), {
+      method: 'GET',
+      headers: { authorization: `Bearer ${bearer}` },
+      headersTimeout: REQUEST_TIMEOUT_MS,
+      bodyTimeout: REQUEST_TIMEOUT_MS,
+    });
+  } catch (err) {
+    // Una caída de red NO es una credencial mala — mismo criterio que el
+    // verificador de Resend: el llamador decide, y lo que decide es no aceptar.
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error_code: 'network_error', error_message: message, http_status: 0 };
+  }
+
+  const status = res.statusCode;
+  let body: unknown = null;
+  try {
+    body = await res.body.json();
+  } catch {
+    body = null;
+  }
+
+  if (status >= 200 && status < 300) {
+    const name = (body as { name?: string } | null)?.name;
+    return {
+      ok: true,
+      detail: name
+        ? `la credencial autenticó contra Meta y accede a la WABA «${name}»`
+        : 'la credencial autenticó contra Meta y accede a la WABA del cliente',
+    };
+  }
+
+  const errObj = (body as { error?: { message?: string; code?: number; type?: string } } | null)
+    ?.error;
+  return {
+    ok: false,
+    error_code: errObj?.type ?? `http_${status}`,
+    error_message: errObj?.message ?? `HTTP ${status}`,
+    http_status: status,
+  };
 }
 
 export async function fetchTemplates(

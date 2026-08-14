@@ -22,8 +22,67 @@ import { env } from '../env.js';
 import { logger } from './logger.js';
 import { resolveProviderKey } from './providers.js';
 import type { AiPersonalizationConfig, DeliveryContext } from '../dispatch/audience-resolver.js';
+import type { CredentialCheck } from '../providers/types.js';
 
 const SENTINEL = '{{ai_generated}}';
+
+/**
+ * Base URL del consumidor de la credencial `openai` (cascada F1 del gateway):
+ * seteada la env, la key es una virtual key de LiteLLM y se habla con el proxy
+ * interno; vacía, api.openai.com directo.
+ */
+function personalizeBaseUrl(): string {
+  return env.OPENAI_BASE_URL__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI || 'https://api.openai.com/v1';
+}
+
+/**
+ * Test de conexión de la credencial de OpenAI (T7.3 / F4), sin generar nada.
+ *
+ * Vive acá y no en `providers/` porque el consumidor real de esta credencial es
+ * el personalize: el chequeo ejercita la MISMA base URL que usa el envío. Con
+ * gateway, la key es una virtual key de LiteLLM — probarla contra
+ * api.openai.com respondería «inválida» sobre una credencial que funciona.
+ *
+ * `GET /models` es la lectura más barata que ejercita la autenticación: no
+ * genera tokens ni gasto, y la aceptan tanto OpenAI como LiteLLM.
+ */
+export async function verifyOpenAiCredential(apiKey: string): Promise<CredentialCheck> {
+  const baseUrl = personalizeBaseUrl();
+  let host = 'OpenAI';
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    // Base URL malformada: el fetch de abajo lo reporta como network_error.
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(env.AI_PERSONALIZE_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // Una caída de red NO es una credencial mala — mismo criterio que los
+    // verificadores de Resend y Meta.
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error_code: 'network_error', error_message: message, http_status: 0 };
+  }
+
+  if (res.ok) {
+    return { ok: true, detail: `la credencial autenticó contra ${host}` };
+  }
+
+  let errorCode = `http_${res.status}`;
+  let errorMessage = `HTTP ${res.status}`;
+  try {
+    const body = (await res.json()) as { error?: { message?: string; code?: string } } | null;
+    if (body?.error?.code) errorCode = body.error.code;
+    if (body?.error?.message) errorMessage = body.error.message;
+  } catch {
+    // Sin cuerpo JSON: queda el status pelado, que ya nombra el problema.
+  }
+  return { ok: false, error_code: errorCode, error_message: errorMessage, http_status: res.status };
+}
 
 interface OpenAiResponse {
   choices: Array<{ message: { content: string | null } }>;
@@ -135,7 +194,7 @@ export async function resolveAiBindings(
     return bindings;
   }
   const apiKey = keyRes.apiKey;
-  const baseUrl = env.OPENAI_BASE_URL__CAMPAIGNS__DISPATCHER__PERSONALIZE_OPENAI || 'https://api.openai.com/v1';
+  const baseUrl = personalizeBaseUrl();
 
   const model = config.model ?? env.AI_PERSONALIZE_DEFAULT_MODEL;
   const temperature = config.temperature ?? env.AI_PERSONALIZE_DEFAULT_TEMPERATURE;

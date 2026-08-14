@@ -23,6 +23,18 @@ export interface ProviderSendResult {
   raw_request?: unknown;
 }
 
+/**
+ * Resultado del test de conexión de una credencial (T7.3 / F4).
+ *
+ * Cada proveedor implementa el suyo en su propio adapter — la URL y los nombres
+ * de error son vocabulario del proveedor (R8/R9); el core sólo pregunta «¿esta
+ * credencial sirve?» y despacha por id (`CREDENTIAL_VERIFIERS` en
+ * `core/provider-cutover.ts`).
+ */
+export type CredentialCheck =
+  | { ok: true; detail: string }
+  | { ok: false; error_code: string; error_message: string; http_status: number };
+
 export class ChannelNotImplementedError extends Error {
   readonly code = 'channel_not_implemented';
   constructor(public readonly channel: string) {
