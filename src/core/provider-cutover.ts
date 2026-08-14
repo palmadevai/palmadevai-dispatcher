@@ -43,24 +43,46 @@
  */
 import { loadProviderCredential, type CredentialDeps } from './provider-credentials.js';
 import { sendEmail, verifyEmailCredential } from '../providers/email.js';
-import { invalidateProviderCache, resolveDefaultFrom } from '../lib/providers.js';
+import { verifyMetaCredential } from '../providers/whatsapp-management.js';
+import { verifyOpenAiCredential } from '../lib/ai-personalize.js';
+import type { CredentialCheck } from '../providers/types.js';
+import { invalidateProviderCache, resolveDefaultFrom, type ProviderId } from '../lib/providers.js';
 
 /**
  * Dónde va el cliente a arreglar lo suyo (T7.7).
  *
  * El error tiene que apuntar al panel de SU proveedor, no a un ticket nuestro:
- * la cuenta es del cliente y nosotros no podemos verificarle un dominio. Es un
- * mapa chico a propósito — hoy el piso 1 estrena un solo proveedor. Cuando F6
- * traiga OpenAI, Meta y LiteLLM, esto se muda al catálogo (`config.providers`),
- * que es donde vive el resto de lo que la card sabe de un proveedor.
+ * la cuenta es del cliente y nosotros no podemos verificarle un dominio ni
+ * emitirle un token. Cuando el catálogo crezca, esto se muda a
+ * `config.providers`, que es donde vive el resto de lo que la card sabe de un
+ * proveedor.
  */
 const PROVIDER_PANEL: Record<string, string> = {
   resend: 'https://resend.com/domains',
+  meta: 'https://business.facebook.com/settings/system-users',
+  openai: 'https://platform.openai.com/api-keys',
+};
+
+/**
+ * Verificador por proveedor (el TD que gateaba S1.1-por-UI): cada credencial se
+ * prueba contra SU proveedor, con el vocabulario de su adapter.
+ *
+ * Antes había uno solo —el de Resend— para cualquier id: desde que S5.1 metió
+ * `meta` y `openai` al piso 1, el botón «probar» respondía el 401 de Resend
+ * sobre un token de Meta perfectamente bueno, y una rotación por la card no se
+ * podía dar por validada.
+ */
+const CREDENTIAL_VERIFIERS: Record<string, (credential: string) => Promise<CredentialCheck>> = {
+  resend: verifyEmailCredential,
+  meta: verifyMetaCredential,
+  openai: verifyOpenAiCredential,
 };
 
 export type CutoverFailureCode =
   | 'unknown_provider'
   | 'not_flippable'
+  | 'check_unsupported'
+  | 'cutover_unsupported'
   | 'no_credential'
   | 'no_master_key'
   | 'undecryptable'
@@ -70,15 +92,19 @@ export type CutoverFailureCode =
 
 export type CutoverResult =
   | { ok: true; ownership: 'owned'; message_id: string; verified_to: string }
-  | { ok: false; code: CutoverFailureCode; message: string };
+  | { ok: false; code: Exclude<CutoverFailureCode, 'check_unsupported'>; message: string };
 
 export type CheckResult =
   | { ok: true; detail: string }
-  | { ok: false; code: Exclude<CutoverFailureCode, 'no_sender' | 'send_failed'>; message: string };
+  | {
+      ok: false;
+      code: Exclude<CutoverFailureCode, 'no_sender' | 'send_failed' | 'cutover_unsupported'>;
+      message: string;
+    };
 
 export type RevertResult =
   | { ok: true; ownership: 'managed'; was: string }
-  | { ok: false; code: 'unknown_provider' | 'not_owned'; message: string };
+  | { ok: false; code: 'unknown_provider' | 'not_owned' | 'not_flippable'; message: string };
 
 interface ProviderRow {
   id: string;
@@ -170,10 +196,12 @@ async function writeCheckOutcome(
 function rejectedDetail(row: ProviderRow, code: string, message: string): string {
   const panel = PROVIDER_PANEL[row.id];
   const where = panel ? `en tu panel de ${row.name} (${panel})` : `en tu panel de ${row.name}`;
+  // Neutro entre proveedores: lo lee la card de Resend, la de Meta y la de
+  // OpenAI. «El correo…» era verdad sólo para el primero.
   const stillOurs =
     row.ownership === 'owned'
       ? ''
-      : ' El correo sigue saliendo con nuestra cuenta: esto no interrumpió ningún envío.';
+      : ' Todo sigue saliendo con nuestra cuenta: esto no interrumpió ningún envío.';
   return `${row.name} rechazó la credencial (${code}: ${message}). Se arregla ${where}.${stillOurs}`;
 }
 
@@ -194,13 +222,24 @@ export async function checkProviderCredential(
     return { ok: false, code: 'unknown_provider', message: `proveedor '${providerId}' desconocido` };
   }
 
+  const verify = CREDENTIAL_VERIFIERS[providerId];
+  if (!verify) {
+    // Fallar con la causa antes que «validar» contra el proveedor equivocado:
+    // un ok de mentira acá es exactamente el TD que este dispatch cierra.
+    return {
+      ok: false,
+      code: 'check_unsupported',
+      message: `${row.name} todavía no tiene test de conexión propio`,
+    };
+  }
+
   const loaded = await loadProviderCredential(deps, providerId);
   if (!loaded.ok) {
     const code = loaded.code === 'absent' ? 'no_credential' : loaded.code;
     return { ok: false, code, message: loaded.message };
   }
 
-  const check = await verifyEmailCredential(loaded.credential);
+  const check = await verify(loaded.credential);
   if (!check.ok) {
     const detail = rejectedDetail(row, check.error_code, check.error_message);
     await writeCheckOutcome(deps, providerId, row.ownership, detail);
@@ -252,6 +291,20 @@ export async function cutoverProviderToOwned(
       ok: false,
       code: 'not_flippable',
       message: `${row.name} no admite cambio de titularidad (ownership_flippable=false)`,
+    };
+  }
+
+  // El gate del cutover ES un envío real de correo (T9.8.3): sólo existe para
+  // el proveedor de email. Extender el flip a otro proveedor exige construirle
+  // su propia evidencia —un uso real con la credencial nueva—, no reusar ésta:
+  // un «cutover» de OpenAI verificado con un mail de Resend no prueba nada.
+  if (providerId !== 'resend') {
+    return {
+      ok: false,
+      code: 'cutover_unsupported',
+      message:
+        `el cambio de titularidad de ${row.name} todavía no tiene su prueba real cableada: ` +
+        'hoy sólo Resend completa el flip (el gate es un mail de verificación)',
     };
   }
 
@@ -367,6 +420,17 @@ export async function revertProviderToManaged(
   if (!row) {
     return { ok: false, code: 'unknown_provider', message: `proveedor '${providerId}' desconocido` };
   }
+  if (!row.ownership_flippable) {
+    // Meta y ARCA NACEN del cliente: no existe una «cuenta administrada» a la
+    // cual volver. La UI ofrece el botón sobre cualquier card owned; la
+    // autoridad es ésta — sin este guard, un click escribía `managed` sobre un
+    // proveedor cuyo lado managed no existe.
+    return {
+      ok: false,
+      code: 'not_flippable',
+      message: `${row.name} nace del cliente: no hay cuenta administrada a la que volver`,
+    };
+  }
   if (row.ownership !== 'owned') {
     return {
       ok: false,
@@ -383,7 +447,7 @@ export async function revertProviderToManaged(
     changedBy: opts.changedBy,
     notes: opts.reason?.trim() || 'vuelta a la cuenta administrada (T7.5)',
   });
-  invalidateProviderCache('resend');
+  invalidateProviderCache(providerId as ProviderId);
 
   deps.logger.info(
     { provider_id: providerId, by: opts.changedBy, reason: opts.reason },

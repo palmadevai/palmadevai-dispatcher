@@ -30,7 +30,7 @@ import { logger } from '../lib/logger.js';
 import { classifyResendError } from '../classify/email-error-classifier.js';
 import type { DeliveryContext } from '../dispatch/audience-resolver.js';
 import type { ChannelProvider, PrepareOutcome } from '../ports/channel-provider.js';
-import type { ProviderSendResult } from './types.js';
+import type { CredentialCheck, ProviderSendResult } from './types.js';
 
 export interface EmailSendInput {
   from: string;
@@ -229,10 +229,6 @@ export async function sendEmail(input: EmailSendInput): Promise<ProviderSendResu
     raw_request: body,
   };
 }
-
-export type CredentialCheck =
-  | { ok: true; detail: string }
-  | { ok: false; error_code: string; error_message: string; http_status: number };
 
 /**
  * Test de conexión de una credencial de Resend (T7.3), sin mandar nada.
