@@ -92,6 +92,25 @@ describe('env: los opcionales llegan VACÍOS del compose, no ausentes', () => {
     expect(env.CLIENT_SLUG).toBe('palmadevai');
   });
 
+  it('sin META_WA_WABA_ID el servicio ARRANCA — es config de UN canal', async () => {
+    // Era la ÚNICA `.min(1)` que sobrevivió al arreglo de META_WA_APP_SECRET,
+    // justo en el medio de ese bloque. Mismo modo de falla: el proceso no
+    // bootea y entra en loop de reinicio.
+    //
+    // Caso testigo (egeriatravel, 2026-08-15): el alta de campañas dejó el
+    // dispatcher en `Restarting` con `FATAL: env validation failed —
+    // META_WA_WABA_ID required`, en un cliente cuyo canal WhatsApp todavía no
+    // está cableado. Campañas, email y el resto del management eran válidos.
+    //
+    // La guarda vive en el CANAL: el template-sync no arranca (con el motivo
+    // logueado) y `verifyMetaCredential` contesta `waba_id_missing`.
+    const sinWaba = { ...BASE };
+    delete (sinWaba as Record<string, string>).META_WA_WABA_ID;
+    const env = await loadEnv({ ...sinWaba, META_WA_WABA_ID: '' });
+    expect(env.META_WA_WABA_ID).toBe('');
+    expect(env.CLIENT_SLUG).toBe('palmadevai');
+  });
+
   it('el stack entero arranca con TODOS los opcionales en vacío', async () => {
     // Es literalmente lo que hace el compose de un cliente recién desplegado.
     const env = await loadEnv({

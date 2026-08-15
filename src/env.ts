@@ -88,7 +88,24 @@ const schema = z.object({
   // otros; es la misma regla que ya rige para `RESEND_API_KEY` y para
   // `META_WA_DEFAULT_PHONE_NUMBER_ID`, que degradan sin tirar el proceso.
   META_WA_APP_SECRET: z.string().optional(),
-  META_WA_WABA_ID: z.string().min(1, 'META_WA_WABA_ID required'),
+  // ⚠️ OPCIONAL desde 2026-08-15, por la MISMA razón que las dos de arriba —
+  // estaba `.min(1)` justo en el medio de este bloque, o sea la única que
+  // sobrevivió al arreglo del incidente de `META_WA_APP_SECRET`.
+  //
+  // Es el identificador de la WABA de UN canal (WhatsApp), y un canal sin
+  // configurar no puede impedir que arranque el servicio entero: campañas,
+  // email y el resto del management son válidos igual. Con `.min(1)` el proceso
+  // no bootea y entra en loop de reinicio.
+  //
+  // Caso testigo (egeriatravel, 2026-08-15): el alta de campañas dejó el
+  // dispatcher en `Restarting` con `FATAL: env validation failed —
+  // META_WA_WABA_ID required`, en un cliente cuyo canal WhatsApp todavía no
+  // está cableado. Mismo modo de falla que tuvo a palmawebs 3 días caído.
+  //
+  // La guarda va EN EL CANAL, como manda la regla de este bloque: sin WABA id,
+  // el template-sync no arranca (con el motivo logueado) y el check de
+  // credencial de Meta contesta con la causa nombrada.
+  META_WA_WABA_ID: z.string().default(''),
   META_WA_DEFAULT_PHONE_NUMBER_ID: z.string().optional(),
   META_GRAPH_API_VERSION: z.string().default('v17.0'),
 
