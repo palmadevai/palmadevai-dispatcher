@@ -36,6 +36,7 @@ vi.mock('../budget.js', () => ({
 // vitest hoists vi.mock(...) above imports, so these static imports already
 // resolve against the mocked modules.
 import { sendMessage, isWithin24hWindow } from '../messaging.js';
+import { resetAnnouncedForTests } from '../../lib/pg-errors.js';
 
 function makeFakeSql(responses: unknown[][] = []): SqlClient {
   let i = 0;
@@ -50,6 +51,15 @@ function makeFakeSql(responses: unknown[][] = []): SqlClient {
 function makeThrowingSql(): SqlClient {
   return (async () => {
     throw new Error('db down');
+  }) as unknown as SqlClient;
+}
+
+/** Postgres cuando la tabla no existe: SQLSTATE 42P01 (cliente sin `campaigns`). */
+function makeMissingRelationSql(): SqlClient {
+  return (async () => {
+    throw Object.assign(new Error('relation "bot.audience_contacts" does not exist'), {
+      code: '42P01',
+    });
   }) as unknown as SqlClient;
 }
 
@@ -485,6 +495,43 @@ describe('sendMessage — opt-out', () => {
     const result = await sendMessage(deps, msg);
 
     expect(result).toEqual({ status: 'sent', message_id: 'wamid-noopt' });
+  });
+
+  // Cliente SIN la feature `campaigns`: la tabla de la BUC no existe. El envío
+  // tiene que salir igual —no hay baja que respetar donde no hay dónde
+  // registrarla— pero SIN un `error` por mensaje: eso convertía el log de esos
+  // clientes en ruido permanente. Ver `lib/pg-errors.ts`.
+  it('la tabla ausente (42P01) no es una falla: manda igual y NO loguea error', async () => {
+    resetAnnouncedForTests();
+    mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-sin-buc' });
+    const deps = makeDeps({ sql: makeMissingRelationSql() });
+    const logger = deps.logger as unknown as { error: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn> };
+
+    const result = await sendMessage(deps, makeMsg({ context: { feature: 'f', client_ref: 'ref-sin-buc' } }));
+
+    expect(result).toEqual({ status: 'sent', message_id: 'wamid-sin-buc' });
+    expect(logger.error).not.toHaveBeenCalled();
+    // El anuncio va en info y una sola vez. Se filtra por mensaje porque
+    // `sendMessage` loguea otras cosas en info durante un envío normal.
+    const anuncios = logger.info.mock.calls.filter(([, msg]) =>
+      String(msg).includes('sin bot.audience_contacts'),
+    );
+    expect(anuncios).toHaveLength(1);
+  });
+
+  // La contracara, que es la que hace que el cambio no sea una mordaza: si la
+  // query falla por OTRA cosa —permiso revocado, base caída— sigue siendo un
+  // error y se grita igual que antes.
+  it('un fallo real de la query sigue gritando en error', async () => {
+    resetAnnouncedForTests();
+    mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-db-down' });
+    const deps = makeDeps({ sql: makeThrowingSql() });
+    const logger = deps.logger as unknown as { error: ReturnType<typeof vi.fn> };
+
+    const result = await sendMessage(deps, makeMsg({ context: { feature: 'f', client_ref: 'ref-db-down' } }));
+
+    expect(result).toEqual({ status: 'sent', message_id: 'wamid-db-down' });
+    expect(logger.error).toHaveBeenCalled();
   });
 });
 

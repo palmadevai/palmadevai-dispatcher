@@ -24,6 +24,7 @@
 import type { Sql, TransactionSql } from 'postgres';
 import type { Redis } from 'ioredis';
 import type { Logger } from '../lib/logger.js';
+import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
 
 type SqlOrTx = Sql | TransactionSql;
 
@@ -190,10 +191,22 @@ async function loadDbSpendCounts(sql: SqlOrTx, channel: string, logger: Logger):
     `;
     for (const r of rows) data.set(r.category, Number(r.cnt));
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, channel },
-      'campaign spend query (bot.campaign_deliveries) failed — treating campaign spend as 0 for this tick',
-    );
+    if (isMissingRelation(err)) {
+      // Cliente sin la feature `campaigns`: no hay campañas, así que el gasto
+      // de campañas ES cero. El resultado no es una degradación, es el número
+      // correcto — y el gasto de `/send` sigue contándose por Redis.
+      announceOnce(
+        logger,
+        'missing:campaign_deliveries:budget',
+        { channel },
+        'sin bot.campaign_deliveries (cliente sin la feature campaigns): el gasto de campañas es 0 y el de /send se cuenta igual por Redis. Estado esperado, se dice una vez.',
+      );
+    } else {
+      logger.warn(
+        { err: (err as Error).message, channel },
+        'campaign spend query (bot.campaign_deliveries) failed — treating campaign spend as 0 for this tick',
+      );
+    }
   }
   dbSpendCacheByChannel.set(channel, { at: now, data });
   return data;

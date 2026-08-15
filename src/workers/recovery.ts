@@ -23,6 +23,7 @@ import type { Sql } from 'postgres';
 import { env } from '../env.js';
 import type { Logger } from '../lib/logger.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
+import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
 import { moveToDLQ } from './dlq.js';
 
 const RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
@@ -129,7 +130,20 @@ async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promis
       logger.warn({ count: zombies.length }, 'requeued postgres zombies');
     }
   } catch (err) {
-    logger.error({ err: (err as Error).message }, 'safety-net step failed');
+    if (isMissingRelation(err)) {
+      // Sin la feature `campaigns` no hay deliveries que rescatar. Es el paso
+      // que más ruido hacía de los cuatro: corre por cron cada 5 minutos, así
+      // que en un cliente sin campañas escribía un `error` cada 5 minutos,
+      // para siempre.
+      announceOnce(
+        logger,
+        'missing:campaign_deliveries:safety-net',
+        {},
+        'sin bot.campaign_deliveries (cliente sin la feature campaigns): el safety-net no tiene nada que rescatar. Estado esperado, se dice una vez.',
+      );
+    } else {
+      logger.error({ err: (err as Error).message }, 'safety-net step failed');
+    }
   }
 
   // ── 3. PEL dead-letter: IDLE > 1h → terminal failed + DLQ + XACK ──────────
