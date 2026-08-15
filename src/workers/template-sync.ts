@@ -37,6 +37,16 @@ export function startTemplateSync(
     logger.info('template-sync worker: interval 0 — disabled (on-demand sync only)');
     return { stop: () => undefined };
   }
+  // Guarda EN EL CANAL de `META_WA_WABA_ID` (ver el bloque en env.ts): sin WABA
+  // id no hay contra qué sincronizar plantillas. Se sale con el motivo dicho, en
+  // vez de tirar un error cada intervalo contra la Graph API con un id vacío.
+  if (!core.wabaId) {
+    logger.info(
+      'template-sync worker: sin META_WA_WABA_ID — deshabilitado (canal WhatsApp sin configurar). ' +
+        'El resto del dispatcher (campañas, email, management) sigue operativo.',
+    );
+    return { stop: () => undefined };
+  }
 
   let running = false;
   const run = async (): Promise<void> => {

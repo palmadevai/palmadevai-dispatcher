@@ -116,6 +116,20 @@ async function graphRequest(
  * modo de falla del token compartido que la rotación viene a separar.
  */
 export async function verifyMetaCredential(bearer: string): Promise<CredentialCheck> {
+  // Guarda EN EL CANAL de `META_WA_WABA_ID` (ver el bloque en env.ts): sin WABA
+  // id no hay contra qué verificar. Se contesta con la causa NOMBRADA en vez de
+  // pegarle a la Graph API con un id vacío, que devolvería un 400 genérico y
+  // haría parecer que el token está mal cuando lo que falta es la config.
+  if (!env.META_WA_WABA_ID) {
+    return {
+      ok: false,
+      error_code: 'waba_id_missing',
+      error_message:
+        'META_WA_WABA_ID no está configurada: el canal WhatsApp de este cliente todavía no está cableado. ' +
+        'No es un problema del token.',
+      http_status: 400,
+    };
+  }
   let res;
   try {
     res = await request(graphUrl(`${encodeURIComponent(env.META_WA_WABA_ID)}?fields=id,name`), {
