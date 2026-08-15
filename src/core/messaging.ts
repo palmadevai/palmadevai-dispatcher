@@ -31,6 +31,7 @@ import type { Logger } from '../lib/logger.js';
 import { checkBudget, recordSendUsage, maybeAlert } from './budget.js';
 import { providerForChannel, recordProviderOutcome } from './provider-status.js';
 import { toE164, normalizeAllowlist } from '../lib/phone.js';
+import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
 import { getProviderForChannel } from '../ports/channel-provider.js';
 import type { OutboundMessage } from './schemas.js';
 import type { WhatsAppSendInput } from '../providers/whatsapp.js';
@@ -281,10 +282,22 @@ export async function isWithin24hWindow(
       lastInboundAt: new Date(last).toISOString(),
     };
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, channel },
-      '24h window lookup failed — fail-open, Meta decides',
-    );
+    if (isMissingRelation(err)) {
+      // Mismo caso que el opt-out: sin BUC no hay `last_inbound_at` que mirar,
+      // y quien decide si el mensaje entra en la ventana pasa a ser Meta — que
+      // es el fallback de siempre cuando el dato falta.
+      announceOnce(
+        logger,
+        'missing:audience_contact_channels:24h',
+        { channel },
+        'sin bot.audience_contact_channels (cliente sin la feature campaigns): la ventana de 24 h la decide Meta. Estado esperado, se dice una vez.',
+      );
+    } else {
+      logger.warn(
+        { err: (err as Error).message, channel },
+        '24h window lookup failed — fail-open, Meta decides',
+      );
+    }
     return { within: true, known: false, lastInboundAt: null };
   }
 }
@@ -403,10 +416,24 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       // Contacto ausente en la BUC → sigue (ej. números de staff que nunca se
       // dieron de alta como audience contacts).
     } catch (err) {
-      deps.logger.error(
-        { err: (err as Error).message, feature },
-        'opt-out check query failed — proceeding (fail-open, logged loudly)',
-      );
+      if (isMissingRelation(err)) {
+        // Cliente sin la feature `campaigns`: no hay BUC, así que no hay dónde
+        // registrar una baja — y por lo tanto no hay ninguna que respetar. No
+        // se está ignorando el opt-out de nadie: el mecanismo no existe en este
+        // cliente. El día que contrate campañas, la tabla aparece y esta guarda
+        // empieza a funcionar sola, sin tocar código.
+        announceOnce(
+          deps.logger,
+          'missing:audience_contacts:optout',
+          { feature },
+          'sin bot.audience_contacts (cliente sin la feature campaigns): no hay BUC, así que no hay baja que chequear. Estado esperado, se dice una vez.',
+        );
+      } else {
+        deps.logger.error(
+          { err: (err as Error).message, feature },
+          'opt-out check query failed — proceeding (fail-open, logged loudly)',
+        );
+      }
     }
   }
 
