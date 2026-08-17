@@ -19,6 +19,16 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Solo la imagen del ultimo merge sirve. Si entran varios merges seguidos, los
+# builds anteriores quedan superados antes de terminar: cancelarlos ahorra
+# minutos de Actions -los builds son jobs de 3-4 minutos reales, el bloque mas
+# caro del presupuesto- y no hay riesgo, porque el deploy referencia `:latest`
+# y la imagen previa sigue sirviendo hasta que la nueva la reemplace.
+# Contexto y numeros medidos: handbook/docs/analysis-costo-ci-actions.md
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
