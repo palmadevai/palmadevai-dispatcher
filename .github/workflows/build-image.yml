@@ -17,6 +17,19 @@ name: Build & Push Dispatcher Image (GHCR)
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # Un merge que solo toca documentacion produce una imagen IDENTICA: el
+      # `COPY . .` es del stage builder y la imagen final se arma con
+      # /app/public + /app/.next/{standalone,static} (o src/ + dist/ en los
+      # servicios TS), asi que ningun .md llega al artefacto. Verificado ademas
+      # que ningun sitio lee markdown en build-time.
+      # Medido sobre agosto/2026: 18 de 130 builds (14%) fueron doc-only, y los
+      # dos disparadores mas comunes eran AGENTS.md y este mismo archivo.
+      # Para forzar un build igual: `workflow_dispatch` (abajo).
+      - '**.md'
+      - 'doc/**'
+      - 'docs/**'
+      - '.github/**'
   workflow_dispatch:
 
 # Solo la imagen del ultimo merge sirve. Si entran varios merges seguidos, los
