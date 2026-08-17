@@ -30,6 +30,7 @@ import type { Logger } from './lib/logger.js';
 import type { SqlClient } from './lib/postgres.js';
 import type { MetricsCollector } from './observability/metrics-collector.js';
 import { registerSendRoute } from './transports/http/send-route.js';
+import { registerMarkReadRoute } from './transports/http/mark-read-route.js';
 import { registerManagementRoutes } from './transports/http/management-routes.js';
 import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
@@ -139,6 +140,13 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     staffAllowlist: staffAllowlistRaw,
     defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
     defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+  });
+
+  // ── /mark-read (R8: el último Graph que quedaba fuera del dispatcher) ───
+  registerMarkReadRoute(app, {
+    logger,
+    sendBearer: env.DISPATCHER_SEND_BEARER,
+    defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
   });
 
   // ── /management/* (Messaging Service F3) ────────────────────────────────

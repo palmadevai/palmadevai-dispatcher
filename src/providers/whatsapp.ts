@@ -333,3 +333,110 @@ export const whatsappProvider: ChannelProvider = {
   classify: (result, attemptsMade, maxAttempts) => classifyMetaError(result, attemptsMade, maxAttempts),
   terminalOverride: whatsAppTerminalOverride,
 };
+
+// ─── Read receipts ──────────────────────────────────────────────────────────
+
+export interface WhatsAppMarkReadInput {
+  phone_number_id: string;
+  /** `wamid.…` del mensaje ENTRANTE que se marca leído. */
+  message_id: string;
+  /** BYOK por endpoint (multi-WABA), igual que en el envío. */
+  access_token?: string;
+}
+
+export interface MarkReadResult {
+  ok: boolean;
+  http_status?: number;
+  error_code?: string;
+  error_message?: string;
+}
+
+/**
+ * `POST /{phone_number_id}/messages` con `status: 'read'` — el tilde azul.
+ *
+ * POR QUÉ VIVE ACÁ Y NO EN n8n (R8, «cero Graph fuera del dispatcher»)
+ *
+ * Hasta 2026-08-17 el nodo `Mark as Read WA` de `whatsapp-bot-core` le pegaba
+ * DIRECTO a graph.facebook.com, y para eso n8n necesitaba su propia copia del
+ * número (`META_WA_PHONE_NUMBER_ID`) además del bearer. Esa env era la única
+ * razón por la que el número del cliente vivía en dos nombres distintos: acá
+ * `META_WA_DEFAULT_PHONE_NUMBER_ID` (con validación, tests y override por
+ * mensaje) y allá una copia sin nada de eso, que en palmawebs estaba **vacía**
+ * — el mark-as-read armaba `graph.facebook.com/v24.0//messages` y fallaba en
+ * silencio (`neverError: true`) sin un error en ningún log.
+ *
+ * ERROR POLICY: DISTINTA a la del envío, a propósito. Un envío que falla se
+ * reintenta y se clasifica porque el mensaje importa; un read receipt es
+ * cosmético. Acá NUNCA se lanza —ni en 5xx ni en error de red— y no hay retry:
+ * el peor caso aceptable es que un mensaje quede sin tilde azul. Lanzar haría
+ * que una caída de Meta ensuciara el log del bot por algo que no afecta a nadie.
+ */
+export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<MarkReadResult> {
+  let bearer = input.access_token ?? null;
+  if (!bearer) {
+    const key = await resolveProviderKey('meta');
+    if (!key.ok) {
+      logger.warn(
+        { phone_number_id: input.phone_number_id, err: key.error },
+        'mark-read sin credencial de Meta — no se intenta',
+      );
+      return { ok: false, error_code: 'missing_credential', error_message: key.error };
+    }
+    bearer = key.apiKey;
+  }
+
+  const url =
+    `https://graph.facebook.com/${env.META_GRAPH_API_VERSION}/` +
+    `${encodeURIComponent(input.phone_number_id)}/messages`;
+
+  try {
+    const res = await request(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: input.message_id,
+      }),
+      headersTimeout: REQUEST_TIMEOUT_MS,
+      bodyTimeout: REQUEST_TIMEOUT_MS,
+    });
+
+    const status = res.statusCode;
+    if (status >= 200 && status < 300) {
+      // El cuerpo se descarta a propósito (`{success:true}`), pero se CONSUME:
+      // undici filtra si nadie lee el body y el socket queda colgado.
+      await res.body.dump();
+      return { ok: true, http_status: status };
+    }
+
+    let body: unknown = null;
+    try {
+      body = await res.body.json();
+    } catch {
+      body = null;
+    }
+    const err = (body as MetaErrorResponse | null)?.error;
+    const result: MarkReadResult = {
+      ok: false,
+      http_status: status,
+      error_code: err?.code !== undefined ? String(err.code) : undefined,
+      error_message: err?.message ?? `HTTP ${status}`,
+    };
+    logger.warn(
+      { phone_number_id: input.phone_number_id, ...result },
+      'mark-read rechazado por Meta — sin retry (es cosmético)',
+    );
+    return result;
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    logger.warn(
+      { phone_number_id: input.phone_number_id, err: message },
+      'mark-read: error de red — sin retry (es cosmético)',
+    );
+    return { ok: false, error_code: 'network_error', error_message: message };
+  }
+}

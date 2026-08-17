@@ -140,3 +140,25 @@ export const OutboundMessageSchema = z.object({
     { message: 'el mail necesita `html` o `text` (o los dos)', path: ['content'] },
   );
 export type OutboundMessage = z.infer<typeof OutboundMessageSchema>;
+
+/**
+ * `POST /mark-read` — el tilde azul de un mensaje ENTRANTE de WhatsApp.
+ *
+ * No reusa `OutboundMessageSchema` a propósito: marcar leído no es un envío. No
+ * tiene destinatario, ni contenido, ni presupuesto, ni ventana de 24 h, ni
+ * idempotencia — pedirle un `to` y un `content` al llamador sería obligarlo a
+ * inventar campos que nadie lee.
+ *
+ * `phone_number_id` es OPCIONAL: el default es el del cliente
+ * (`META_WA_DEFAULT_PHONE_NUMBER_ID`), y sólo se manda explícito cuando el
+ * mensaje entró por un número que no es el default (multi-WABA). Ésa es la
+ * razón por la que este servicio es el dueño del número: el mark-as-read tiene
+ * que usar el número por el que ENTRÓ el mensaje, y quien sabe eso es el
+ * dispatcher, no una env copiada en n8n.
+ */
+export const MarkReadSchema = z.object({
+  channel: z.literal('whatsapp'),
+  message_id: z.string().min(1),
+  phone_number_id: z.string().min(1).optional(),
+});
+export type MarkRead = z.infer<typeof MarkReadSchema>;
