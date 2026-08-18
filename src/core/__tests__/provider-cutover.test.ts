@@ -36,14 +36,13 @@ vi.mock('../../providers/email.js', () => ({
 vi.mock('../../providers/whatsapp-management.js', () => ({
   verifyMetaCredential: vi.fn(),
 }));
-vi.mock('../../lib/ai-personalize.js', () => ({
-  verifyOpenAiCredential: vi.fn(),
-}));
 
-// La prueba de USO real del BYOK OpenAI (G1): sale a api.openai.com — se
-// mockea, nunca se llama de verdad.
+// Todo lo del BYOK OpenAI que sale a la red (la prueba de uso directa, el
+// «probar» directo y la Evidencia B por el gateway): mockeado, nunca real.
 vi.mock('../../providers/openai-byok.js', () => ({
   realOpenAiCompletion: vi.fn(),
+  verifyOpenAiByokKey: vi.fn(),
+  gatewayOpenAiCompletion: vi.fn(),
 }));
 
 // El resolver de remitente y el invalidador de cache: decisiones del core, no
@@ -62,13 +61,13 @@ const logger = {
 } as never;
 
 const { storeProviderCredential } = await import('../provider-credentials.js');
-const { checkProviderCredential, cutoverProviderToOwned, revertProviderToManaged } = await import(
-  '../provider-cutover.js'
-);
+const { checkProviderCredential, confirmOpenAiCutover, cutoverProviderToOwned, revertProviderToManaged } =
+  await import('../provider-cutover.js');
 const { sendEmail, verifyEmailCredential } = await import('../../providers/email.js');
 const { verifyMetaCredential } = await import('../../providers/whatsapp-management.js');
-const { verifyOpenAiCredential } = await import('../../lib/ai-personalize.js');
-const { realOpenAiCompletion } = await import('../../providers/openai-byok.js');
+const { realOpenAiCompletion, verifyOpenAiByokKey, gatewayOpenAiCompletion } = await import(
+  '../../providers/openai-byok.js'
+);
 const { resolveDefaultFrom, invalidateProviderCache } = await import('../../lib/providers.js');
 
 const SECRET = 're_ClienteTraeLaSuya_9f2c';
@@ -181,8 +180,9 @@ beforeEach(() => {
   vi.mocked(sendEmail).mockReset();
   vi.mocked(verifyEmailCredential).mockReset();
   vi.mocked(verifyMetaCredential).mockReset();
-  vi.mocked(verifyOpenAiCredential).mockReset();
+  vi.mocked(verifyOpenAiByokKey).mockReset();
   vi.mocked(realOpenAiCompletion).mockReset();
+  vi.mocked(gatewayOpenAiCompletion).mockReset();
   vi.mocked(resolveDefaultFrom).mockReset();
   vi.mocked(invalidateProviderCache).mockReset();
 });
@@ -575,7 +575,7 @@ describe('check per-proveedor (TD S5.1 → S1.1) — cada credencial contra SU p
   it('15. openai rechazada → failed con el texto de SU proveedor y SU panel', async () => {
     const { sql, providerState } = fakeSql({ id: 'openai', name: 'OpenAI' });
     await seedCredential(sql, 'sk-proj-mala', 'openai');
-    vi.mocked(verifyOpenAiCredential).mockResolvedValue({
+    vi.mocked(verifyOpenAiByokKey).mockResolvedValue({
       ok: false,
       error_code: 'invalid_api_key',
       error_message: 'Incorrect API key provided',
@@ -602,7 +602,7 @@ describe('check per-proveedor (TD S5.1 → S1.1) — cada credencial contra SU p
     expect(stateWrites).toHaveLength(0);
     expect(verifyEmailCredential).not.toHaveBeenCalled();
     expect(verifyMetaCredential).not.toHaveBeenCalled();
-    expect(verifyOpenAiCredential).not.toHaveBeenCalled();
+    expect(verifyOpenAiByokKey).not.toHaveBeenCalled();
   });
 
   it('17. cutover de resend SIN verify_to → no_verify_to, sin escribir nada', async () => {
@@ -731,5 +731,181 @@ describe('cutover OpenAI (G1, byok §7.12) — Evidencia A, sin flip', () => {
     expect(r).toMatchObject({ ok: false, code: 'no_credential' });
     expect(stateWrites).toHaveLength(0);
     expect(realOpenAiCompletion).not.toHaveBeenCalled();
+  });
+});
+
+describe('confirm OpenAI (G2, byok §7.12) — Evidencia B, y con ella el flip', () => {
+  const OPENAI_SEED = {
+    id: 'openai',
+    name: 'OpenAI',
+    ownership: 'managed',
+    ownership_flippable: true,
+    status: 'pending_verification',
+  };
+  const OPENAI_KEY = 'sk-proj-DelClienteDeVerdad_4u7q';
+  const DEPS = (sql: never) => ({ sql, logger, clientSlug: 'palmadevai' });
+
+  function directOk(org: string | null = 'org-cliente-xyz') {
+    vi.mocked(realOpenAiCompletion).mockResolvedValue({
+      ok: true,
+      response_id: 'chatcmpl-directa',
+      model: 'gpt-4o-mini',
+      organization: org,
+    });
+  }
+  function gatewayOk(org: string | null, apiBase: string | null = 'https://api.openai.com') {
+    vi.mocked(gatewayOpenAiCompletion).mockResolvedValue({
+      ok: true,
+      response_id: 'chatcmpl-gateway',
+      model: 'gpt-4o-mini',
+      organization: org,
+      api_base: apiBase,
+    });
+  }
+
+  it('22. B == A → owned, con las dos evidencias en notes y el cache invalidado', async () => {
+    const { sql, providerState, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk('org-cliente-xyz');
+    gatewayOk('org-cliente-xyz');
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({
+      ok: true,
+      ownership: 'owned',
+      organization: 'org-cliente-xyz',
+      evidence: { direct_id: 'chatcmpl-directa', gateway_id: 'chatcmpl-gateway' },
+    });
+    expect(providerState.ownership).toBe('owned');
+    expect(providerState.status).toBe('ok');
+    const last = stateWrites[stateWrites.length - 1];
+    expect(String(last.notes)).toContain('chatcmpl-directa');
+    expect(String(last.notes)).toContain('chatcmpl-gateway');
+    expect(String(last.changedBy)).toBe('operador');
+    expect(invalidateProviderCache).toHaveBeenCalledWith('openai');
+  });
+
+  it('23. el gateway factura a OTRA organización → gateway_not_swapped, sin flip', async () => {
+    const { sql, providerState, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk('org-cliente-xyz');
+    // El caso real de G2b: el operador todavía no corrió el loop BW → .env →
+    // recreate, así que el upstream sigue siendo nuestra cuenta.
+    gatewayOk('palmadevai');
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'gateway_not_swapped' });
+    expect(r.ok ? '' : r.message).toContain('palmadevai');
+    expect(providerState.ownership).toBe('managed');
+    expect(providerState.status).toBe('pending_verification');
+    // El estado honesto quedó escrito para la card, con las dos organizaciones.
+    const last = stateWrites[stateWrites.length - 1];
+    expect(String(last.notes)).toContain('palmadevai');
+    expect(String(last.notes)).toContain('org-cliente-xyz');
+    expect(invalidateProviderCache).not.toHaveBeenCalled();
+  });
+
+  it('24. la Evidencia A falla → failed + credential_rejected, el gateway NI SE TOCA', async () => {
+    const { sql, providerState } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    vi.mocked(realOpenAiCompletion).mockResolvedValue({
+      ok: false,
+      error_code: 'invalid_api_key',
+      error_message: 'Incorrect API key provided',
+      http_status: 401,
+    });
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'credential_rejected' });
+    expect(providerState.ownership).toBe('managed');
+    expect(providerState.status).toBe('failed');
+    // El porqué del orden: una key mala jamás golpea el gateway (401 upstream
+    // → cooldown del deployment ~60 s que sufren los consumidores del alias).
+    expect(gatewayOpenAiCompletion).not.toHaveBeenCalled();
+  });
+
+  it('25. sin gateway cableado → no_gateway, sin escrituras de estado', async () => {
+    const { sql, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk('org-cliente-xyz');
+    vi.mocked(gatewayOpenAiCompletion).mockResolvedValue({
+      ok: false,
+      error_code: 'no_gateway',
+      error_message: 'el dispatcher no tiene el gateway cableado',
+      http_status: 0,
+    });
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'no_gateway' });
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('26. el alias de prueba rutea a otro proveedor → smoke_not_openai_upstream, sin flip', async () => {
+    // Hallazgo G0: gpt-chico del lab rutea a DeepSeek. Comparar organizaciones
+    // de dos proveedores distintos no prueba titularidad de nada.
+    const { sql, providerState, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk('org-cliente-xyz');
+    gatewayOk(null, 'https://api.deepseek.com');
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'smoke_not_openai_upstream' });
+    expect(r.ok ? '' : r.message).toContain('api.deepseek.com');
+    expect(providerState.ownership).toBe('managed');
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('27. la completion directa sin header de organización → org_evidence_missing', async () => {
+    const { sql, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk(null);
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'org_evidence_missing' });
+    // Sin identidad no hay comparación — y flipear sin comparar es lo que el
+    // gate existe para impedir. El gateway ni se consulta.
+    expect(gatewayOpenAiCompletion).not.toHaveBeenCalled();
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('28. ya owned → already_owned, sin red y sin escrituras', async () => {
+    const { sql, stateWrites } = fakeSql({ ...OPENAI_SEED, ownership: 'owned', status: 'ok' });
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(r).toMatchObject({ ok: false, code: 'already_owned' });
+    expect(realOpenAiCompletion).not.toHaveBeenCalled();
+    expect(gatewayOpenAiCompletion).not.toHaveBeenCalled();
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('29. otro proveedor → confirm_unsupported, sin tocar nada', async () => {
+    const { sql, stateWrites } = fakeSql();
+    await seedCredential(sql);
+
+    const r = await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' }, 'resend');
+
+    expect(r).toMatchObject({ ok: false, code: 'confirm_unsupported' });
+    expect(realOpenAiCompletion).not.toHaveBeenCalled();
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('30. el plaintext de la key no se filtra ni al log ni al estado', async () => {
+    const { sql, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    directOk('org-cliente-xyz');
+    gatewayOk('org-cliente-xyz');
+
+    await confirmOpenAiCutover(DEPS(sql), { changedBy: 'operador' });
+
+    expect(JSON.stringify(logged)).not.toContain(OPENAI_KEY);
+    expect(JSON.stringify(stateWrites)).not.toContain(OPENAI_KEY);
   });
 });

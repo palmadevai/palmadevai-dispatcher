@@ -35,7 +35,7 @@
  *   managed ──(hay credencial + test OK)──▶ pending_verification
  *           ◀─────────(cualquier fallo)─── failed
  *   pending_verification ──(mail real OK)──▶ owned/ok          (resend)
- *   pending_verification ──(Evidencia B, G2)──▶ owned/ok       (openai — G1 se queda acá)
+ *   pending_verification ──(Evidencia B, confirm G2)──▶ owned/ok  (openai — ver confirmOpenAiCutover)
  *   owned ─────────────(T7.5, sin código)──▶ managed
  *
  * `pending_verification` se escribe **antes** de salir a la red, no después: si
@@ -51,8 +51,11 @@
 import { loadProviderCredential, type CredentialDeps } from './provider-credentials.js';
 import { sendEmail, verifyEmailCredential } from '../providers/email.js';
 import { verifyMetaCredential } from '../providers/whatsapp-management.js';
-import { verifyOpenAiCredential } from '../lib/ai-personalize.js';
-import { realOpenAiCompletion } from '../providers/openai-byok.js';
+import {
+  realOpenAiCompletion,
+  verifyOpenAiByokKey,
+  gatewayOpenAiCompletion,
+} from '../providers/openai-byok.js';
 import type { CredentialCheck } from '../providers/types.js';
 import { invalidateProviderCache, resolveDefaultFrom, type ProviderId } from '../lib/providers.js';
 
@@ -83,7 +86,11 @@ const PROVIDER_PANEL: Record<string, string> = {
 const CREDENTIAL_VERIFIERS: Record<string, (credential: string) => Promise<CredentialCheck>> = {
   resend: verifyEmailCredential,
   meta: verifyMetaCredential,
-  openai: verifyOpenAiCredential,
+  // DIRECTO contra api.openai.com, NO el verificador del personalize: aquél
+  // ejercita la base URL del cascade (con gateway, `http://litellm:4000/v1`,
+  // donde la key del CLIENTE daría «inválida» siendo buena). Era el hallazgo
+  // que G1 esquivó y G2 cierra — dos credenciales, dos verificadores.
+  openai: verifyOpenAiByokKey,
 };
 
 export type CutoverFailureCode =
@@ -128,6 +135,36 @@ export type CheckResult =
 export type RevertResult =
   | { ok: true; ownership: 'managed'; was: string }
   | { ok: false; code: 'unknown_provider' | 'not_owned' | 'not_flippable'; message: string };
+
+/**
+ * Causas del `confirm` (G2). Separadas de `CutoverFailureCode` a propósito: el
+ * confirm tiene fallos que el cutover no conoce (el gateway no cableado, el
+ * smoke ruteado a otro proveedor, la organización que no coincide) y mezclarlos
+ * degradaría los dos vocabularios.
+ */
+export type ConfirmFailureCode =
+  | 'unknown_provider'
+  | 'not_flippable'
+  | 'confirm_unsupported'
+  | 'already_owned'
+  | 'no_credential'
+  | 'no_master_key'
+  | 'undecryptable'
+  | 'credential_rejected'
+  | 'no_gateway'
+  | 'gateway_smoke_failed'
+  | 'smoke_not_openai_upstream'
+  | 'org_evidence_missing'
+  | 'gateway_not_swapped';
+
+export type ConfirmResult =
+  | {
+      ok: true;
+      ownership: 'owned';
+      organization: string;
+      evidence: { direct_id: string; gateway_id: string; model: string };
+    }
+  | { ok: false; code: ConfirmFailureCode; message: string };
 
 interface ProviderRow {
   id: string;
@@ -532,6 +569,216 @@ async function cutoverOpenAiG1(
       response_id: used.response_id,
       model: used.model,
       organization: used.organization,
+    },
+  };
+}
+
+/**
+ * G2 del cutover BYOK de OpenAI (byok §7.12) — la Evidencia B, y con ella el
+ * flip. Lo corre el OPERADOR después de aplicar el loop de siempre (BW →
+ * `LITELLM_OPENAI_API_KEY` del `.env` → recreate del stack 45-litellm): esto
+ * NO recablea el gateway — lo AUDITA. G2b es el estado final deliberado: el
+ * spike de 2026-08-18 midió que el hot-swap por API de LiteLLM sólo existe
+ * para modelos DB-managed (`STORE_MODEL_IN_DB`), y los nuestros son config
+ * GitOps — operador-en-el-loop no es half-measure cuando el mecanismo de
+ * config del gateway ES el `.env`.
+ *
+ * Dos evidencias, las dos frescas y en el mismo run:
+ *
+ *   A. una completion DIRECTA con la key del cliente → la organización que
+ *      factura esa cuenta (no se confía en la evidencia guardada por G1: entre
+ *      aquel click y este confirm pudieron pasar días y otra key);
+ *   B. una completion POR EL GATEWAY (virtual key del personalize) → la
+ *      organización que factura el upstream del gateway.
+ *
+ * B == A ⇒ el gateway factura al cliente ⇒ `owned`. Cualquier otra cosa deja
+ * el estado donde estaba, con la causa en `status_detail` — nunca a mitad de
+ * camino.
+ *
+ * 🪤 Cooldown: si el operador recreó con una key mala, la Evidencia B da 401 y
+ * LiteLLM pone ese deployment en cooldown (~60 s, medido en el spike) — los
+ * consumidores del alias lo sufren también. Por eso la Evidencia A corre ANTES:
+ * una key que no completó A jamás llega a golpear el gateway.
+ */
+export async function confirmOpenAiCutover(
+  deps: CredentialDeps,
+  opts: { changedBy: string | null },
+  providerId = 'openai',
+): Promise<ConfirmResult> {
+  if (providerId !== 'openai') {
+    return {
+      ok: false,
+      code: 'confirm_unsupported',
+      message:
+        `'${providerId}' no tiene confirm: este paso existe para proveedores cuyo consumidor ` +
+        'runtime es otro proceso (hoy: el gateway de IA, OpenAI)',
+    };
+  }
+  const row = await readProvider(deps, providerId);
+  if (!row) {
+    return { ok: false, code: 'unknown_provider', message: `proveedor '${providerId}' desconocido` };
+  }
+  if (!row.ownership_flippable) {
+    return {
+      ok: false,
+      code: 'not_flippable',
+      message: `${row.name} no admite cambio de titularidad (ownership_flippable=false)`,
+    };
+  }
+  if (row.ownership === 'owned') {
+    return {
+      ok: false,
+      code: 'already_owned',
+      message: `${row.name} ya está en 'owned': no hay cambio que completar`,
+    };
+  }
+
+  const loaded = await loadProviderCredential(deps, providerId);
+  if (!loaded.ok) {
+    const code = loaded.code === 'absent' ? 'no_credential' : loaded.code;
+    return { ok: false, code, message: loaded.message };
+  }
+
+  // ── Evidencia A, fresca ───────────────────────────────────────────────────
+  const direct = await realOpenAiCompletion(loaded.credential);
+  if (!direct.ok) {
+    const detail = rejectedDetail(row, direct.error_code, direct.error_message);
+    await writeState(deps, providerId, {
+      ownership: row.ownership,
+      status: 'failed',
+      statusDetail: detail,
+      changedFrom: row.ownership,
+      changedBy: opts.changedBy,
+      notes: 'confirm abortado: la key del cliente falló la prueba de uso directa (G2)',
+    });
+    deps.logger.warn(
+      { provider_id: providerId, error_code: direct.error_code, http_status: direct.http_status },
+      'confirm OpenAI: la key del cliente falló la completion directa — sin tocar el gateway',
+    );
+    return { ok: false, code: 'credential_rejected', message: detail };
+  }
+  if (!direct.organization) {
+    // Sin la identidad de la cuenta no hay comparación posible, y flipear sin
+    // comparar es exactamente lo que este gate existe para impedir.
+    return {
+      ok: false,
+      code: 'org_evidence_missing',
+      message:
+        'la completion directa no trajo el header `openai-organization`: sin la identidad de la ' +
+        'cuenta del cliente no hay contra qué comparar el gateway',
+    };
+  }
+
+  // ── Evidencia B: el gateway, por la puerta de siempre ─────────────────────
+  const viaGateway = await gatewayOpenAiCompletion();
+  if (!viaGateway.ok) {
+    if (viaGateway.error_code === 'no_gateway') {
+      return { ok: false, code: 'no_gateway', message: viaGateway.error_message };
+    }
+    // Error transitorio o de infra: NO se escribe estado — el cliente no hizo
+    // nada mal y su card no tiene por qué enterarse de un smoke fallido nuestro.
+    deps.logger.warn(
+      {
+        provider_id: providerId,
+        error_code: viaGateway.error_code,
+        http_status: viaGateway.http_status,
+      },
+      'confirm OpenAI: la completion por el gateway falló — el estado queda como estaba',
+    );
+    return {
+      ok: false,
+      code: 'gateway_smoke_failed',
+      message:
+        `la prueba por el gateway falló (${viaGateway.error_code}: ${viaGateway.error_message}). ` +
+        'Si el recreate fue reciente, puede ser el cooldown del deployment (~60 s) — reintentá',
+    };
+  }
+  if (!viaGateway.api_base || !viaGateway.api_base.includes('api.openai.com')) {
+    // Hallazgo G0: un alias puede rutear a OTRO proveedor (gpt-chico → DeepSeek
+    // en el lab). Comparar organizaciones de dos proveedores distintos no
+    // prueba nada — se corta con la causa y el fix nombrado.
+    return {
+      ok: false,
+      code: 'smoke_not_openai_upstream',
+      message:
+        `el alias de prueba '${viaGateway.model}' rutea a ${viaGateway.api_base ?? 'un upstream desconocido'}, ` +
+        'no a api.openai.com: apuntá OPENAI_CUTOVER_TEST_MODEL a un alias cuyo upstream sea OpenAI',
+    };
+  }
+  if (!viaGateway.organization) {
+    return {
+      ok: false,
+      code: 'org_evidence_missing',
+      message:
+        'el gateway no reenvió `llm_provider-openai-organization`: sin la identidad de la cuenta ' +
+        'que facturó no hay evidencia B — verificá la versión de LiteLLM (G0.a la midió en 1.90.2)',
+    };
+  }
+
+  // ── El veredicto ──────────────────────────────────────────────────────────
+  if (viaGateway.organization !== direct.organization) {
+    const detail =
+      'Tu key está verificada, pero el gateway de IA todavía factura a otra organización ' +
+      `('${viaGateway.organization}', no '${direct.organization}'): el equipo aún no aplicó ` +
+      'el cambio de cuenta. Todo sigue funcionando con la cuenta administrada.';
+    await writeState(deps, providerId, {
+      ownership: row.ownership,
+      status: 'pending_verification',
+      statusDetail: detail,
+      changedFrom: row.ownership,
+      changedBy: opts.changedBy,
+      notes:
+        `confirm G2 sin flip: gateway factura a '${viaGateway.organization}' ≠ cliente ` +
+        `'${direct.organization}' (directa ${direct.response_id} · gateway ${viaGateway.response_id})`,
+    });
+    deps.logger.warn(
+      {
+        provider_id: providerId,
+        gateway_org: viaGateway.organization,
+        client_org: direct.organization,
+      },
+      'confirm OpenAI: el gateway sigue facturando a otra organización — sin flip',
+    );
+    return {
+      ok: false,
+      code: 'gateway_not_swapped',
+      message: detail,
+    };
+  }
+
+  // ── El flip, con las dos evidencias ───────────────────────────────────────
+  await writeState(deps, providerId, {
+    ownership: 'owned',
+    status: 'ok',
+    statusDetail: null,
+    changedFrom: row.ownership,
+    changedBy: opts.changedBy,
+    notes:
+      `flip BYOK OpenAI (G2): el gateway factura a la organización del cliente ` +
+      `'${direct.organization}' (directa ${direct.response_id} · gateway ${viaGateway.response_id} · ` +
+      `modelo ${viaGateway.model})`,
+  });
+  invalidateProviderCache('openai');
+
+  deps.logger.info(
+    {
+      provider_id: providerId,
+      organization: direct.organization,
+      direct_id: direct.response_id,
+      gateway_id: viaGateway.response_id,
+      by: opts.changedBy,
+    },
+    'confirm OpenAI completado: el gateway factura al cliente — owned',
+  );
+
+  return {
+    ok: true,
+    ownership: 'owned',
+    organization: direct.organization,
+    evidence: {
+      direct_id: direct.response_id,
+      gateway_id: viaGateway.response_id,
+      model: viaGateway.model,
     },
   };
 }

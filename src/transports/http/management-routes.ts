@@ -14,6 +14,7 @@
  *   DELETE /management/providers/:id/credential    → core deleteProviderCredential()
  *   POST   /management/providers/:id/credential/check → core checkProviderCredential()
  *   POST   /management/providers/:id/cutover       → core cutoverProviderToOwned()
+ *   POST   /management/providers/:id/cutover/confirm → core confirmOpenAiCutover()
  *   POST   /management/providers/:id/revert        → core revertProviderToManaged()
  *
  * Transport rule (§3.4): zero business logic here — request shape → core
@@ -39,8 +40,10 @@ import {
 } from '../../core/provider-credentials.js';
 import {
   checkProviderCredential,
+  confirmOpenAiCutover,
   cutoverProviderToOwned,
   revertProviderToManaged,
+  type ConfirmFailureCode,
 } from '../../core/provider-cutover.js';
 import { listResendDomains, type DomainsDeps } from '../../core/provider-domains.js';
 
@@ -91,6 +94,10 @@ const CutoverBodySchema = z.object({
 const RevertBodySchema = z.object({
   changed_by: z.string().max(200).optional(),
   reason: z.string().max(500).optional(),
+});
+
+const ConfirmBodySchema = z.object({
+  changed_by: z.string().max(200).optional(),
 });
 
 const CreateTemplateBodySchema = z.object({
@@ -253,6 +260,31 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
     return reply.code(200).send(result);
   });
 
+  // G2 (byok §7.12): la Evidencia B y el flip. Lo dispara el OPERADOR después
+  // del loop BW → `.env` → recreate del gateway — la ruta no recablea nada:
+  // audita que el gateway YA facture al cliente, y recién entonces flipea.
+  app.post<{ Params: { id: string } }>(
+    '/management/providers/:id/cutover/confirm',
+    async (request, reply) => {
+      if (!deps.credentials) {
+        return reply.code(503).send({ error: 'credential_store_disabled' });
+      }
+      const parsed = ConfirmBodySchema.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_body', issues: parsed.error.issues.map((i) => i.message) });
+      }
+      const result = await confirmOpenAiCutover(
+        deps.credentials,
+        { changedBy: parsed.data.changed_by ?? null },
+        request.params.id,
+      );
+      if (!result.ok) {
+        return reply.code(confirmStatus(result.code)).send({ error: result.code, message: result.message });
+      }
+      return reply.code(200).send(result);
+    },
+  );
+
   app.post<{ Params: { id: string } }>('/management/providers/:id/revert', async (request, reply) => {
     if (!deps.credentials) {
       return reply.code(503).send({ error: 'credential_store_disabled' });
@@ -280,6 +312,29 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
  * proveedor no flipea), `422` es «el proveedor rechazó lo que trajiste» y
  * `503` es «este cliente no tiene el piso 1 cableado», que es nuestro.
  */
+/**
+ * Mapeo del `confirm` (G2), con el mismo criterio de «de quién es el problema»:
+ * 409 = falta un paso (del operador: el recreate del gateway; o del cliente: la
+ * credencial) · 422 = una evidencia salió mal · 503 = el piso 1 o el gateway no
+ * están cableados en este cliente, que es nuestro.
+ */
+function confirmStatus(code: ConfirmFailureCode): number {
+  if (code === 'unknown_provider') return 404;
+  if (code === 'no_master_key' || code === 'no_gateway') return 503;
+  if (
+    code === 'not_flippable' ||
+    code === 'confirm_unsupported' ||
+    code === 'already_owned' ||
+    code === 'no_credential' ||
+    // El gateway sigue facturando a otra organización: falta el paso del
+    // operador (el loop BW → .env → recreate), no falló ninguna evidencia.
+    code === 'gateway_not_swapped'
+  ) {
+    return 409;
+  }
+  return 422;
+}
+
 function cutoverStatus(code: string): number {
   if (code === 'unknown_provider') return 404;
   if (code === 'no_master_key') return 503;
