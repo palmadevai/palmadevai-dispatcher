@@ -158,6 +158,85 @@ export async function resolveDefaultFrom(): Promise<string | null> {
 }
 
 /**
+ * Config del canal WhatsApp (dispatcher#feat-channel-whatsapp-config).
+ *
+ * `META_WA_WABA_ID` / `META_WA_DEFAULT_PHONE_NUMBER_ID` son configuración NO
+ * SECRETA del cliente (criterio del handbook: «¿hay que rotarlo si se
+ * filtra? No → config, no BW/env»). Hoy sólo salen del `.env`; pasan a poder
+ * vivir en `bot.config['channel_whatsapp']` (jsonb `{waba_id,
+ * default_phone_number_id}`), que el cockpit va a editar sin redeploy.
+ *
+ * MISMO patrón que `readProviderRow`/`resolveDefaultFrom`: cache in-process
+ * TTL 30 s, `pool.connect` dentro del try, error de DB → fallback a env sin
+ * tirar.
+ *
+ * FALLBACK POR CAMPO, no por objeto: si la DB trae `waba_id` pero no
+ * `default_phone_number_id` (o viceversa), el campo faltante cae a SU PROPIA
+ * env — no se descarta la fila entera. Es el mismo espíritu del piso 1
+ * (T5.6): una fila parcial en el modelo no puede ser peor que no tener fila.
+ */
+export interface ChannelWhatsAppConfig {
+  wabaId: string | null;
+  defaultPhoneNumberId: string | null;
+  /** 'db' si ALGÚN campo resolvió por DB; si no, 'env' si alguno resolvió por env; si no, 'none'. */
+  source: 'db' | 'env' | 'none';
+}
+
+type ChannelWhatsAppRow = { waba_id: string | null; default_phone_number_id: string | null };
+let channelWhatsAppCache: { at: number; row: ChannelWhatsAppRow | null } | null = null;
+
+async function readChannelWhatsAppRow(): Promise<ChannelWhatsAppRow | null> {
+  if (channelWhatsAppCache && Date.now() - channelWhatsAppCache.at < TTL_MS) {
+    return channelWhatsAppCache.row;
+  }
+
+  let row: ChannelWhatsAppRow | null = null;
+  try {
+    const rows = await sql<ChannelWhatsAppRow[]>`
+      SELECT value->>'waba_id' AS waba_id,
+             value->>'default_phone_number_id' AS default_phone_number_id
+        FROM bot.config WHERE key = 'channel_whatsapp'
+    `;
+    row = rows[0] ?? null;
+  } catch (err) {
+    // Igual que readProviderRow: sin modelo (o DB caída) no es un error del
+    // llamador — se cae al env, que es el estado previo a esta feature.
+    logger.debug({ err }, 'providers: sin channel_whatsapp en DB, uso el env');
+    row = null;
+  }
+  channelWhatsAppCache = { at: Date.now(), row };
+  return row;
+}
+
+/** `''` de la DB o del env cuenta como AUSENTE — nunca como valor. */
+function nonEmpty(v: string | null | undefined): string | null {
+  return typeof v === 'string' && v.trim() ? v.trim() : null;
+}
+
+export async function readChannelWhatsAppConfig(): Promise<ChannelWhatsAppConfig> {
+  const row = await readChannelWhatsAppRow();
+
+  const dbWaba = nonEmpty(row?.waba_id);
+  const dbPhone = nonEmpty(row?.default_phone_number_id);
+  const envWaba = nonEmpty(env.META_WA_WABA_ID);
+  const envPhone = nonEmpty(env.META_WA_DEFAULT_PHONE_NUMBER_ID);
+
+  const wabaId = dbWaba ?? envWaba;
+  const defaultPhoneNumberId = dbPhone ?? envPhone;
+
+  const anyDb = dbWaba !== null || dbPhone !== null;
+  const anyEnv = envWaba !== null || envPhone !== null;
+  const source: ChannelWhatsAppConfig['source'] = anyDb ? 'db' : anyEnv ? 'env' : 'none';
+
+  return { wabaId, defaultPhoneNumberId, source };
+}
+
+/** Invalida el cache de config del canal WhatsApp — mismo motivo que T7.4. */
+export function invalidateChannelWhatsAppCache(): void {
+  channelWhatsAppCache = null;
+}
+
+/**
  * Invalida el cache de un proveedor (o de todos) — T7.4.
  *
  * El TTL de 30 s ya haría que un cutover se tome solo, y por eso esto **no es
@@ -179,4 +258,5 @@ export function invalidateProviderCache(id?: ProviderId): void {
 export function __resetProviderCache(): void {
   keyCache.clear();
   mailCache = null;
+  channelWhatsAppCache = null;
 }

@@ -8,6 +8,21 @@ import type { SqlClient } from '../../lib/postgres.js';
 import type { Logger } from '../../lib/logger.js';
 import type { GraphManagement } from '../../providers/whatsapp-management.js';
 import type { ProviderSendResult } from '../../providers/types.js';
+
+// `resolveWabaId()` en management.ts llama a `readChannelWhatsAppConfig()`
+// (DB real vía lib/postgres.js) — se mockea acá, no la DB, mismo criterio que
+// provider-cutover.test.ts para `resolveDefaultFrom`. Default: 'waba-global'
+// por 'env' — preserva el comportamiento previo de los tests de abajo, que
+// asumían un `deps.wabaId` fijo.
+vi.mock('../../lib/providers.js', () => ({
+  readChannelWhatsAppConfig: vi.fn(async () => ({
+    wabaId: 'waba-global',
+    defaultPhoneNumberId: null,
+    source: 'env' as const,
+  })),
+}));
+
+import { readChannelWhatsAppConfig } from '../../lib/providers.js';
 import {
   extractBodyVariables,
   validateCreateTemplateInput,
@@ -68,7 +83,6 @@ function makeDeps(overrides: {
       sql,
       logger: makeFakeLogger(),
       graph,
-      wabaId: 'waba-global',
       cockpitUrl: 'https://cockpit.example.com',
       sendEmail: sendEmail as unknown as ManagementDeps['sendEmail'],
     },
@@ -316,5 +330,38 @@ describe('deleteWaTemplate', () => {
     const { deps } = makeDeps({ sqlResponses: [[]] });
     const r = await deleteWaTemplate(deps, 'nope');
     expect(r).toEqual({ ok: true, deleted: false });
+  });
+});
+
+describe('WABA sin configurar (ni DB ni env) — el error nombra las dos fuentes', () => {
+  it('syncTemplates falla nombrando bot.config y la env', async () => {
+    vi.mocked(readChannelWhatsAppConfig).mockResolvedValueOnce({
+      wabaId: null,
+      defaultPhoneNumberId: null,
+      source: 'none',
+    });
+    const { deps } = makeDeps({});
+    const r = await syncTemplates(deps);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain("bot.config['channel_whatsapp'].waba_id");
+    expect(r.message).toContain('META_WA_WABA_ID');
+  });
+
+  it('createWaTemplate falla sin pegarle a Meta', async () => {
+    vi.mocked(readChannelWhatsAppConfig).mockResolvedValueOnce({
+      wabaId: null,
+      defaultPhoneNumberId: null,
+      source: 'none',
+    });
+    const { deps } = makeDeps({});
+    const r = await createWaTemplate(deps, {
+      name: 'promo_agosto',
+      language: 'es',
+      category: 'marketing',
+      body_text: 'Hola sin variables',
+    });
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('META_WA_WABA_ID');
+    expect(deps.graph.createTemplate).not.toHaveBeenCalled();
   });
 });

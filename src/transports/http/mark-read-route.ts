@@ -27,8 +27,12 @@ export interface MarkReadRouteDeps {
   logger: Logger;
   /** `env.DISPATCHER_SEND_BEARER` — el mismo de `/send`, sin env nueva. */
   sendBearer: string | undefined;
-  /** `env.META_WA_DEFAULT_PHONE_NUMBER_ID`. Undefined → 502 con la causa. */
-  defaultWaPhoneNumberId: string | undefined;
+  /**
+   * DB `bot.config['channel_whatsapp'].default_phone_number_id` → env
+   * `META_WA_DEFAULT_PHONE_NUMBER_ID` (mismo resolver que `/send`). `null` →
+   * 502 con las DOS fuentes nombradas.
+   */
+  resolveDefaultPhoneNumberId: () => Promise<string | null>;
 }
 
 export function registerMarkReadRoute(app: FastifyInstance, deps: MarkReadRouteDeps): void {
@@ -49,12 +53,14 @@ export function registerMarkReadRoute(app: FastifyInstance, deps: MarkReadRouteD
     // El número por el que entró el mensaje. Explícito gana (multi-WABA); si no,
     // el default del cliente. Su ausencia es 502 CON LA CAUSA NOMBRADA y no un
     // 500 mudo — es el mismo criterio que /send.
-    const phoneNumberId = parsed.data.phone_number_id ?? deps.defaultWaPhoneNumberId;
+    const phoneNumberId = parsed.data.phone_number_id ?? (await deps.resolveDefaultPhoneNumberId());
     if (!phoneNumberId) {
       return reply.code(502).send({
         status: 'failed',
         error_code: 'missing_phone_number_id',
-        error_message: 'META_WA_DEFAULT_PHONE_NUMBER_ID is not configured',
+        error_message:
+          "falta bot.config['channel_whatsapp'].default_phone_number_id y la env " +
+          'META_WA_DEFAULT_PHONE_NUMBER_ID',
       });
     }
 

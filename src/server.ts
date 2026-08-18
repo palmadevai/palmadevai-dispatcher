@@ -35,6 +35,7 @@ import { registerManagementRoutes } from './transports/http/management-routes.js
 import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
 import { normalizeAllowlist } from './lib/phone.js';
+import { readChannelWhatsAppConfig } from './lib/providers.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
@@ -130,6 +131,15 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     }
   }
 
+  // Resolver inyectado (no un valor estático baked al boot): DB
+  // `bot.config['channel_whatsapp'].default_phone_number_id` → env
+  // `META_WA_DEFAULT_PHONE_NUMBER_ID`, cacheado 30 s en `lib/providers.ts`.
+  // Compartido por /send, /mark-read y las tools MCP de envío — el cockpit
+  // puede cargar el teléfono default sin redeploy y los tres lo ven en el
+  // próximo tick del cache.
+  const resolveDefaultPhoneNumberId = async (): Promise<string | null> =>
+    (await readChannelWhatsAppConfig()).defaultPhoneNumberId;
+
   // ── /send (Messaging Service H2.1) ──────────────────────────────────────
   registerSendRoute(app, {
     sql,
@@ -138,7 +148,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     metricsCollector,
     sendBearer: env.DISPATCHER_SEND_BEARER,
     staffAllowlist: staffAllowlistRaw,
-    defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
+    resolveDefaultPhoneNumberId,
     defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
   });
 
@@ -146,7 +156,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
   registerMarkReadRoute(app, {
     logger,
     sendBearer: env.DISPATCHER_SEND_BEARER,
-    defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
+    resolveDefaultPhoneNumberId,
   });
 
   // ── /management/* (Messaging Service F3) ────────────────────────────────
@@ -171,7 +181,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
         logger,
         metrics: metricsCollector,
         staffAllowlist: staffAllowlistRaw,
-        defaultWaPhoneNumberId: env.META_WA_DEFAULT_PHONE_NUMBER_ID,
+        resolveDefaultPhoneNumberId,
         defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
       },
     },

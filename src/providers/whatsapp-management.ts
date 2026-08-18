@@ -22,7 +22,7 @@
  */
 import { request } from 'undici';
 import { env } from '../env.js';
-import { resolveProviderKey } from '../lib/providers.js';
+import { resolveProviderKey, readChannelWhatsAppConfig } from '../lib/providers.js';
 import type { CredentialCheck } from './types.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -116,23 +116,26 @@ async function graphRequest(
  * modo de falla del token compartido que la rotación viene a separar.
  */
 export async function verifyMetaCredential(bearer: string): Promise<CredentialCheck> {
-  // Guarda EN EL CANAL de `META_WA_WABA_ID` (ver el bloque en env.ts): sin WABA
-  // id no hay contra qué verificar. Se contesta con la causa NOMBRADA en vez de
-  // pegarle a la Graph API con un id vacío, que devolvería un 400 genérico y
-  // haría parecer que el token está mal cuando lo que falta es la config.
-  if (!env.META_WA_WABA_ID) {
+  // Guarda EN EL CANAL (dispatcher#66): sin WABA no hay contra qué verificar.
+  // La WABA se resuelve DB (`bot.config['channel_whatsapp'].waba_id`) → env
+  // (`META_WA_WABA_ID`) — mismo resolver que usa `core/management.ts`. Se
+  // contesta con la causa NOMBRANDO LAS DOS fuentes en vez de pegarle a la
+  // Graph API con un id vacío, que devolvería un 400 genérico y haría parecer
+  // que el token está mal cuando lo que falta es la config.
+  const { wabaId } = await readChannelWhatsAppConfig();
+  if (!wabaId) {
     return {
       ok: false,
       error_code: 'waba_id_missing',
       error_message:
-        'META_WA_WABA_ID no está configurada: el canal WhatsApp de este cliente todavía no está cableado. ' +
-        'No es un problema del token.',
+        "No hay WABA configurada: falta bot.config['channel_whatsapp'].waba_id y la env META_WA_WABA_ID. " +
+        'El canal WhatsApp de este cliente todavía no está cableado. No es un problema del token.',
       http_status: 400,
     };
   }
   let res;
   try {
-    res = await request(graphUrl(`${encodeURIComponent(env.META_WA_WABA_ID)}?fields=id,name`), {
+    res = await request(graphUrl(`${encodeURIComponent(wabaId)}?fields=id,name`), {
       method: 'GET',
       headers: { authorization: `Bearer ${bearer}` },
       headersTimeout: REQUEST_TIMEOUT_MS,

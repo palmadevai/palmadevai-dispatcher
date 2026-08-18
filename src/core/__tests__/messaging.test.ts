@@ -93,7 +93,7 @@ function makeDeps(overrides: Partial<SendDeps> = {}): SendDeps {
     redis: makeFakeRedis(),
     logger: makeFakeLogger(),
     staffAllowlist: ['+5491111111111'],
-    defaultWaPhoneNumberId: '1234567890',
+    resolveDefaultPhoneNumberId: async () => '1234567890',
     defaultFromEmail: 'ops@example.com',
     ...overrides,
   };
@@ -771,7 +771,7 @@ describe('sendMessage — provider failures', () => {
 
 describe('sendMessage — missing configuration', () => {
   it('fails with missing_phone_number_id when whatsapp has no default phone number id configured', async () => {
-    const deps = makeDeps({ defaultWaPhoneNumberId: undefined });
+    const deps = makeDeps({ resolveDefaultPhoneNumberId: async () => null });
     const msg = makeMsg({ context: { feature: 'f', client_ref: 'ref-nophone' } });
 
     const result = await sendMessage(deps, msg);
@@ -779,7 +779,9 @@ describe('sendMessage — missing configuration', () => {
     expect(result).toEqual({
       status: 'failed',
       error_code: 'missing_phone_number_id',
-      error_message: 'META_WA_DEFAULT_PHONE_NUMBER_ID is not configured',
+      error_message:
+        "falta bot.config['channel_whatsapp'].default_phone_number_id y la env " +
+        'META_WA_DEFAULT_PHONE_NUMBER_ID',
     });
     expect(mockSend).not.toHaveBeenCalled();
   });

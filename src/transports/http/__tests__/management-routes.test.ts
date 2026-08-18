@@ -11,6 +11,18 @@ import type { GraphManagement } from '../../../providers/whatsapp-management.js'
 import type { ManagementDeps } from '../../../core/management.js';
 import { registerManagementRoutes } from '../management-routes.js';
 
+// La WABA ya no viaja fija en `ManagementDeps` (dispatcher feat-channel-whatsapp-config):
+// `core/management.ts` la resuelve por llamada vía `readChannelWhatsAppConfig()`.
+// Mismo criterio que `core/__tests__/management.test.ts`: mockeamos el resolver,
+// no la DB.
+vi.mock('../../../lib/providers.js', () => ({
+  readChannelWhatsAppConfig: vi.fn(async () => ({
+    wabaId: 'waba-global',
+    defaultPhoneNumberId: null,
+    source: 'env' as const,
+  })),
+}));
+
 function makeFakeSql(responses: unknown[][] = []): SqlClient {
   let i = 0;
   const fn = ((_s: TemplateStringsArray, ..._v: unknown[]) => {
@@ -41,7 +53,6 @@ function makeCore(overrides: {
     sql: makeFakeSql(overrides.sqlResponses ?? []),
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger,
     graph,
-    wabaId: 'waba-global',
     sendEmail: vi.fn(async () => ({ ok: true as const, message_id: 'x', http_status: 200 })),
   };
 }

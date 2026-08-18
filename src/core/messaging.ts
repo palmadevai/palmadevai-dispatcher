@@ -48,8 +48,14 @@ export interface SendDeps {
   metrics?: { recordSend(latencyMs: number): void };
   /** `env.STAFF_NOTIFY_ALLOWLIST` parseado (CSV → array trimmeado). */
   staffAllowlist: string[];
-  /** `env.META_WA_DEFAULT_PHONE_NUMBER_ID`. Undefined → whatsapp falla. */
-  defaultWaPhoneNumberId: string | undefined;
+  /**
+   * Resolver inyectado (§3.4: el core no toca DB) — DB
+   * `bot.config['channel_whatsapp'].default_phone_number_id` → env
+   * `META_WA_DEFAULT_PHONE_NUMBER_ID`, mismo patrón `deps.resolveKey ??
+   * resolveProviderKey` de `provider-domains.ts`. `null` → whatsapp falla con
+   * la causa nombrando LAS DOS fuentes.
+   */
+  resolveDefaultPhoneNumberId: () => Promise<string | null>;
   /** `env.CAMPAIGNS_DEFAULT_FROM_EMAIL` — reusado, sin env nueva para /send. */
   /** Fallback de transición (T5.6). La fuente real es bot.config[branding].email_from. */
   defaultFromEmail: string | undefined;
@@ -501,17 +507,20 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   // ── 7. Envío por el ChannelProvider ───────────────────────────────────────
   let sendInput: WhatsAppSendInput | EmailSendInput;
   if (msg.channel === 'whatsapp') {
-    if (!deps.defaultWaPhoneNumberId) {
+    const defaultWaPhoneNumberId = await deps.resolveDefaultPhoneNumberId();
+    if (!defaultWaPhoneNumberId) {
       return {
         status: 'failed',
         error_code: 'missing_phone_number_id',
-        error_message: 'META_WA_DEFAULT_PHONE_NUMBER_ID is not configured',
+        error_message:
+          "falta bot.config['channel_whatsapp'].default_phone_number_id y la env " +
+          'META_WA_DEFAULT_PHONE_NUMBER_ID',
       };
     }
     sendInput =
       msg.content.type === 'text'
         ? {
-            phone_number_id: deps.defaultWaPhoneNumberId,
+            phone_number_id: defaultWaPhoneNumberId,
             to: msg.to,
             biz_opaque_callback_data: client_ref,
             type: 'text',
@@ -525,7 +534,7 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
               throw new Error(`content.type=${msg.content.type} no es válido para whatsapp`);
             })()
           : {
-            phone_number_id: deps.defaultWaPhoneNumberId,
+            phone_number_id: defaultWaPhoneNumberId,
             to: msg.to,
             biz_opaque_callback_data: client_ref,
             type: 'template',

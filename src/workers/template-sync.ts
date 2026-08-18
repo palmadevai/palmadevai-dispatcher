@@ -37,16 +37,12 @@ export function startTemplateSync(
     logger.info('template-sync worker: interval 0 — disabled (on-demand sync only)');
     return { stop: () => undefined };
   }
-  // Guarda EN EL CANAL de `META_WA_WABA_ID` (ver el bloque en env.ts): sin WABA
-  // id no hay contra qué sincronizar plantillas. Se sale con el motivo dicho, en
-  // vez de tirar un error cada intervalo contra la Graph API con un id vacío.
-  if (!core.wabaId) {
-    logger.info(
-      'template-sync worker: sin META_WA_WABA_ID — deshabilitado (canal WhatsApp sin configurar). ' +
-        'El resto del dispatcher (campañas, email, management) sigue operativo.',
-    );
-    return { stop: () => undefined };
-  }
+  // Ya NO hay guarda estática al boot: la WABA se resuelve por llamada
+  // (DB `bot.config['channel_whatsapp']` → env `META_WA_WABA_ID`, ver
+  // `core/management.ts resolveWabaId`), así que el cockpit puede cablearla
+  // sin redeploy y el worker la ve en el próximo tick. Sin WABA configurada,
+  // `syncTemplates()` devuelve `ok:false` con el motivo — el worker lo loguea
+  // como cualquier otra falla y reintenta el intervalo siguiente.
 
   let running = false;
   const run = async (): Promise<void> => {
@@ -56,7 +52,10 @@ export function startTemplateSync(
     }
     running = true;
     try {
-      await syncTemplates(core);
+      const result = await syncTemplates(core);
+      if (!result.ok) {
+        logger.info({ message: result.message }, 'template-sync tick: sin WABA configurada — sin cambios');
+      }
     } catch (err) {
       logger.error(
         { err: err instanceof Error ? err.message : String(err) },

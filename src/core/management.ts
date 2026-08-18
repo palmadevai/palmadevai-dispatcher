@@ -20,18 +20,38 @@ import type { Logger } from '../lib/logger.js';
 import type { GraphManagement, GraphTemplate } from '../providers/whatsapp-management.js';
 import type { EmailSendInput } from '../providers/email.js';
 import type { ProviderSendResult } from '../providers/types.js';
+import { readChannelWhatsAppConfig } from '../lib/providers.js';
 
 export interface ManagementDeps {
   sql: SqlClient;
   logger: Logger;
   graph: GraphManagement;
-  /** `env.META_WA_WABA_ID` — global WABA (multi-WABA adds endpoint WABAs on sync). */
-  wabaId: string;
   /** `env.COCKPIT_URL` — link target in the auto-pause alert email. */
   cockpitUrl?: string;
   /** Resend adapter (`providers/email.ts sendEmail`) — alert is best-effort. */
   sendEmail: (input: EmailSendInput) => Promise<ProviderSendResult>;
 }
+
+/**
+ * WABA global (multi-WABA adds endpoint WABAs on sync) — antes venía baked
+ * como `deps.wabaId` desde `env.META_WA_WABA_ID` al boot; ahora se resuelve
+ * en CADA llamada vía `readChannelWhatsAppConfig()` (DB `bot.config`
+ * `channel_whatsapp.waba_id` → env `META_WA_WABA_ID`), porque el cockpit va
+ * a poder cambiarlo desde la DB sin redeploy — un valor baked al boot nunca
+ * lo vería.
+ *
+ * `null` cuando ninguna de las dos fuentes tiene el dato: el llamador decide
+ * (no hay Graph call posible sin WABA).
+ */
+async function resolveWabaId(): Promise<string | null> {
+  const cfg = await readChannelWhatsAppConfig();
+  return cfg.wabaId;
+}
+
+/** Mensaje único de "no hay WABA configurada" — nombra LAS DOS fuentes. */
+const WABA_NOT_CONFIGURED =
+  "No hay WABA configurada: falta bot.config['channel_whatsapp'].waba_id y la env META_WA_WABA_ID. " +
+  'El canal WhatsApp de este cliente todavía no está cableado.';
 
 // ─── Pure helpers (exported for unit tests) ─────────────────────────────────
 
@@ -175,7 +195,20 @@ interface TemplatePauseEvent {
 export async function syncTemplates(deps: ManagementDeps): Promise<SyncTemplatesResult> {
   const { sql, logger, graph } = deps;
 
-  const wabaIds = new Set<string>([deps.wabaId]);
+  const globalWabaId = await resolveWabaId();
+  if (!globalWabaId) {
+    return {
+      ok: false,
+      message: WABA_NOT_CONFIGURED,
+      inserted: 0,
+      updated: 0,
+      total_fetched: 0,
+      campaigns_paused: 0,
+      errors: [WABA_NOT_CONFIGURED],
+    };
+  }
+
+  const wabaIds = new Set<string>([globalWabaId]);
   try {
     const eps = await sql<Array<{ waba_id: string }>>`
       SELECT DISTINCT waba_id FROM bot.outbound_endpoints
@@ -416,7 +449,10 @@ export async function createWaTemplate(
   const validated = validateCreateTemplateInput(input);
   if (!validated.ok) return { ok: false, message: validated.message };
 
-  const created = await deps.graph.createTemplate(deps.wabaId, {
+  const wabaId = await resolveWabaId();
+  if (!wabaId) return { ok: false, message: WABA_NOT_CONFIGURED };
+
+  const created = await deps.graph.createTemplate(wabaId, {
     name: input.name,
     language: input.language,
     category: validated.category,
@@ -481,7 +517,8 @@ export async function deleteWaTemplate(
   const name = rows[0]?.name;
   if (!name) return { ok: true, deleted: false };
 
-  const wabaId = rows[0]?.waba_id || deps.wabaId;
+  const wabaId = rows[0]?.waba_id || (await resolveWabaId());
+  if (!wabaId) return { ok: false, error: WABA_NOT_CONFIGURED };
   let metaWarning: string | undefined;
   const del = await deps.graph.deleteTemplateByName(wabaId, name);
   if (!del.ok) {
@@ -517,7 +554,12 @@ export interface SyncEndpointsResult {
  * (channel='whatsapp'). No pisa overrides manuales (priority/daily_cap).
  */
 export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpointsResult> {
-  const fetched = await deps.graph.fetchPhoneNumbers(deps.wabaId);
+  const wabaId = await resolveWabaId();
+  if (!wabaId) {
+    return { ok: false, message: WABA_NOT_CONFIGURED, inserted: 0, updated: 0, errors: [] };
+  }
+
+  const fetched = await deps.graph.fetchPhoneNumbers(wabaId);
   if (!fetched.ok) {
     return { ok: false, message: `Meta API ${fetched.error}`, inserted: 0, updated: 0, errors: [] };
   }
@@ -533,7 +575,7 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
           (channel, endpoint_id, display_name, phone_number_id, display_phone,
            waba_id, quality_rating, status, priority, created_at, updated_at)
         VALUES ('whatsapp', ${p.id}, ${p.display_phone_number}, ${p.id}, ${p.display_phone_number},
-                ${deps.wabaId}, ${quality}, ${status}, 0, now(), now())
+                ${wabaId}, ${quality}, ${status}, 0, now(), now())
         ON CONFLICT (channel, endpoint_id) DO UPDATE
            SET display_name = EXCLUDED.display_name,
                display_phone = EXCLUDED.display_phone,
@@ -550,7 +592,7 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
   }
   return {
     ok: true,
-    message: `Sync WhatsApp OK: ${inserted} nuevos, ${updated} actualizados (${fetched.phones.length} números en WABA ${deps.wabaId}).`,
+    message: `Sync WhatsApp OK: ${inserted} nuevos, ${updated} actualizados (${fetched.phones.length} números en WABA ${wabaId}).`,
     inserted,
     updated,
     errors,

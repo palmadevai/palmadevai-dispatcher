@@ -33,11 +33,12 @@ async function build(deps: {
   defaultWaPhoneNumberId?: string | undefined;
 }): Promise<FastifyInstance> {
   const app = Fastify();
+  const resolvedPhone =
+    'defaultWaPhoneNumberId' in deps ? (deps.defaultWaPhoneNumberId ?? null) : '1234567890';
   registerMarkReadRoute(app, {
     logger: makeLogger(),
     sendBearer: 'sendBearer' in deps ? deps.sendBearer : 'secreto',
-    defaultWaPhoneNumberId:
-      'defaultWaPhoneNumberId' in deps ? deps.defaultWaPhoneNumberId : '1234567890',
+    resolveDefaultPhoneNumberId: async () => resolvedPhone,
   });
   await app.ready();
   return app;
@@ -129,7 +130,13 @@ describe('POST /mark-read', () => {
       payload: OK_BODY,
     });
     expect(res.statusCode).toBe(502);
-    expect(res.json().error_code).toBe('missing_phone_number_id');
+    const body = res.json();
+    expect(body.error_code).toBe('missing_phone_number_id');
+    // El mensaje nombra las DOS fuentes (seguimiento channel-whatsapp-config):
+    // DB `bot.config['channel_whatsapp'].default_phone_number_id` y env
+    // `META_WA_DEFAULT_PHONE_NUMBER_ID`.
+    expect(body.error_message).toContain("bot.config['channel_whatsapp'].default_phone_number_id");
+    expect(body.error_message).toContain('META_WA_DEFAULT_PHONE_NUMBER_ID');
     // Y no se intenta el request: sin número, la URL sería `/v24.0//messages`,
     // que es exactamente el bug que traía el nodo de n8n en palmawebs.
     expect(markReadWhatsApp).not.toHaveBeenCalled();
