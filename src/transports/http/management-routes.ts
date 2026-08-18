@@ -73,13 +73,18 @@ const CredentialBodySchema = z.object({
 /**
  * `verify_to` no tiene default, y es deliberado.
  *
- * El gate del cutover es que **alguien lea el mail** (T9.8.3). Un default —el
- * `admin_email` del branding, por ejemplo— haría que el cutover se "verifique"
- * contra una casilla que quizá nadie mira, que es la forma elegante de tener un
- * gate que no gatea. Quien aprieta el botón elige a dónde llega la prueba.
+ * El gate del cutover de RESEND es que **alguien lea el mail** (T9.8.3). Un
+ * default —el `admin_email` del branding, por ejemplo— haría que el cutover se
+ * "verifique" contra una casilla que quizá nadie mira, que es la forma elegante
+ * de tener un gate que no gatea. Quien aprieta el botón elige a dónde llega la
+ * prueba.
+ *
+ * Es OPTIONAL en el schema porque el gate de OpenAI (G1, byok §7.12) es una
+ * completion, no un mail — obligarlo acá inventaría una casilla para una prueba
+ * que no manda nada. El core lo exige para `resend` (`no_verify_to`).
  */
 const CutoverBodySchema = z.object({
-  verify_to: z.string().email('verify_to tiene que ser una dirección de mail'),
+  verify_to: z.string().email('verify_to tiene que ser una dirección de mail').optional(),
   changed_by: z.string().max(200).optional(),
 });
 
@@ -278,6 +283,9 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
 function cutoverStatus(code: string): number {
   if (code === 'unknown_provider') return 404;
   if (code === 'no_master_key') return 503;
+  // Falta un campo que ESTE proveedor requiere (verify_to en resend): es un
+  // request incompleto, no un conflicto de estado.
+  if (code === 'no_verify_to') return 400;
   if (
     code === 'not_flippable' ||
     code === 'no_credential' ||

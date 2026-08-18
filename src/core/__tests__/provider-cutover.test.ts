@@ -40,6 +40,12 @@ vi.mock('../../lib/ai-personalize.js', () => ({
   verifyOpenAiCredential: vi.fn(),
 }));
 
+// La prueba de USO real del BYOK OpenAI (G1): sale a api.openai.com — se
+// mockea, nunca se llama de verdad.
+vi.mock('../../providers/openai-byok.js', () => ({
+  realOpenAiCompletion: vi.fn(),
+}));
+
 // El resolver de remitente y el invalidador de cache: decisiones del core, no
 // del proveedor, pero tampoco son lo que este módulo prueba.
 vi.mock('../../lib/providers.js', () => ({
@@ -62,6 +68,7 @@ const { checkProviderCredential, cutoverProviderToOwned, revertProviderToManaged
 const { sendEmail, verifyEmailCredential } = await import('../../providers/email.js');
 const { verifyMetaCredential } = await import('../../providers/whatsapp-management.js');
 const { verifyOpenAiCredential } = await import('../../lib/ai-personalize.js');
+const { realOpenAiCompletion } = await import('../../providers/openai-byok.js');
 const { resolveDefaultFrom, invalidateProviderCache } = await import('../../lib/providers.js');
 
 const SECRET = 're_ClienteTraeLaSuya_9f2c';
@@ -175,6 +182,7 @@ beforeEach(() => {
   vi.mocked(verifyEmailCredential).mockReset();
   vi.mocked(verifyMetaCredential).mockReset();
   vi.mocked(verifyOpenAiCredential).mockReset();
+  vi.mocked(realOpenAiCompletion).mockReset();
   vi.mocked(resolveDefaultFrom).mockReset();
   vi.mocked(invalidateProviderCache).mockReset();
 });
@@ -597,26 +605,131 @@ describe('check per-proveedor (TD S5.1 → S1.1) — cada credencial contra SU p
     expect(verifyOpenAiCredential).not.toHaveBeenCalled();
   });
 
-  it('17. cutover de openai → cutover_unsupported: el gate de mail es de Resend, no se reusa', async () => {
-    const { sql, providerState, stateWrites } = fakeSql({
-      id: 'openai',
-      name: 'OpenAI',
-      ownership: 'managed',
-      ownership_flippable: true,
+  it('17. cutover de resend SIN verify_to → no_verify_to, sin escribir nada', async () => {
+    const { sql, providerState, stateWrites } = fakeSql();
+    await seedCredential(sql);
+
+    const r = await cutoverProviderToOwned(
+      { sql, logger, clientSlug: 'palmadevai' },
+      'resend',
+      { changedBy: 'carlos' },
+    );
+
+    expect(r).toMatchObject({ ok: false, code: 'no_verify_to' });
+    expect(providerState.ownership).toBe('managed');
+    expect(stateWrites).toHaveLength(0);
+    expect(sendEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('cutover OpenAI (G1, byok §7.12) — Evidencia A, sin flip', () => {
+  const OPENAI_SEED = {
+    id: 'openai',
+    name: 'OpenAI',
+    ownership: 'managed',
+    ownership_flippable: true,
+  };
+  const OPENAI_KEY = 'sk-proj-DelClienteDeVerdad_4u7q';
+
+  it('18. la key verificada con uso real deja pending_verification, NUNCA owned', async () => {
+    const { sql, providerState, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    vi.mocked(realOpenAiCompletion).mockImplementation(async () => {
+      callOrder.push('net:openai-completion');
+      return {
+        ok: true,
+        response_id: 'chatcmpl-abc123',
+        model: 'gpt-4o-mini',
+        organization: 'org-cliente-xyz',
+      };
     });
-    await seedCredential(sql, 'sk-proj-buena', 'openai');
 
     const r = await cutoverProviderToOwned(
       { sql, logger, clientSlug: 'palmadevai' },
       'openai',
-      { verifyTo: VERIFY_TO, changedBy: 'carlos' },
+      { changedBy: 'carlos' },
     );
 
-    expect(r).toMatchObject({ ok: false, code: 'cutover_unsupported' });
+    // El resultado es el estado honesto: verificada, pero el gateway sigue
+    // siendo nuestro — `owned` recién con la Evidencia B (G2).
+    expect(r).toMatchObject({
+      ok: true,
+      ownership: 'pending_verification',
+      evidence: {
+        response_id: 'chatcmpl-abc123',
+        model: 'gpt-4o-mini',
+        organization: 'org-cliente-xyz',
+      },
+    });
     expect(providerState.ownership).toBe('managed');
-    expect(stateWrites).toHaveLength(0);
+    expect(providerState.status).toBe('pending_verification');
+    // pending_verification se escribió ANTES de salir a la red (T7.1).
+    expect(callOrder.indexOf('state:pending_verification')).toBeLessThan(
+      callOrder.indexOf('net:openai-completion'),
+    );
+    // La evidencia queda en notes; el flip no invalida ningún cache porque no
+    // hubo flip.
+    const last = stateWrites[stateWrites.length - 1];
+    expect(String(last.notes)).toContain('chatcmpl-abc123');
+    expect(String(last.notes)).toContain('org-cliente-xyz');
+    expect(invalidateProviderCache).not.toHaveBeenCalled();
+    // El gate de mail no participa: es de Resend.
     expect(sendEmail).not.toHaveBeenCalled();
     expect(verifyEmailCredential).not.toHaveBeenCalled();
-    expect(verifyOpenAiCredential).not.toHaveBeenCalled();
+  });
+
+  it('19. la completion rechazada deja failed + credential_rejected, ownership intacto', async () => {
+    const { sql, providerState } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    vi.mocked(realOpenAiCompletion).mockResolvedValue({
+      ok: false,
+      error_code: 'insufficient_quota',
+      error_message: 'You exceeded your current quota',
+      http_status: 429,
+    });
+
+    const r = await cutoverProviderToOwned(
+      { sql, logger, clientSlug: 'palmadevai' },
+      'openai',
+      { changedBy: 'carlos' },
+    );
+
+    expect(r).toMatchObject({ ok: false, code: 'credential_rejected' });
+    expect(r.ok ? '' : r.message).toContain('insufficient_quota');
+    expect(providerState.ownership).toBe('managed');
+    expect(providerState.status).toBe('failed');
+    expect(invalidateProviderCache).not.toHaveBeenCalled();
+  });
+
+  it('20. el plaintext de la key no se filtra ni al log ni al estado', async () => {
+    const { sql, stateWrites } = fakeSql(OPENAI_SEED);
+    await seedCredential(sql, OPENAI_KEY, 'openai');
+    vi.mocked(realOpenAiCompletion).mockResolvedValue({
+      ok: true,
+      response_id: 'chatcmpl-x',
+      model: 'gpt-4o-mini',
+      organization: null,
+    });
+
+    await cutoverProviderToOwned({ sql, logger, clientSlug: 'palmadevai' }, 'openai', {
+      changedBy: 'carlos',
+    });
+
+    expect(JSON.stringify(logged)).not.toContain(OPENAI_KEY);
+    expect(JSON.stringify(stateWrites)).not.toContain(OPENAI_KEY);
+  });
+
+  it('21. sin credencial cargada → no_credential, sin llamar a OpenAI', async () => {
+    const { sql, stateWrites } = fakeSql(OPENAI_SEED);
+
+    const r = await cutoverProviderToOwned(
+      { sql, logger, clientSlug: 'palmadevai' },
+      'openai',
+      { changedBy: 'carlos' },
+    );
+
+    expect(r).toMatchObject({ ok: false, code: 'no_credential' });
+    expect(stateWrites).toHaveLength(0);
+    expect(realOpenAiCompletion).not.toHaveBeenCalled();
   });
 });

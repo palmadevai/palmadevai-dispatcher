@@ -34,17 +34,25 @@
  *
  *   managed ──(hay credencial + test OK)──▶ pending_verification
  *           ◀─────────(cualquier fallo)─── failed
- *   pending_verification ──(mail real OK)──▶ owned/ok
+ *   pending_verification ──(mail real OK)──▶ owned/ok          (resend)
+ *   pending_verification ──(Evidencia B, G2)──▶ owned/ok       (openai — G1 se queda acá)
  *   owned ─────────────(T7.5, sin código)──▶ managed
  *
  * `pending_verification` se escribe **antes** de salir a la red, no después: si
  * el proceso se muere en el medio, el estado que queda dice «alguien empezó un
  * cutover y no terminó», que es diagnosticable. El orden inverso deja silencio.
+ *
+ * OPENAI (G1, byok §7.12): su evidencia es una completion real —no un mail— y
+ * el flip NO se completa en este proceso: el consumidor runtime es el gateway
+ * LiteLLM (env de su container), así que `pending_verification` es un estado
+ * legítimo de DÍAS hasta que el gateway facture a la organización del cliente
+ * (Evidencia B, G2). Ver `cutoverOpenAiG1`.
  */
 import { loadProviderCredential, type CredentialDeps } from './provider-credentials.js';
 import { sendEmail, verifyEmailCredential } from '../providers/email.js';
 import { verifyMetaCredential } from '../providers/whatsapp-management.js';
 import { verifyOpenAiCredential } from '../lib/ai-personalize.js';
+import { realOpenAiCompletion } from '../providers/openai-byok.js';
 import type { CredentialCheck } from '../providers/types.js';
 import { invalidateProviderCache, resolveDefaultFrom, type ProviderId } from '../lib/providers.js';
 
@@ -88,17 +96,32 @@ export type CutoverFailureCode =
   | 'undecryptable'
   | 'credential_rejected'
   | 'no_sender'
+  | 'no_verify_to'
   | 'send_failed';
 
 export type CutoverResult =
   | { ok: true; ownership: 'owned'; message_id: string; verified_to: string }
+  /**
+   * El resultado del cutover de OpenAI en G1 (byok §7.12): la key del cliente
+   * quedó VERIFICADA con un uso real, pero el flip a `owned` no se marca —
+   * el gateway sigue con nuestra cuenta hasta la Evidencia B (G2). No es un
+   * fallo: es el estado honesto, y dura días.
+   */
+  | {
+      ok: true;
+      ownership: 'pending_verification';
+      evidence: { response_id: string; model: string; organization: string | null };
+    }
   | { ok: false; code: Exclude<CutoverFailureCode, 'check_unsupported'>; message: string };
 
 export type CheckResult =
   | { ok: true; detail: string }
   | {
       ok: false;
-      code: Exclude<CutoverFailureCode, 'no_sender' | 'send_failed' | 'cutover_unsupported'>;
+      code: Exclude<
+        CutoverFailureCode,
+        'no_sender' | 'no_verify_to' | 'send_failed' | 'cutover_unsupported'
+      >;
       message: string;
     };
 
@@ -278,7 +301,7 @@ export async function checkProviderCredential(
 export async function cutoverProviderToOwned(
   deps: CredentialDeps,
   providerId: string,
-  opts: { verifyTo: string; changedBy: string | null },
+  opts: { verifyTo?: string; changedBy: string | null },
 ): Promise<CutoverResult> {
   const row = await readProvider(deps, providerId);
   if (!row) {
@@ -294,19 +317,36 @@ export async function cutoverProviderToOwned(
     };
   }
 
-  // El gate del cutover ES un envío real de correo (T9.8.3): sólo existe para
-  // el proveedor de email. Extender el flip a otro proveedor exige construirle
-  // su propia evidencia —un uso real con la credencial nueva—, no reusar ésta:
-  // un «cutover» de OpenAI verificado con un mail de Resend no prueba nada.
+  // Cada proveedor con flip tiene SU evidencia (un «cutover» de OpenAI
+  // verificado con un mail de Resend no prueba nada): Resend = un mail real
+  // (T9.8.3); OpenAI = una completion real, y en G1 el flip queda a mitad de
+  // camino A PROPÓSITO (byok §7.12 — la Evidencia B llega con G2).
+  if (providerId === 'openai') {
+    return cutoverOpenAiG1(deps, row, opts.changedBy);
+  }
   if (providerId !== 'resend') {
     return {
       ok: false,
       code: 'cutover_unsupported',
       message:
         `el cambio de titularidad de ${row.name} todavía no tiene su prueba real cableada: ` +
-        'hoy sólo Resend completa el flip (el gate es un mail de verificación)',
+        'hoy Resend completa el flip (mail de verificación) y OpenAI verifica la key (G1)',
     };
   }
+
+  // `verify_to` es del gate de Resend: el mail que ALGUIEN tiene que leer. Se
+  // valida acá y no en el schema del transporte porque OpenAI no lo usa — un
+  // required global obligaría a inventar una casilla para una prueba que no
+  // manda mails.
+  if (!opts.verifyTo) {
+    return {
+      ok: false,
+      code: 'no_verify_to',
+      message:
+        'el cutover de Resend necesita `verify_to`: su gate es un mail real que alguien lee',
+    };
+  }
+  const verifyTo = opts.verifyTo;
 
   const loaded = await loadProviderCredential(deps, providerId);
   if (!loaded.ok) {
@@ -356,10 +396,10 @@ export async function cutoverProviderToOwned(
   // ── El gate: un mail real, con la credencial nueva (T9.8.3) ──────────────
   const sent = await sendEmail({
     from,
-    to: opts.verifyTo,
+    to: verifyTo,
     subject: `Verificación de tu cuenta de ${row.name}`,
-    html: verificationHtml(row.name, opts.verifyTo),
-    text: verificationText(row.name, opts.verifyTo),
+    html: verificationHtml(row.name, verifyTo),
+    text: verificationText(row.name, verifyTo),
     biz_opaque_callback_data: `cutover-${providerId}`,
     // La credencial que se está probando, no la que entrega el resolver.
     api_key: loaded.credential,
@@ -390,7 +430,7 @@ export async function cutoverProviderToOwned(
     statusDetail: null,
     changedFrom: row.ownership,
     changedBy: opts.changedBy,
-    notes: `verificado con un envío real a ${opts.verifyTo} (message_id ${sent.message_id})`,
+    notes: `verificado con un envío real a ${verifyTo} (message_id ${sent.message_id})`,
   });
   invalidateProviderCache('resend');
 
@@ -399,7 +439,101 @@ export async function cutoverProviderToOwned(
     'cutover completado: el proveedor pasa a la cuenta del cliente (owned)',
   );
 
-  return { ok: true, ownership: 'owned', message_id: sent.message_id, verified_to: opts.verifyTo };
+  return { ok: true, ownership: 'owned', message_id: sent.message_id, verified_to: verifyTo };
+}
+
+/**
+ * G1 del cutover BYOK de OpenAI (byok §7.12) — la Evidencia A.
+ *
+ * A diferencia de Resend, acá el flip NO puede completarse en este proceso: el
+ * consumidor runtime de la key es el gateway LiteLLM (env de su container,
+ * GitOps), no el resolver del dispatcher. Marcar `owned` con la Evidencia A
+ * sola dejaría la card diciendo «tu cuenta» mientras el tráfico factura a la
+ * nuestra. Lo que G1 sí hace: probar la key con un USO real (una completion,
+ * no un `GET /models` — eso no prueba permiso de completions, ni cuota, ni
+ * acceso al modelo en SU proyecto), guardar la evidencia (id + organización
+ * que facturó) y dejar el estado honesto en `pending_verification` — que para
+ * OpenAI es un estado de DÍAS, no de segundos, hasta la Evidencia B (G2: una
+ * completion por el gateway facturada por la organización del cliente).
+ */
+async function cutoverOpenAiG1(
+  deps: CredentialDeps,
+  row: ProviderRow,
+  changedBy: string | null,
+): Promise<CutoverResult> {
+  const loaded = await loadProviderCredential(deps, row.id);
+  if (!loaded.ok) {
+    const code = loaded.code === 'absent' ? 'no_credential' : loaded.code;
+    return { ok: false, code, message: loaded.message };
+  }
+
+  // ── Estado intermedio, ANTES de salir a la red (mismo criterio que Resend) ─
+  await writeState(deps, row.id, {
+    ownership: row.ownership,
+    status: 'pending_verification',
+    statusDetail: 'credencial cargada, esperando la prueba de uso real',
+    changedFrom: row.ownership,
+    changedBy,
+    notes: 'cutover BYOK OpenAI iniciado (G1)',
+  });
+
+  // ── El gate de G1: una completion real contra la cuenta del cliente ───────
+  // Filtro y evidencia en una sola llamada — el chequeo barato aparte no
+  // agrega nada cuando la prueba real cuesta un token.
+  const used = await realOpenAiCompletion(loaded.credential);
+  if (!used.ok) {
+    const detail = rejectedDetail(row, used.error_code, used.error_message);
+    await writeState(deps, row.id, {
+      ownership: row.ownership,
+      status: 'failed',
+      statusDetail: detail,
+      changedFrom: row.ownership,
+      changedBy,
+      notes: 'cutover abortado en la prueba de uso real (G1)',
+    });
+    deps.logger.warn(
+      { provider_id: row.id, error_code: used.error_code, http_status: used.http_status },
+      'cutover OpenAI: la prueba de uso real con la credencial del cliente falló — sigue en managed',
+    );
+    return { ok: false, code: 'credential_rejected', message: detail };
+  }
+
+  // ── La key quedó verificada; el flip NO se marca ──────────────────────────
+  await writeState(deps, row.id, {
+    ownership: row.ownership,
+    status: 'pending_verification',
+    statusDetail:
+      'Tu key quedó verificada con un uso real. El cambio de cuenta lo completa el equipo: ' +
+      'el gateway de IA pasa a tu organización y esta card se marca «Tu cuenta» recién ' +
+      'entonces. Mientras tanto todo sigue funcionando con nuestra cuenta.',
+    changedFrom: row.ownership,
+    changedBy,
+    notes:
+      `verificación BYOK OpenAI (G1): completion ${used.response_id} · modelo ${used.model}` +
+      ` · organización ${used.organization ?? 'no informada'} — el flip a owned llega con la` +
+      ' Evidencia B (G2, byok §7.12)',
+  });
+
+  deps.logger.info(
+    {
+      provider_id: row.id,
+      response_id: used.response_id,
+      model: used.model,
+      organization: used.organization,
+      by: changedBy,
+    },
+    'cutover OpenAI G1: key del cliente verificada con uso real — pending_verification hasta G2',
+  );
+
+  return {
+    ok: true,
+    ownership: 'pending_verification',
+    evidence: {
+      response_id: used.response_id,
+      model: used.model,
+      organization: used.organization,
+    },
+  };
 }
 
 /**

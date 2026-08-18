@@ -166,6 +166,10 @@ const schema = z.object({
   AI_PERSONALIZE_DEFAULT_MAX_TOKENS: z.coerce.number().int().min(50).max(2000).default(200),
   AI_PERSONALIZE_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.7),
   AI_PERSONALIZE_TIMEOUT_MS: z.coerce.number().int().min(1000).default(15000),
+  // Modelo de la prueba de uso real del cutover BYOK OpenAI (G1, byok §7.12).
+  // Optional a propósito: '' (lista curada) o ausente caen al default barato
+  // en providers/openai-byok.ts. Se cobra a la key del cliente (1 token).
+  OPENAI_CUTOVER_TEST_MODEL: z.string().optional(),
 
   // ── Email channel (Fase 5 Item 1 — Resend) ───────────────────────────────
   // Optional: if missing, email deliveries fail terminally with
