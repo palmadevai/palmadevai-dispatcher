@@ -23,13 +23,20 @@ de `palmadevai-apps` v0.4.0. Empaqueta:
   `campaigns-template-sync` (retirado en F3/H3.4 de
   `palmadevai-apps:features/messaging/doc/analysis-messaging-service.md`).
 
-> **Estado actual: SKELETON / Fase 1 boot scaffold (F1.2.a).**
+> **Estado actual: implementación real completa (F1.2.b+, v0.2.0 en adelante).**
 >
-> Los 3 workers están en modo STUB: levantan, conectan a Redis + Postgres,
-> logean "received job" + ACK. NO procesan delivery ni hacen send a Meta.
+> Los workers ejecutan side effects reales — XREADGROUP loop, SELECT FOR UPDATE
+> SKIP LOCKED, pick-phone/pick-endpoint, send multi-provider (WA/email/FB/IG),
+> classify + retry ZSET o DLQ con auto-pausa, métricas a `bot.dispatcher_metrics`.
+> El boot lo confirma: `src/index.ts` loguea `dispatcher fully booted (real logic
+> — XREADGROUP loop + DLQ + metrics)`. Detalle por worker en `CLAUDE.md`.
 >
-> La implementación real (SELECT FOR UPDATE, multi-phone picker, send WA,
-> classify error, DLQ, métricas reales) viene en **F1.2.b** (próximo PR).
+> `STUB_MODE=true` (env, default `false`) mantiene el modo dry-run para
+> development: loguea intención sin POST a Meta, sin insert en DLQ, sin flush.
+>
+> *(Este header decía "SKELETON / workers en modo STUB" hasta 2026-08-17 —
+> quedó congelado en F1.2.a mientras el código avanzaba; reconciliado en F0
+> del plan `palmadevai-apps:features/campaigns/doc/plan-accion-campanas-2026-08.md`.)*
 
 ## Source of truth
 
