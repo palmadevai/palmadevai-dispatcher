@@ -117,7 +117,6 @@ async function main(): Promise<void> {
     sql,
     logger,
     graph: graphManagement,
-    wabaId: env.META_WA_WABA_ID,
     cockpitUrl: env.COCKPIT_URL,
     sendEmail,
   };

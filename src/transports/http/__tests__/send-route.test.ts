@@ -74,7 +74,8 @@ async function buildApp(overrides: {
     metricsCollector: new MetricsCollector(),
     sendBearer: 'sendBearer' in overrides ? overrides.sendBearer : 'test-bearer',
     staffAllowlist: overrides.staffAllowlist ?? ['+5491111111111'],
-    defaultWaPhoneNumberId: overrides.defaultWaPhoneNumberId ?? '1234567890',
+    resolveDefaultPhoneNumberId: async () =>
+      'defaultWaPhoneNumberId' in overrides ? (overrides.defaultWaPhoneNumberId ?? null) : '1234567890',
     defaultFromEmail: 'ops@example.com',
   });
   await app.ready();
@@ -185,6 +186,28 @@ describe('POST /send — happy path', () => {
 
     expect(res.statusCode).toBe(502);
     expect(res.json()).toEqual({ status: 'failed', error_code: 'meta_400', error_message: 'bad request' });
+  });
+
+  // Seguimiento (channel-whatsapp-config): sin phone en ninguna fuente
+  // (DB `bot.config['channel_whatsapp'].default_phone_number_id` ni env
+  // `META_WA_DEFAULT_PHONE_NUMBER_ID`) — el resolver inyectado devuelve
+  // `null` y el error nombra las dos fuentes, no un 500 mudo.
+  it('502 missing_phone_number_id nombrando las DOS fuentes cuando el resolver no resuelve nada', async () => {
+    const { app } = await buildApp({ defaultWaPhoneNumberId: undefined });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/send',
+      headers: { authorization: 'Bearer test-bearer' },
+      payload: { ...notificationBody, context: { ...notificationBody.context, client_ref: 'ref-nophone' } },
+    });
+
+    expect(res.statusCode).toBe(502);
+    const body = res.json();
+    expect(body.error_code).toBe('missing_phone_number_id');
+    expect(body.error_message).toContain("bot.config['channel_whatsapp'].default_phone_number_id");
+    expect(body.error_message).toContain('META_WA_DEFAULT_PHONE_NUMBER_ID');
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 

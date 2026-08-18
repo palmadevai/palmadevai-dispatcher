@@ -30,8 +30,12 @@ export interface SendRouteDeps {
   sendBearer: string | undefined;
   /** `env.STAFF_NOTIFY_ALLOWLIST` parseado (CSV → array trimmeado). */
   staffAllowlist: string[];
-  /** `env.META_WA_DEFAULT_PHONE_NUMBER_ID`. Undefined → whatsapp da 502. */
-  defaultWaPhoneNumberId: string | undefined;
+  /**
+   * DB `bot.config['channel_whatsapp'].default_phone_number_id` → env
+   * `META_WA_DEFAULT_PHONE_NUMBER_ID` (ver `core/messaging.ts SendDeps`).
+   * `null` → whatsapp da 502 con las DOS fuentes nombradas.
+   */
+  resolveDefaultPhoneNumberId: () => Promise<string | null>;
   /** `env.CAMPAIGNS_DEFAULT_FROM_EMAIL` — reusado, sin env nueva para `/send`. */
   defaultFromEmail: string | undefined;
 }
@@ -85,7 +89,7 @@ export function registerSendRoute(app: FastifyInstance, deps: SendRouteDeps): vo
         logger: deps.logger,
         metrics: deps.metricsCollector,
         staffAllowlist: deps.staffAllowlist,
-        defaultWaPhoneNumberId: deps.defaultWaPhoneNumberId,
+        resolveDefaultPhoneNumberId: deps.resolveDefaultPhoneNumberId,
         defaultFromEmail: deps.defaultFromEmail,
       },
       parsed.data,
