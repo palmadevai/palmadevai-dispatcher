@@ -177,7 +177,8 @@ describe('syncTemplates', () => {
         [{ id: 'camp-1' }, { id: 'camp-2' }], // auto-pause RETURNING
         [], // audit insert camp-1
         [], // audit insert camp-2
-        [{ admin_email: 'admin@example.com' }], // bot.config branding
+        [{ email_from: 'noreply@cliente.test' }], // branding.email_from (T4.5)
+        [{ to: ['admin@example.com'] }], // bot.notify_to('campaigns')
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
@@ -186,10 +187,73 @@ describe('syncTemplates', () => {
     const r = await syncTemplates(deps);
     expect(r.campaigns_paused).toBe(2);
     expect(sendEmail).toHaveBeenCalledTimes(1);
-    const emailInput = sendEmail.mock.calls[0][0] as { to: string; subject: string };
+    const emailInput = sendEmail.mock.calls[0][0] as {
+      to: string;
+      from: string;
+      subject: string;
+    };
     expect(emailInput.to).toBe('admin@example.com');
     expect(emailInput.subject).toContain('2 campaña(s) pausada(s)');
+    // El remitente sale del branding del cliente. Hasta T4.5 era
+    // `onboarding@resend.dev` HARDCODEADO — el sandbox de Resend, que entrega al
+    // dueño de la cuenta con un 200 limpio: la alerta no le llegaba al cliente y
+    // nada lo indicaba.
+    expect(emailInput.from).toBe('Alertas PalmaDev <noreply@cliente.test>');
+    expect(emailInput.from).not.toContain('resend.dev');
     expect(calls.some((c) => c.includes('campaign_launches_audit'))).toBe(true);
+  });
+
+  // T4.5: la lista es del cliente y puede tener más de uno. Un envío por
+  // destinatario — el rechazo de uno no puede dejar sin aviso a los otros.
+  it('manda UN mail por destinatario cuando notify_to tiene varios', async () => {
+    const rejected = { ...approvedTemplate, status: 'REJECTED' };
+    const { deps, sendEmail } = makeDeps({
+      sqlResponses: [
+        [],
+        [{ id: 'tpl-1', status: 'approved' }],
+        [{ id: 'tpl-1', inserted: false }],
+        [{ id: 'camp-1' }],
+        [], // audit
+        [{ email_from: 'noreply@cliente.test' }],
+        [{ to: ['ops@cliente.test', 'conta@cliente.test'] }],
+      ],
+      graph: {
+        fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
+      },
+    });
+    await syncTemplates(deps);
+    expect(sendEmail).toHaveBeenCalledTimes(2);
+    const destinos = sendEmail.mock.calls.map((c) => (c[0] as { to: string }).to);
+    expect(destinos).toEqual(['ops@cliente.test', 'conta@cliente.test']);
+    // El callback data lleva el destinatario: sin eso los dos envíos del mismo
+    // evento colisionan en la idempotencia del proveedor y el segundo se pierde.
+    const refs = sendEmail.mock.calls.map(
+      (c) => (c[0] as { biz_opaque_callback_data: string }).biz_opaque_callback_data,
+    );
+    expect(new Set(refs).size).toBe(2);
+  });
+
+  // Sin remitente NO se manda, aunque haya destinatarios: mandar desde un
+  // remitente equivocado entrega al lugar equivocado con un 200 limpio.
+  it('no manda si falta branding.email_from, aunque haya destinatarios', async () => {
+    const rejected = { ...approvedTemplate, status: 'REJECTED' };
+    const { deps, sendEmail } = makeDeps({
+      sqlResponses: [
+        [],
+        [{ id: 'tpl-1', status: 'approved' }],
+        [{ id: 'tpl-1', inserted: false }],
+        [{ id: 'camp-1' }],
+        [], // audit
+        [{ email_from: '' }],
+        [{ to: ['ops@cliente.test'] }],
+      ],
+      graph: {
+        fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
+      },
+    });
+    const r = await syncTemplates(deps);
+    expect(r.campaigns_paused).toBe(1);
+    expect(sendEmail).not.toHaveBeenCalled();
   });
 
   it('skips the alert (with a warning) when admin_email is not configured', async () => {
@@ -201,7 +265,8 @@ describe('syncTemplates', () => {
         [{ id: 'tpl-1', inserted: false }],
         [{ id: 'camp-1' }],
         [], // audit
-        [{ admin_email: null }], // branding without admin_email
+        [{ email_from: 'noreply@cliente.test' }],
+        [{ to: [] }], // bot.notify_to devuelve vacío: aviso apagado / sin cargar
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),

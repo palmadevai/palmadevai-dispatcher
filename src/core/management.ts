@@ -21,6 +21,7 @@ import type { GraphManagement, GraphTemplate } from '../providers/whatsapp-manag
 import type { EmailSendInput } from '../providers/email.js';
 import type { ProviderSendResult } from '../providers/types.js';
 import { readChannelWhatsAppConfig } from '../lib/providers.js';
+import { resolveNotifyTarget, notifyBlockedReason } from './notify-to.js';
 
 export interface ManagementDeps {
   sql: SqlClient;
@@ -380,14 +381,21 @@ async function upsertTemplate(
  */
 async function alertAutoPause(deps: ManagementDeps, events: TemplatePauseEvent[]): Promise<void> {
   const { sql, logger } = deps;
-  const cfg = await sql<Array<{ admin_email: string | null }>>`
-    SELECT value->>'admin_email' AS admin_email FROM bot.config WHERE key = 'branding'
-  `;
-  const adminEmail = cfg[0]?.admin_email ?? '';
-  if (!adminEmail) {
+  // R1c / T4.5: destinatarios de la feature `campaigns`, con branding.admin_email
+  // de fallback y lista vacía = aviso apagado.
+  //
+  // ⚠ El remitente también cambia, y era un bug vivo: hasta acá era
+  // `onboarding@resend.dev` HARDCODEADO — el sandbox de Resend, que entrega al
+  // DUEÑO DE LA CUENTA con un 200 limpio. O sea que esta alerta no le llegaba al
+  // cliente y nada lo indicaba. Es el mismo defecto que T8.1 sacó de los seis
+  // workflows, sobreviviendo acá porque el inventario del plan miraba n8n y el
+  // cockpit. Ahora sale de `branding.email_from`, sin fallback.
+  const target = await resolveNotifyTarget(sql, logger, 'campaigns');
+  const blocked = notifyBlockedReason(target);
+  if (blocked) {
     logger.warn(
-      { paused_templates: events.length },
-      'template-sync auto-paused campaigns but bot.config[branding].admin_email is not set — no alert sent',
+      { paused_templates: events.length, reason: blocked },
+      'template-sync auto-paused campaigns but the alert could not be sent',
     );
     return;
   }
@@ -409,22 +417,28 @@ async function alertAutoPause(deps: ManagementDeps, events: TemplatePauseEvent[]
     )
     .join(' ');
 
-  const result = await deps.sendEmail({
-    from: 'Alertas PalmaDev <onboarding@resend.dev>',
-    to: adminEmail,
-    subject: `Template Meta bloqueante: ${totalPaused} campaña(s) pausada(s)`,
-    html:
-      htmlItems +
-      `<p>No se envían más mensajes de esas campañas hasta resolverlo.</p>` +
-      (cockpitLink ? `<p>Ver: ${cockpitLink}</p>` : ''),
-    text: `${textItems}${cockpitLink ? ` Ver: ${cockpitLink}` : ''}`,
-    biz_opaque_callback_data: `template-sync-alert-${events[0]?.templateDbId ?? 'unknown'}`,
-  });
-  if (!result.ok) {
-    logger.warn(
-      { error_code: result.error_code, error_message: result.error_message },
-      'template-sync: alert email returned non-ok (best-effort, continuing)',
-    );
+  // Un envío POR DESTINATARIO, acumulando rechazos en vez de cortar en el
+  // primero: que a uno le rebote no es razón para que los otros no se enteren.
+  // El `biz_opaque_callback_data` lleva el destinatario para que dos envíos del
+  // mismo evento no colisionen en la idempotencia del proveedor.
+  for (const to of target.to) {
+    const result = await deps.sendEmail({
+      from: `Alertas PalmaDev <${target.from}>`,
+      to,
+      subject: `Template Meta bloqueante: ${totalPaused} campaña(s) pausada(s)`,
+      html:
+        htmlItems +
+        `<p>No se envían más mensajes de esas campañas hasta resolverlo.</p>` +
+        (cockpitLink ? `<p>Ver: ${cockpitLink}</p>` : ''),
+      text: `${textItems}${cockpitLink ? ` Ver: ${cockpitLink}` : ''}`,
+      biz_opaque_callback_data: `template-sync-alert-${events[0]?.templateDbId ?? 'unknown'}-${to}`,
+    });
+    if (!result.ok) {
+      logger.warn(
+        { to, error_code: result.error_code, error_message: result.error_message },
+        'template-sync: alert email returned non-ok (best-effort, continuing)',
+      );
+    }
   }
 }
 

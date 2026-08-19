@@ -162,25 +162,58 @@ export async function resolveCategory(
  * Direcciones de staff del cliente, para la guarda de destino de las
  * notificaciones por **email**.
  *
- * Hoy es UNA: `bot.config['branding'].admin_email` — el mismo dato que el
- * cockpit ya usa como destinatario de sus avisos y que el operador edita desde
- * la UI. **Es configuración, no secreto**, así que su lugar es la DB y no el
- * `.env` (frontera del handbook: "¿habría que rotarlo si se filtra?" → no).
+ * Son DOS fuentes, y las dos son configuración del cliente en la DB (frontera
+ * del handbook: "¿habría que rotarlo si se filtra?" → no):
  *
- * Si mañana hacen falta varias, la lista va en una key propia de `bot.config`
- * con ésta como default — no en una env nueva, que además repetiría el modo de
- * falla del 2026-08-03 (valor cargado a mano que no matchea nunca).
+ *   1. `bot.config['branding'].admin_email` — el buzón de administración.
+ *   2. `bot.config['notify_to']` — los destinatarios que el operador cargó por
+ *      feature desde *Seguridad → Avisos* (R1c / T4.5). **Todas las features
+ *      juntas**, no la del mensaje: ver abajo.
+ *
+ * ⚠ **Sin la fuente 2, T4.5 quedaba rota y de la peor forma.** Cuatro de los
+ * cinco emisores migrados mandan con `kind: 'notification'`, así que esta
+ * guarda los alcanza: con la allowlist en una sola dirección, cargar un segundo
+ * destinatario lo dejaba en `403 destination_not_allowed`. La configuración
+ * habría aceptado la dirección y el mail no habría llegado nunca — exactamente
+ * el modo de falla que el plan de email viene desarmando. El comentario que
+ * había acá lo anticipaba (*"si mañana hacen falta varias, la lista va en una
+ * key propia de bot.config con ésta como default"*); esto es ese día.
+ *
+ * **Por qué TODAS las features y no la del mensaje.** La pregunta que contesta
+ * la guarda es *"¿esta dirección es de adentro?"*, y una dirección que el
+ * operador cargó para recibir avisos automáticos es del staff del cliente sin
+ * importar qué feature dispare. Scopear por feature agregaría precisión contra
+ * una amenaza marginal (un aviso del gateway llegando al buzón que se cargó
+ * para facturación — las dos del mismo cliente) al precio de acoplar la guarda
+ * a que el `context.feature` esté bien puesto, y de un modo de falla confuso:
+ * la misma dirección aceptada para un emisor y 403 para otro.
  *
  * **Fail-closed**: sin dato, o con la query rota, devuelve vacío y la
  * notificación se rechaza. Es una guarda de destino; fallar abierta la anula.
  */
 export async function resolveStaffEmails(sql: SqlClient, logger: Logger): Promise<Set<string>> {
   try {
-    const rows = await sql<Array<{ admin_email: string | null }>>`
-      SELECT value->>'admin_email' AS admin_email FROM bot.config WHERE key = 'branding'
+    // Una sola vuelta a la base: la guarda corre en el camino de envío.
+    const rows = await sql<Array<{ admin_email: string | null; notify_to: string[] | null }>>`
+      SELECT (SELECT value->>'admin_email' FROM bot.config WHERE key = 'branding') AS admin_email,
+             COALESCE(
+               (SELECT array_agg(DISTINCT btrim(addr))
+                  FROM bot.config c,
+                       LATERAL jsonb_each(c.value) AS f(feature, list),
+                       LATERAL jsonb_array_elements_text(f.list) AS addr
+                 WHERE c.key = 'notify_to'
+                   AND jsonb_typeof(f.list) = 'array'
+                   AND btrim(addr) <> ''),
+               '{}'::text[]
+             ) AS notify_to
     `;
-    const v = rows[0]?.admin_email;
-    return typeof v === 'string' && v.trim() ? new Set([v.trim().toLowerCase()]) : new Set();
+    const out = new Set<string>();
+    const add = (v: unknown) => {
+      if (typeof v === 'string' && v.trim()) out.add(v.trim().toLowerCase());
+    };
+    add(rows[0]?.admin_email);
+    for (const addr of rows[0]?.notify_to ?? []) add(addr);
+    return out;
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },
@@ -369,7 +402,7 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       reason: 'destination_not_allowed',
       detail:
         msg.channel === 'email'
-          ? "destination is not a staff address (bot.config['branding'].admin_email)"
+          ? "destination is not a staff address (bot.config['notify_to'] o ['branding'].admin_email)"
           : 'destination is not in the staff allowlist',
     };
   }
