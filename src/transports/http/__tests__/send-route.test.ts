@@ -117,7 +117,10 @@ describe('POST /send — auth', () => {
 describe('POST /send — idempotency', () => {
   it('returns duplicate without calling the provider when client_ref was already seen', async () => {
     const { app, redis } = await buildApp();
-    await redis.set('msgsvc:ref:ref-1', '1');
+    // La clave de idempotencia incluye el DESTINO desde 2026-08-19: deduplicar
+    // entre destinatarios distintos no es idempotencia, es perdida de datos
+    // silenciosa (el 2do vuelve `duplicate` y `duplicate` cuenta como «salio»).
+    await redis.set(`msgsvc:ref:ref-1:${notificationBody.to.toLowerCase()}`, '1');
 
     const res = await app.inject({
       method: 'POST',

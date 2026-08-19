@@ -15,7 +15,7 @@
  *
  * Orden de las guardas (deliberado, el mismo que tenía la ruta HTTP):
  *   1. combo canal × contenido soportado
- *   2. idempotencia por `client_ref`
+ *   2. idempotencia por (`client_ref`, destino)
  *   3. destino staff-only para `kind='notification'`
  *   4. opt-out contra la BUC
  *   5. ventana de 24h (sólo texto libre de WhatsApp)
@@ -369,8 +369,33 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
     };
   }
 
-  // ── 2. Idempotencia por client_ref ────────────────────────────────────────
-  const idemKey = `msgsvc:ref:${client_ref}`;
+  // ── 2. Idempotencia por (client_ref, destino) ─────────────────────────────
+  //
+  // ⚠ EL DESTINO ES PARTE DE LA CLAVE, y no es un detalle: la idempotencia
+  // existe para no entregarle DOS VECES EL MISMO MENSAJE A LA MISMA PERSONA.
+  // Deduplicar entre destinatarios DISTINTOS no es idempotencia — es pérdida de
+  // datos, y silenciosa, porque el segundo vuelve `duplicate` y `duplicate`
+  // cuenta como «salió» río arriba (T10.6).
+  //
+  // Hasta 2026-08-19 la clave era sólo `client_ref`, y alcanzaba mientras todos
+  // los emisores mandaban a UNO. Con `notify_to` (R1c/T4.5) aparecieron los que
+  // mandan a una LISTA, y ahí el modo de falla se abrió: cinco workflows
+  // mandaban N POSTs con el mismo ref por ejecución, así que del 2º
+  // destinatario en adelante NO SE MANDABA NADA y la ejecución cerraba en
+  // verde. Se arregló primero en los cinco llamadores —una convención copiada
+  // cinco veces, o sea la próxima mina para el emisor n°6— y después acá, que
+  // es donde estaba.
+  //
+  // El cambio sólo puede entregar MÁS, y únicamente en el caso que era el bug:
+  // con un solo destinatario `(ref, to)` es 1:1 con `ref` y el reintento se
+  // deduplica igual que siempre.
+  //
+  // Se normaliza el destino (trim + lowercase) para que un reintento con
+  // diferencias cosméticas siga cayendo en la misma clave: es la misma
+  // normalización con la que se compara contra la allowlist de staff, y no
+  // fusiona destinos legítimamente distintos (una dirección de mail no
+  // distingue mayúsculas en la práctica, y un teléfono E.164 no tiene).
+  const idemKey = `msgsvc:ref:${client_ref}:${msg.to.trim().toLowerCase()}`;
   let isDuplicate = false;
   try {
     const set = await deps.redis.set(idemKey, '1', 'EX', IDEMPOTENCY_TTL_SECONDS, 'NX');
@@ -385,8 +410,10 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   }
   if (isDuplicate) {
     deps.logger.info(
-      { feature, kind, channel: msg.channel, client_ref },
-      'sendMessage: duplicate client_ref — no-op',
+      // El destino va en el log: sin él, un `duplicate` en una lista no se puede
+      // diagnosticar — no se sabe a quién se le tragó el mensaje.
+      { feature, kind, channel: msg.channel, client_ref, to: maskDestination(msg.to) },
+      'sendMessage: duplicate (client_ref + destino) — no-op',
     );
     return { status: 'duplicate' };
   }

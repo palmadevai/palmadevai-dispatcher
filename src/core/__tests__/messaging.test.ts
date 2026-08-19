@@ -160,6 +160,58 @@ describe('sendMessage — idempotency', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
+  // ── La clave incluye el DESTINO (2026-08-19) ──────────────────────────────
+  //
+  // La idempotencia existe para no entregar dos veces el mismo mensaje a la
+  // MISMA persona. Deduplicar entre destinatarios distintos no es idempotencia:
+  // es perdida de datos, y silenciosa, porque `duplicate` cuenta como «salio»
+  // rio arriba (T10.6).
+  //
+  // Caso testigo: con `notify_to` (R1c/T4.5) aparecieron emisores que mandan a
+  // una LISTA con un ref por ejecucion. Del 2do destinatario en adelante no se
+  // mandaba NADA y la ejecucion cerraba en verde.
+  it('el mismo client_ref a OTRO destinatario SI se manda (no es un duplicado)', async () => {
+    const deps = makeDeps();
+    const ref = 'fanout-ref';
+
+    const a = await sendMessage(deps, makeMsg({ to: '+5493511111111', context: { feature: 'f', client_ref: ref } }));
+    const b = await sendMessage(deps, makeMsg({ to: '+5493512222222', context: { feature: 'f', client_ref: ref } }));
+
+    expect(a.status).toBe('sent');
+    expect(b.status).toBe('sent');
+    expect(mockSend).toHaveBeenCalledTimes(2);
+  });
+
+  it('el mismo client_ref al MISMO destinatario sigue siendo duplicado', async () => {
+    // La garantia de siempre no se afloja: con un solo destinatario, (ref, to)
+    // es 1:1 con ref y el reintento se deduplica igual.
+    const deps = makeDeps();
+    const ref = 'mismo-destino-ref';
+
+    await sendMessage(deps, makeMsg({ to: '+5493511111111', context: { feature: 'f', client_ref: ref } }));
+    mockSend.mockClear();
+    const second = await sendMessage(deps, makeMsg({ to: '+5493511111111', context: { feature: 'f', client_ref: ref } }));
+
+    expect(second).toEqual({ status: 'duplicate' });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('normaliza el destino: mayusculas y espacios no abren una clave nueva', async () => {
+    // Un reintento con diferencias cosmeticas tiene que caer en la misma clave,
+    // o el dedup deja de proteger justo en el reintento.
+    const deps = makeDeps();
+    const ref = 'normaliza-ref';
+    const msg = { channel: 'email' as const, from: 'noreply@x.test',
+                  content: { type: 'mail' as const, subject: 's', text: 't' } };
+
+    await sendMessage(deps, makeMsg({ ...msg, to: 'Ops@Ejemplo.TEST', context: { feature: 'f', client_ref: ref, kind: 'transactional' } }));
+    mockSend.mockClear();
+    const second = await sendMessage(deps, makeMsg({ ...msg, to: '  ops@ejemplo.test ', context: { feature: 'f', client_ref: ref, kind: 'transactional' } }));
+
+    expect(second).toEqual({ status: 'duplicate' });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
   it('proceeds with the send when the idempotency SET NX throws (fail-open)', async () => {
     mockSend.mockResolvedValue({ ok: true, message_id: 'wamid-failopen' });
     const redis = makeThrowingSetRedis();
