@@ -419,8 +419,12 @@ async function alertAutoPause(deps: ManagementDeps, events: TemplatePauseEvent[]
 
   // Un envío POR DESTINATARIO, acumulando rechazos en vez de cortar en el
   // primero: que a uno le rebote no es razón para que los otros no se enteren.
-  // El `biz_opaque_callback_data` lleva el destinatario para que dos envíos del
-  // mismo evento no colisionen en la idempotencia del proveedor.
+  // El `biz_opaque_callback_data` lleva el destinatario para poder CORRELACIONAR
+  // qué evento del proveedor corresponde a qué persona: para email termina como
+  // un tag de Resend (`providers/email.ts`). ⚠ NO evita ninguna colisión de
+  // idempotencia —un tag no deduplica, y este camino ni siquiera pasa por
+  // `sendMessage`, que es donde vive la guarda—; la primera versión de este
+  // comentario decía eso y era falso.
   for (const to of target.to) {
     const result = await deps.sendEmail({
       from: `Alertas PalmaDev <${target.from}>`,
