@@ -265,8 +265,55 @@ describe('sendMessage — staff allowlist por mail', () => {
     expect(result).toEqual({
       status: 'rejected',
       reason: 'destination_not_allowed',
-      detail: "destination is not a staff address (bot.config['branding'].admin_email)",
+      detail:
+        "destination is not a staff address (bot.config['notify_to'] o ['branding'].admin_email)",
     });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  // ── T4.5: la allowlist son DOS fuentes ────────────────────────────────────
+  //
+  // Sin esto, cargar un segundo destinatario en Seguridad → Avisos lo dejaba en
+  // 403: cuatro de los cinco emisores migrados mandan con kind='notification',
+  // asi que esta guarda los alcanza. La config habria aceptado la direccion y el
+  // mail no habria llegado nunca.
+  it('una direccion cargada en notify_to TAMBIEN es staff (T4.5)', async () => {
+    const sql = makeFakeSql([
+      [{ admin_email: 'ops@ejemplo.test', notify_to: ['conta@ejemplo.test'] }],
+    ]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('conta@ejemplo.test', 'ref-nt-1'));
+
+    expect(result.status).not.toBe('rejected');
+    expect(mockSend).toHaveBeenCalled();
+  });
+
+  it('vale la de CUALQUIER feature, no solo la del mensaje', async () => {
+    // La guarda contesta "esta direccion es de adentro?", y una direccion que el
+    // operador cargo para recibir avisos es del staff del cliente dispare quien
+    // dispare. Scopear por feature acoplaria la guarda a que context.feature
+    // este bien puesto, y daria el modo de falla confuso de la misma direccion
+    // aceptada para un emisor y 403 para otro.
+    const sql = makeFakeSql([
+      [{ admin_email: null, notify_to: ['a@ejemplo.test', 'b@ejemplo.test'] }],
+    ]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('b@ejemplo.test', 'ref-nt-2'));
+
+    expect(result.status).not.toBe('rejected');
+  });
+
+  it('notify_to no afloja la guarda: una direccion ajena sigue en 403', async () => {
+    const sql = makeFakeSql([
+      [{ admin_email: 'ops@ejemplo.test', notify_to: ['conta@ejemplo.test'] }],
+    ]);
+    const deps = makeDeps({ sql });
+
+    const result = await sendMessage(deps, mailNotification('ajeno@otro.test', 'ref-nt-3'));
+
+    expect(result).toMatchObject({ status: 'rejected', reason: 'destination_not_allowed' });
     expect(mockSend).not.toHaveBeenCalled();
   });
 

@@ -19,6 +19,7 @@ import type { ErrorCategory } from '../classify/error-classifier.js';
 import { env } from '../env.js';
 import { sendEmail } from '../providers/email.js';
 import { resolveProviderKey } from '../lib/providers.js';
+import { resolveNotifyTarget, notifyBlockedReason } from '../core/notify-to.js';
 
 const AUTO_PAUSE_RATIO = 0.2; // 20 %
 const AUTO_PAUSE_WINDOW_MIN = 1; // last 1 minute of attempts
@@ -146,13 +147,20 @@ export async function moveToDLQ(
         // puede estar cifrada en la base. sendEmail() resuelve igual; esto
         // sólo decide si hay con qué mandar.
         if ((await resolveProviderKey('resend')).ok) {
-          const [brandingRow] = await sql<Array<{ admin_email: string | null }>>`
-            SELECT value->>'admin_email' AS admin_email
-            FROM bot.config
-            WHERE key = 'branding'
-          `;
-          const alertEmail = brandingRow?.admin_email;
-          if (alertEmail) {
+          // R1c / T4.5: los destinatarios salen de bot.notify_to('campaigns') —
+          // la lista propia de la feature, con branding.admin_email de fallback y
+          // lista vacía = aviso apagado. El remitente viene del mismo lugar; antes
+          // salía de `env.CAMPAIGNS_DEFAULT_FROM_EMAIL`, que es el remitente de
+          // las CAMPAÑAS: un aviso de ops saliendo con la identidad de marketing
+          // del cliente.
+          const target = await resolveNotifyTarget(sql, logger, 'campaigns');
+          const blocked = notifyBlockedReason(target);
+          if (blocked) {
+            logger.warn(
+              { campaign_id: entry.campaignId, reason: blocked },
+              'auto-pause por calidad: el aviso no se envía',
+            );
+          } else {
             const name = pauseResult[0].name ?? entry.campaignId;
             const ratePct = Math.round(
               (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
@@ -160,30 +168,33 @@ export async function moveToDLQ(
             const link = env.COCKPIT_URL
               ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
               : '';
-            // Sin remitente no se manda ni la alerta: mandar desde un
-            // remitente equivocado es peor que no avisar.
-            void sendEmail({
-              from: env.CAMPAIGNS_DEFAULT_FROM_EMAIL ?? '',
-              to: alertEmail,
-              subject: `Campaña pausada automáticamente: ${name}`,
-              html:
-                `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
-                `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
-                `(${stats.recent_failures}/${stats.recent_total}).</p>` +
-                `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
-                (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
-              text:
-                `Campaña pausada automáticamente: ${name}\n` +
-                `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
-                `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
-                (link ? `\n${link}` : ''),
-              biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}`,
-            }).catch((err: unknown) =>
-              logger.error(
-                { err: (err as Error).message, campaign_id: entry.campaignId },
-                'auto-pause email notify failed',
-              ),
-            );
+            // Un envío POR DESTINATARIO. Sin remitente no se manda ni la
+            // alerta —mandar desde un remitente equivocado es peor que no
+            // avisar—, y de eso se encarga el gate de arriba.
+            for (const alertEmail of target.to) {
+              void sendEmail({
+                from: target.from,
+                to: alertEmail,
+                subject: `Campaña pausada automáticamente: ${name}`,
+                html:
+                  `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
+                  `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
+                  `(${stats.recent_failures}/${stats.recent_total}).</p>` +
+                  `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
+                  (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
+                text:
+                  `Campaña pausada automáticamente: ${name}\n` +
+                  `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
+                  `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
+                  (link ? `\n${link}` : ''),
+                biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}:${alertEmail}`,
+              }).catch((err: unknown) =>
+                logger.error(
+                  { err: (err as Error).message, campaign_id: entry.campaignId, to: alertEmail },
+                  'auto-pause email notify failed',
+                ),
+              );
+            }
           }
         }
       }
