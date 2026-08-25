@@ -1,7 +1,7 @@
 /**
  * Recovery worker — runs every 5 min (spec §5.3, ADR-009, ADR-015).
  *
- * Three layers of defense:
+ * Four layers of defense:
  *
  *   1. PEL recovery — XCLAIM stale entries (IDLE > 5min) so a dead worker
  *      doesn't block forever. Just transfers ownership; the dispatcher loop
@@ -14,9 +14,17 @@
  *   3. PEL timeout (1h) — entries idle > 1h are presumed dead. Terminal-fail
  *      the delivery + insert DLQ row + XACK. failure_reason='pel_timeout_1h'.
  *
- * All three are idempotent: XCLAIM is safe to re-issue, re-XADD goes through
- * SELECT FOR UPDATE SKIP LOCKED in the dispatcher (non-pending → skip), and
- * the DLQ insert duplicates are acceptable (operator dedups on display).
+ *   4. Campaign state sweep (F3.1 del plan de campañas) — repara campañas
+ *      zombie en 'sending': (a) pausadas sin transición de status (las dejó
+ *      el mecanismo viejo pre-dispatcher), (b) one_off sin deliveries
+ *      pendientes que nadie cerró porque el último pendiente lo suprimió SQL
+ *      (bot.buc_opt_out) y maybeMarkCampaignDone solo corre en el update de
+ *      una delivery.
+ *
+ * All four are idempotent: XCLAIM is safe to re-issue, re-XADD goes through
+ * SELECT FOR UPDATE SKIP LOCKED in the dispatcher (non-pending → skip), the
+ * DLQ insert duplicates are acceptable (operator dedups on display), and the
+ * sweep UPDATEs are self-extinguishing (una vez reparado, el WHERE no matchea).
  */
 import type { Redis } from 'ioredis';
 import type { Sql } from 'postgres';
@@ -241,5 +249,98 @@ async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promis
     }
   } catch (err) {
     logger.error({ err: (err as Error).message }, 'PEL dead-letter step failed');
+  }
+
+  // ── 4. Campaign state sweep (F3.1) ────────────────────────────────────────
+  await sweepStuckCampaigns(sql, logger);
+}
+
+/**
+ * Repara los dos estados zombie medidos en el lab (2026-08-25, campañas
+ * `d2d5aa55` y el smoke del 2026-07-08 — colgadas en 'sending' desde junio y
+ * julio sin que nada lo detectara):
+ *
+ * (a) `paused_at` seteado con `status` todavía 'sending'/'queued'. La ruta
+ *     actual pausa atómico (`core/management.ts` setea status+paused_at en el
+ *     mismo UPDATE); estas filas las dejó el mecanismo viejo (el cron n8n de
+ *     template-sync retirado, o un UPDATE manual de cleanup). Ojo: un resume
+ *     legítimo NO limpia `paused_at` (setea `resumed_at`, ver
+ *     `campaign-site resumeCampaign`), así que la señal de inconsistencia es
+ *     «pausada DESPUÉS del último resume, o nunca resumida» — no `paused_at`
+ *     a secas, o el sweep re-pausaría campañas reanudadas.
+ *
+ * (b) one_off en 'sending' sin deliveries pendientes. `maybeMarkCampaignDone`
+ *     corre sólo en el update de una delivery: si el último pendiente lo
+ *     suprime SQL por fuera del dispatcher (`bot.buc_opt_out` marca
+ *     'suppressed' en un opt-out) nadie vuelve a evaluar el cierre y la
+ *     campaña queda 'sending' para siempre. Mismo WHERE que
+ *     `maybeMarkCampaignDone` + margen de 6h desde `launched_at` para no
+ *     correr contra un enqueue que todavía está creando deliveries.
+ *
+ * Audit: (a) inserta la fila 'paused' (mismo shape que `core/management.ts`;
+ * el CHECK de `campaign_launches_audit.action` no admite 'done', y el cierre
+ * normal a 'done' tampoco audita — (b) queda registrado por el warn del log,
+ * como el cierre normal).
+ */
+export async function sweepStuckCampaigns(sql: Sql, logger: Logger): Promise<void> {
+  try {
+    const repaired = await sql<Array<{ id: string; pause_reason: string | null }>>`
+      UPDATE bot.campaigns c
+         SET status = 'paused'
+       WHERE c.status IN ('sending', 'queued')
+         AND c.paused_at IS NOT NULL
+         AND (c.resumed_at IS NULL OR c.resumed_at < c.paused_at)
+      RETURNING c.id::text AS id, c.pause_reason
+    `;
+    for (const r of repaired) {
+      try {
+        await sql`
+          INSERT INTO bot.campaign_launches_audit
+            (campaign_id, action, operator, recorded_at, delta, evidence)
+          VALUES (${r.id}, 'paused', 'system_recovery_sweep', now(),
+                  ${JSON.stringify({ reason: 'sweep_reconcile_paused_status' })}::jsonb,
+                  ${JSON.stringify({ pause_reason: r.pause_reason })}::jsonb)
+        `;
+      } catch (auditErr) {
+        logger.error(
+          { err: (auditErr as Error).message, campaignId: r.id },
+          'campaign sweep: audit insert failed (repair already applied)',
+        );
+      }
+      logger.warn(
+        { campaignId: r.id, pauseReason: r.pause_reason },
+        "campaign sweep: status 'sending/queued' con paused_at seteado — reconciliado a 'paused'",
+      );
+    }
+
+    const closed = await sql<Array<{ id: string }>>`
+      UPDATE bot.campaigns c
+         SET status = 'done', done_at = now()
+       WHERE c.status = 'sending'
+         AND c.kind = 'one_off'
+         AND c.launched_at < now() - interval '6 hours'
+         AND NOT EXISTS (
+           SELECT 1 FROM bot.campaign_deliveries d
+            WHERE d.campaign_id = c.id AND d.status = 'pending'
+         )
+      RETURNING c.id::text AS id
+    `;
+    for (const r of closed) {
+      logger.warn(
+        { campaignId: r.id },
+        "campaign sweep: one_off en 'sending' sin deliveries pendientes hace >6h — cerrada a 'done'",
+      );
+    }
+  } catch (err) {
+    if (isMissingRelation(err)) {
+      announceOnce(
+        logger,
+        'missing:campaigns:state-sweep',
+        {},
+        'sin bot.campaigns (cliente sin la feature campaigns): el sweep de estados no tiene nada que reparar. Estado esperado, se dice una vez.',
+      );
+    } else {
+      logger.error({ err: (err as Error).message }, 'campaign state sweep failed');
+    }
   }
 }
