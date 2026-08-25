@@ -129,26 +129,110 @@ describe('recordSendUsage', () => {
 });
 
 describe('maybeAlert', () => {
+  // Cada test arma su propio fake `sql` (resuelve `notify_to`/`email_from`)
+  // y su propio `sendAlert` mock — el shape que devuelve `resolveAlertRecipients`
+  // internamente no está exportado, así que se mockea vía el `sql` fake, igual
+  // que `checkBudget` arriba.
+  function makeFakeAlertSql(recipients: string[] | null, emailFrom: string | null): Sql {
+    return (async () => [{ recipients, email_from: emailFrom }]) as unknown as Sql;
+  }
+
+  function makeFakeSendAlert() {
+    return vi.fn(async () => ({ status: 'sent' }));
+  }
+
+  const RESULT_80PCT = { allowed: true, spent_usd: 8.5, cap_usd: 10, pct: 0.85 };
+
   it('does nothing when there is no cap configured', async () => {
+    const sql = makeFakeAlertSql(['ops@palmadev.test'], 'alerts@palmadev.test');
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
-    await maybeAlert(redis, logger, 'whatsapp', 'marketing', {
+    const sendAlert = makeFakeSendAlert();
+
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', {
       allowed: true,
       spent_usd: 999,
       cap_usd: null,
       pct: 0,
-    });
+    }, sendAlert);
+
     expect(logger.warn).not.toHaveBeenCalled();
+    expect(sendAlert).not.toHaveBeenCalled();
   });
 
-  it('logs once at >=80% and is deduped via Redis SETNX for the rest of the month', async () => {
+  it('sends to each notify_to(messaging) recipient with kind=notification, critical=true and a monthly client_ref', async () => {
+    const sql = makeFakeAlertSql(['ops@palmadev.test', 'billing@palmadev.test'], 'alerts@palmadev.test');
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
-    const result = { allowed: true, spent_usd: 8.5, cap_usd: 10, pct: 0.85 };
+    const sendAlert = makeFakeSendAlert();
 
-    await maybeAlert(redis, logger, 'whatsapp', 'marketing', result);
-    await maybeAlert(redis, logger, 'whatsapp', 'marketing', result);
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
+
+    expect(sendAlert).toHaveBeenCalledTimes(2);
+    const calls = sendAlert.mock.calls.map((c) => c[0]);
+    expect(calls[0].to).toBe('ops@palmadev.test');
+    expect(calls[1].to).toBe('billing@palmadev.test');
+    for (const call of calls) {
+      expect(call.from).toBe('Alertas PalmaDev <alerts@palmadev.test>');
+      expect(call.subject).toContain('85%');
+      expect(call.clientRef).toMatch(/^budget-alert-\d{6}-whatsapp-marketing-/);
+    }
+  });
+
+  it('does not send when bot.notify_to(messaging) returns no recipients', async () => {
+    const sql = makeFakeAlertSql([], 'alerts@palmadev.test');
+    const redis = makeFakeRedis();
+    const logger = makeFakeLogger();
+    const sendAlert = makeFakeSendAlert();
+
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
+
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalled();
+  });
+
+  it('does not send when email_from is empty, and warns explicitly', async () => {
+    const sql = makeFakeAlertSql(['ops@palmadev.test'], null);
+    const redis = makeFakeRedis();
+    const logger = makeFakeLogger();
+    const sendAlert = makeFakeSendAlert();
+
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
+
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('email_from'),
+    );
+  });
+
+  it('does not propagate a sendAlert failure to the caller, and logs the rest of the recipients', async () => {
+    const sql = makeFakeAlertSql(['ops@palmadev.test', 'billing@palmadev.test'], 'alerts@palmadev.test');
+    const redis = makeFakeRedis();
+    const logger = makeFakeLogger();
+    const sendAlert = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('provider down'))
+      .mockResolvedValueOnce({ status: 'sent' });
+
+    await expect(
+      maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert),
+    ).resolves.toBeUndefined();
+
+    expect(sendAlert).toHaveBeenCalledTimes(2);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('logs once at >=80% and is deduped via Redis SETNX for the rest of the month (no second send)', async () => {
+    const sql = makeFakeAlertSql(['ops@palmadev.test'], 'alerts@palmadev.test');
+    const redis = makeFakeRedis();
+    const logger = makeFakeLogger();
+    const sendAlert = makeFakeSendAlert();
+
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
+    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
   });
 });

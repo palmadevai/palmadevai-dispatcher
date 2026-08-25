@@ -526,7 +526,18 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   // ── 6. Budget por canal × categoría ───────────────────────────────────────
   const category = await resolveCategory(deps.sql, deps.logger, msg);
   const budgetResult = await checkBudget(deps.sql, deps.redis, deps.logger, msg.channel, category);
-  await maybeAlert(deps.redis, deps.logger, msg.channel, category, budgetResult);
+  // H2.3 — el sender cierra el ciclo `sendMessage → checkBudget → maybeAlert →
+  // sendMessage` de vuelta: es una llamada recursiva a esta misma función, y
+  // el dedup SETNX de `maybeAlert` es lo que la corta (ver comentario ahí).
+  await maybeAlert(deps.sql, deps.redis, deps.logger, msg.channel, category, budgetResult, (recipient) =>
+    sendMessage(deps, {
+      channel: 'email',
+      to: recipient.to,
+      from: recipient.from,
+      content: { type: 'mail', subject: recipient.subject, text: recipient.text, html: recipient.html },
+      context: { feature: 'messaging', client_ref: recipient.clientRef, kind: 'notification', critical: true },
+    }),
+  );
 
   const criticalBypass = kind === 'notification' && msg.context.critical === true;
 

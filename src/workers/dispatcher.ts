@@ -47,6 +47,7 @@ import {
 import { assertProviderAvailable, ChannelNotImplementedError, type ProviderSendResult } from '../providers/index.js';
 import { getProviderForChannel } from '../ports/channel-provider.js';
 import { checkBudget, maybeAlert } from '../core/budget.js';
+import { sendMessage } from '../core/messaging.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
@@ -399,7 +400,38 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           ctx.delivery.channel,
           ctx.template.category,
         );
-        await maybeAlert(rawRedis, logger, ctx.delivery.channel, ctx.template.category, budgetResult);
+        // `sql` acá es `pgPool` (el handle global de `lib/postgres.js`), NO
+        // `tx` — la alerta no puede correr ni fallar dentro de la transacción
+        // de este delivery (ver el comentario del propio `maybeAlert`).
+        await maybeAlert(
+          pgPool,
+          rawRedis,
+          logger,
+          ctx.delivery.channel,
+          ctx.template.category,
+          budgetResult,
+          (recipient) =>
+            sendMessage(
+              {
+                sql: pgPool,
+                redis: rawRedis,
+                logger,
+                // Sólo se manda `email` acá: la allowlist de teléfonos y el
+                // resolver de phone_number_id no aplican a esta notificación
+                // y quedan en su valor neutro (nunca se consultan para email).
+                staffAllowlist: [],
+                resolveDefaultPhoneNumberId: async () => null,
+                defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+              },
+              {
+                channel: 'email',
+                to: recipient.to,
+                from: recipient.from,
+                content: { type: 'mail', subject: recipient.subject, text: recipient.text, html: recipient.html },
+                context: { feature: 'messaging', client_ref: recipient.clientRef, kind: 'notification', critical: true },
+              },
+            ),
+        );
         if (!budgetResult.allowed) {
           await markDeliveryTerminal(tx, deliveryId, queuedAt, {
             error_code: 'budget_exceeded',

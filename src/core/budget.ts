@@ -282,21 +282,99 @@ export async function recordSendUsage(redis: Redis, logger: Logger, channel: str
 }
 
 /**
+ * Un destinatario de la alerta, ya resuelto (a quién, con qué remitente). El
+ * cuerpo (subject/text/html) y el `client_ref` los arma `maybeAlert` — acá
+ * sólo entra el destino y el remitente porque son los dos únicos datos que
+ * dependen de la DB.
+ */
+export interface BudgetAlertRecipient {
+  to: string;
+  from: string;
+  subject: string;
+  text: string;
+  html: string;
+  clientRef: string;
+}
+
+/**
+ * Inyectado por el caller (H2.3): manda un email de la alerta y NUNCA tira —
+ * este archivo es domain-pure (sin Fastify, sin `postgres.js` en el
+ * `sendMessage` real) y no puede importar `core/messaging.ts` sin crear un
+ * ciclo (`messaging.ts` importa `maybeAlert` de acá). El caller cierra el
+ * ciclo pasando `(recipient) => sendMessage(deps, {...})`.
+ */
+export type BudgetAlertSender = (recipient: BudgetAlertRecipient) => Promise<{ status: string }>;
+
+function monthKeyCompact(now = new Date()): string {
+  return monthKey(now).replace('-', '');
+}
+
+/**
+ * Destinatarios + remitente de la alerta, en una sola consulta.
+ *
+ * Destinatarios: `bot.notify_to('messaging')` (mig apps `_platform/158`) —
+ * NUNCA `bot.config['branding'].admin_email` directo (R14): esa función ya
+ * encadena notify_to[messaging] → branding.admin_email → `{}`, así que leer
+ * branding acá duplicaría la cadena y la dejaría desincronizada si mañana
+ * cambia. Vacío = "el cliente no quiere este aviso", no un error.
+ *
+ * Remitente: `bot.config['branding'].email_from`, directo — no hay una
+ * función equivalente para esto y es la misma fuente que usan los emisores
+ * migrados (T9.4/T9.5).
+ */
+async function resolveAlertRecipients(
+  sql: SqlOrTx,
+  logger: Logger,
+): Promise<{ recipients: string[]; emailFrom: string | null }> {
+  try {
+    const rows = await sql<Array<{ recipients: string[] | null; email_from: string | null }>>`
+      SELECT
+        bot.notify_to('messaging') AS recipients,
+        (SELECT value->>'email_from' FROM bot.config WHERE key = 'branding') AS email_from
+    `;
+    return {
+      recipients: rows[0]?.recipients ?? [],
+      emailFrom: rows[0]?.email_from?.trim() || null,
+    };
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'budget alert: notify_to()/branding.email_from lookup failed — not sending (fail-closed, same criteria as the guards)',
+    );
+    return { recipients: [], emailFrom: null };
+  }
+}
+
+/**
  * 80%-of-cap alert, deduped once per month per channel × category via Redis
  * SETNX. No-op if there's no cap or pct < 0.8.
  *
- * TODO(H2.3): this only logs a warn today. Once the 4 staff-notification
- * workflows migrate off direct Graph calls onto `POST /send`
- * (`send_internal_notification` semantics — kind='notification'), wire this
- * to actually call `/send` against the staff allowlist instead of just
- * logging. Documented as a known gap, not a silent omission.
+ * H2.3 — ya no sólo loguea: manda una notificación real vía `sendMessage`
+ * (`kind: 'notification'`, `critical: true`) a cada destinatario de
+ * `bot.notify_to('messaging')`. `critical: true` es necesario porque, si no,
+ * la propia alerta de presupuesto podría quedar bloqueada por el presupuesto
+ * que está avisando — el bypass es puntual para este emisor, no general.
+ *
+ * Recursión esperada: este envío pasa de nuevo por `sendMessage` →
+ * `checkBudget` → `maybeAlert`. El SETNX de esta misma celda (channel ×
+ * category) ya está seteado cuando se llega acá, así que la re-entrada corta
+ * en el `if (!firstTimeThisMonth) return` de arriba. Si el envío tocara OTRA
+ * celda channel×category (no debería: la notificación es siempre
+ * `email`/`service` en la práctica), el dedup mensual de ESA celda manda.
+ *
+ * `sql` tiene que ser el handle global/no-transaccional del caller — nunca
+ * una `tx` de delivery en curso (el call-site de `workers/dispatcher.ts` la
+ * tiene disponible y NO debe pasarla: la alerta no puede demorar ni fallar el
+ * commit de un envío).
  */
 export async function maybeAlert(
+  sql: SqlOrTx,
   redis: Redis,
   logger: Logger,
   channel: string,
   category: string,
   result: BudgetCheckResult,
+  sendAlert: BudgetAlertSender,
 ): Promise<void> {
   if (result.cap_usd === null || result.pct < 0.8) return;
 
@@ -320,6 +398,77 @@ export async function maybeAlert(
       cap_usd: result.cap_usd,
       pct: result.pct,
     },
-    'messaging budget at/above 80% of monthly cap — TODO(H2.3): notify staff via send_internal_notification, today this log line is the only alert',
+    'messaging budget at/above 80% of monthly cap — notifying staff via send_internal_notification',
   );
+
+  // Envío best-effort: un fallo acá NUNCA debe volver a los dos call-sites
+  // (`/send` en curso, o una transacción de delivery). Se loguea fuerte y se
+  // sigue — la alerta es una conveniencia operativa, no parte del envío que
+  // la disparó.
+  try {
+    const { recipients, emailFrom } = await resolveAlertRecipients(sql, logger);
+    if (recipients.length === 0) {
+      logger.info(
+        { channel, category },
+        'budget alert: bot.notify_to(messaging) returned no recipients — not sending (client opted out of this alert)',
+      );
+      return;
+    }
+    if (!emailFrom) {
+      logger.warn(
+        { channel, category },
+        "budget alert: bot.config['branding'].email_from is empty — not sending without a verified sender",
+      );
+      return;
+    }
+
+    const month = monthKeyCompact();
+    const pctLabel = Math.round(result.pct * 100);
+    const subject = `⚠️ Presupuesto de mensajería al ${pctLabel}% (${channel}/${category})`;
+    const text =
+      `El gasto de mensajería de ${channel}/${category} llegó al ${pctLabel}% del tope mensual.\n\n` +
+      `Gastado: USD ${result.spent_usd}\n` +
+      `Tope: USD ${result.cap_usd}\n` +
+      `Mes: ${month}\n`;
+    const html =
+      `<p>El gasto de mensajería de <b>${channel}/${category}</b> llegó al <b>${pctLabel}%</b> del tope mensual.</p>` +
+      `<ul>` +
+      `<li>Gastado: USD ${result.spent_usd}</li>` +
+      `<li>Tope: USD ${result.cap_usd}</li>` +
+      `<li>Mes: ${month}</li>` +
+      `</ul>`;
+
+    for (const to of recipients) {
+      try {
+        const outcome = await sendAlert({
+          to,
+          from: `Alertas PalmaDev <${emailFrom}>`,
+          subject,
+          text,
+          html,
+          // Mes + destino: idempotencia de 24h por destinatario (misma clave
+          // (`client_ref`, to) que usa `sendMessage`) — un reintento del
+          // mismo tick no duplica el mail, y otro destinatario de la misma
+          // celda sí recibe el suyo.
+          clientRef: `budget-alert-${month}-${channel}-${category}-${to}`,
+        });
+        if (outcome.status !== 'sent' && outcome.status !== 'duplicate') {
+          logger.error(
+            { channel, category, outcome },
+            'budget alert: sendAlert rejected/failed for a recipient — continuing with the rest',
+          );
+        }
+      } catch (err) {
+        logger.error(
+          { err: (err as Error).message, channel, category },
+          'budget alert: sendAlert threw for a recipient — continuing with the rest',
+        );
+      }
+    }
+  } catch (err) {
+    logger.error(
+      { err: (err as Error).message, channel, category },
+      'budget alert: unexpected failure composing/sending the notification — not propagating to the caller',
+    );
+  }
 }
