@@ -33,6 +33,7 @@ import type { Logger } from '../lib/logger.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
 import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
 import { moveToDLQ } from './dlq.js';
+import type { NotifyDeps } from '../core/notify.js';
 
 const RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
 const STALE_MS = 5 * 60 * 1000;
@@ -42,10 +43,12 @@ export interface RecoveryDeps {
   rawRedis: Redis;
   sql: Sql;
   logger: Logger;
+  /** F7.5 — el DLQ avisa del auto-pause por calidad; la mecánica va inyectada. */
+  notify: NotifyDeps;
 }
 
 export function startRecovery(deps: RecoveryDeps): NodeJS.Timeout {
-  const { logger, rawRedis, sql } = deps;
+  const { logger, rawRedis, sql, notify: notifyDeps } = deps;
 
   logger.info(
     {
@@ -58,7 +61,7 @@ export function startRecovery(deps: RecoveryDeps): NodeJS.Timeout {
 
   const tick = async (): Promise<void> => {
     try {
-      await recoverStalled(rawRedis, sql, logger);
+      await recoverStalled(rawRedis, sql, logger, notifyDeps);
     } catch (err) {
       logger.error({ err: (err as Error).message }, 'recovery tick failed');
     }
@@ -76,7 +79,12 @@ export function startRecovery(deps: RecoveryDeps): NodeJS.Timeout {
   return handle;
 }
 
-async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promise<void> {
+async function recoverStalled(
+  rawRedis: Redis,
+  sql: Sql,
+  logger: Logger,
+  notifyDeps: NotifyDeps,
+): Promise<void> {
   // ── 1. PEL recovery: XCLAIM stale entries (IDLE > 5min) ───────────────────
   try {
     const pending = (await rawRedis.call(
@@ -223,7 +231,7 @@ async function recoverStalled(rawRedis: Redis, sql: Sql, logger: Logger): Promis
 
           const updatedRow = updated[0];
           if (updatedRow) {
-            await moveToDLQ(sql, logger, {
+            await moveToDLQ(sql, logger, notifyDeps, {
               deliveryId,
               queuedAt: updatedRow.queued_at,
               campaignId: updatedRow.campaign_id,

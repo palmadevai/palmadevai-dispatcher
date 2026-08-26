@@ -8,6 +8,10 @@
  *   POST /send          — Messaging Service H2.1 (bajo volumen, sincrónico).
  *                         Auth: Bearer DISPATCHER_SEND_BEARER. Ver
  *                         `transports/http/send-route.ts`.
+ *   POST /notify        — Avisos declarados (F7.5). Mismo bearer que /send.
+ *                         El emisor manda QUÉ PASÓ; destinatarios, remitente,
+ *                         fan-out y ref los pone el servicio. Ver
+ *                         `transports/http/notify-route.ts`.
  *   /management/*       — Messaging Service F3 (templates/endpoints/quality).
  *                         Mismo bearer que /send. Ver
  *                         `transports/http/management-routes.ts`.
@@ -30,12 +34,13 @@ import type { Logger } from './lib/logger.js';
 import type { SqlClient } from './lib/postgres.js';
 import type { MetricsCollector } from './observability/metrics-collector.js';
 import { registerSendRoute } from './transports/http/send-route.js';
+import { registerNotifyRoute } from './transports/http/notify-route.js';
 import { registerMarkReadRoute } from './transports/http/mark-read-route.js';
 import { registerManagementRoutes } from './transports/http/management-routes.js';
 import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
-import { normalizeAllowlist } from './lib/phone.js';
-import { readChannelWhatsAppConfig } from './lib/providers.js';
+import type { SendDeps } from './core/messaging.js';
+import type { NotifyDeps } from './core/notify.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
@@ -43,8 +48,17 @@ export interface ServerDeps {
   sql: SqlClient;
   logger: Logger;
   metricsCollector: MetricsCollector;
-  /** F3 — deps del core de management (Graph adapter + email inyectados). */
+  /** F3 — deps del core de management (Graph adapter + avisos inyectados). */
   managementCore: ManagementDeps;
+  /**
+   * Armado en `index.ts` y compartido: /send, las tools MCP de envío y el
+   * `send` de los avisos usan LA MISMA instancia. Estaba duplicado acá dos
+   * veces (ruta + MCP), que es la forma de que dos caminos de envío del mismo
+   * servicio diverjan sin que nadie lo note.
+   */
+  sendDeps: SendDeps;
+  /** F7.5 — la mecánica de los avisos, compartida con los emisores propios. */
+  notifyDeps: NotifyDeps;
 }
 
 const HEALTHCHECK_PING_TIMEOUT_MS = 2000;
@@ -81,6 +95,7 @@ const startTimestamp = Date.now();
 
 export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
   const { logger, bullmqConnection, rawRedis, sql, metricsCollector, managementCore } = deps;
+  const { sendDeps, notifyDeps } = deps;
 
   // Fastify 5 acepta un logger instance pre-built via la opción `loggerInstance`.
   // El cast a `any` evita el generic mismatch entre nuestros logger types y
@@ -113,33 +128,6 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     return reply.code(healthy ? 200 : 503).send(body);
   });
 
-  // Allowlist de notificaciones a staff. Se carga a mano en el `.env`, así que
-  // acá se normaliza a E.164 y se AVISA de lo que no normaliza: un valor que no
-  // normaliza no va a matchear nunca, y dejarlo pasar en silencio es prometer
-  // una autorización que no existe. La comparación vuelve a normalizar del lado
-  // de `sendMessage` (el MCP arma su propio `deps`).
-  const staffAllowlistRaw = env.STAFF_NOTIFY_ALLOWLIST.split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  {
-    const { allowed, invalid } = normalizeAllowlist(staffAllowlistRaw);
-    if (invalid.length > 0) {
-      logger.warn(
-        { invalid_count: invalid.length, valid_count: allowed.length },
-        'STAFF_NOTIFY_ALLOWLIST: hay valores que no son un teléfono E.164 — nunca van a matchear',
-      );
-    }
-  }
-
-  // Resolver inyectado (no un valor estático baked al boot): DB
-  // `bot.config['channel_whatsapp'].default_phone_number_id` → env
-  // `META_WA_DEFAULT_PHONE_NUMBER_ID`, cacheado 30 s en `lib/providers.ts`.
-  // Compartido por /send, /mark-read y las tools MCP de envío — el cockpit
-  // puede cargar el teléfono default sin redeploy y los tres lo ven en el
-  // próximo tick del cache.
-  const resolveDefaultPhoneNumberId = async (): Promise<string | null> =>
-    (await readChannelWhatsAppConfig()).defaultPhoneNumberId;
-
   // ── /send (Messaging Service H2.1) ──────────────────────────────────────
   registerSendRoute(app, {
     sql,
@@ -147,16 +135,19 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     logger,
     metricsCollector,
     sendBearer: env.DISPATCHER_SEND_BEARER,
-    staffAllowlist: staffAllowlistRaw,
-    resolveDefaultPhoneNumberId,
-    defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+    staffAllowlist: sendDeps.staffAllowlist,
+    resolveDefaultPhoneNumberId: sendDeps.resolveDefaultPhoneNumberId,
+    defaultFromEmail: sendDeps.defaultFromEmail,
   });
+
+  // ── /notify (F7.5) ──────────────────────────────────────────────────────
+  registerNotifyRoute(app, { ...notifyDeps, sendBearer: env.DISPATCHER_SEND_BEARER });
 
   // ── /mark-read (R8: el último Graph que quedaba fuera del dispatcher) ───
   registerMarkReadRoute(app, {
     logger,
     sendBearer: env.DISPATCHER_SEND_BEARER,
-    resolveDefaultPhoneNumberId,
+    resolveDefaultPhoneNumberId: sendDeps.resolveDefaultPhoneNumberId,
   });
 
   // ── /management/* (Messaging Service F3) ────────────────────────────────
@@ -175,15 +166,7 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     tools: {
       reads: { sql, redis: rawRedis, logger },
       management: managementCore,
-      send: {
-        sql,
-        redis: rawRedis,
-        logger,
-        metrics: metricsCollector,
-        staffAllowlist: staffAllowlistRaw,
-        resolveDefaultPhoneNumberId,
-        defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
-      },
+      send: sendDeps,
     },
     bearers: {
       read: env.MESSAGING_MCP_BEARER,

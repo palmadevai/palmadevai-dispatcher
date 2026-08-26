@@ -50,6 +50,7 @@ import { checkBudget, maybeAlert } from '../core/budget.js';
 import { sendMessage } from '../core/messaging.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
 import { moveToDLQ } from './dlq.js';
+import { notify, type NotifyDeps } from '../core/notify.js';
 import { resolveAiBindings } from '../lib/ai-personalize.js';
 import { parseQueuedAt } from '../lib/parse-queued-at.js';
 import { sql as pgPool } from '../lib/postgres.js';
@@ -59,6 +60,8 @@ export interface DispatcherDeps {
   sql: Sql;
   logger: Logger;
   metricsCollector: MetricsCollector;
+  /** F7.5 — la mecánica de los avisos (auto-pause del DLQ, alerta de tope). */
+  notify: NotifyDeps;
 }
 
 export interface DispatcherHandle {
@@ -410,27 +413,17 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
           ctx.delivery.channel,
           ctx.template.category,
           budgetResult,
-          (recipient) =>
-            sendMessage(
-              {
-                sql: pgPool,
-                redis: rawRedis,
-                logger,
-                // Sólo se manda `email` acá: la allowlist de teléfonos y el
-                // resolver de phone_number_id no aplican a esta notificación
-                // y quedan en su valor neutro (nunca se consultan para email).
-                staffAllowlist: [],
-                resolveDefaultPhoneNumberId: async () => null,
-                defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
-              },
-              {
-                channel: 'email',
-                to: recipient.to,
-                from: recipient.from,
-                content: { type: 'mail', subject: recipient.subject, text: recipient.text, html: recipient.html },
-                context: { feature: 'messaging', client_ref: recipient.clientRef, kind: 'notification', critical: true },
-              },
-            ),
+          // F7.5 — el aviso sale por la MISMA mecánica que los otros dos
+          // emisores. Antes se armaba un `SendDeps` ad-hoc acá, con la
+          // allowlist vacía y el resolver de teléfono en `null` "porque para
+          // email no se consultan": una cuarta copia de las decisiones de
+          // envío, con sus propios valores neutros que había que justificar.
+          async (req) => {
+            const outcome = await notify(deps.notify, req);
+            return outcome.status === 'undeclared'
+              ? { status: 'undeclared', blocked_reason: outcome.detail }
+              : { status: 'ok', blocked_reason: outcome.blocked_reason };
+          },
         );
         if (!budgetResult.allowed) {
           await markDeliveryTerminal(tx, deliveryId, queuedAt, {
@@ -592,7 +585,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
     const carry = carryBox.value;
     if (carry?.kind === 'terminal') {
       try {
-        await moveToDLQ(sql, logger, {
+        await moveToDLQ(sql, logger, deps.notify, {
           deliveryId,
           queuedAt,
           campaignId: carry.campaignId,
@@ -743,7 +736,7 @@ export function startDispatcher(deps: DispatcherDeps): DispatcherHandle {
       `;
       const updatedRow = updated[0];
       if (updatedRow) {
-        await moveToDLQ(sql, logger, {
+        await moveToDLQ(sql, logger, deps.notify, {
           deliveryId,
           queuedAt,
           campaignId: updatedRow.campaign_id,

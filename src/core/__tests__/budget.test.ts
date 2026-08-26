@@ -129,22 +129,19 @@ describe('recordSendUsage', () => {
 });
 
 describe('maybeAlert', () => {
-  // Cada test arma su propio fake `sql` (resuelve `notify_to`/`email_from`)
-  // y su propio `sendAlert` mock — el shape que devuelve `resolveAlertRecipients`
-  // internamente no está exportado, así que se mockea vía el `sql` fake, igual
-  // que `checkBudget` arriba.
-  function makeFakeAlertSql(recipients: string[] | null, emailFrom: string | null): Sql {
-    return (async () => [{ recipients, email_from: emailFrom }]) as unknown as Sql;
-  }
+  // F7.5 — `maybeAlert` ya NO resuelve destinatarios ni fan-outea: le pasa a
+  // `sendAlert` (que el caller cierra contra `notify()`) el aviso declarado y
+  // nada más. Por eso el `sql` fake acá quedó sin uso real: la resolución se
+  // testea en `notify.test.ts`, que es donde vive.
+  const sql = (async () => []) as unknown as Sql;
 
   function makeFakeSendAlert() {
-    return vi.fn(async () => ({ status: 'sent' }));
+    return vi.fn(async () => ({ status: 'ok', blocked_reason: null }));
   }
 
   const RESULT_80PCT = { allowed: true, spent_usd: 8.5, cap_usd: 10, pct: 0.85 };
 
   it('does nothing when there is no cap configured', async () => {
-    const sql = makeFakeAlertSql(['ops@palmadev.test'], 'alerts@palmadev.test');
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
     const sendAlert = makeFakeSendAlert();
@@ -160,71 +157,56 @@ describe('maybeAlert', () => {
     expect(sendAlert).not.toHaveBeenCalled();
   });
 
-  it('sends to each notify_to(messaging) recipient with kind=notification, critical=true and a monthly client_ref', async () => {
-    const sql = makeFakeAlertSql(['ops@palmadev.test', 'billing@palmadev.test'], 'alerts@palmadev.test');
+  it('emits ONE declared aviso (messaging/budget-80) con critical y origin_ref por mes × celda', async () => {
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
     const sendAlert = makeFakeSendAlert();
 
     await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
 
-    expect(sendAlert).toHaveBeenCalledTimes(2);
-    const calls = sendAlert.mock.calls.map((c) => c[0]);
-    expect(calls[0].to).toBe('ops@palmadev.test');
-    expect(calls[1].to).toBe('billing@palmadev.test');
-    for (const call of calls) {
-      expect(call.from).toBe('Alertas PalmaDev <alerts@palmadev.test>');
-      expect(call.subject).toContain('85%');
-      expect(call.clientRef).toMatch(/^budget-alert-\d{6}-whatsapp-marketing-/);
-    }
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    const req = sendAlert.mock.calls[0][0];
+    expect(req.feature).toBe('messaging');
+    expect(req.aviso).toBe('budget-80');
+    expect(req.subject).toContain('85%');
+    // El bypass del tope es puntual de este emisor: la alerta del presupuesto
+    // no puede quedar bloqueada por el presupuesto que está avisando.
+    expect(req.critical).toBe(true);
+    // Mes + celda, SIN destinatario: dos meses o dos canales son dos avisos
+    // distintos, y el destino es parte de la clave de idempotencia aparte.
+    expect(req.origin_ref).toMatch(/^\d{6}-whatsapp-marketing$/);
+    expect(req.origin_ref).not.toContain('@');
   });
 
-  it('does not send when bot.notify_to(messaging) returns no recipients', async () => {
-    const sql = makeFakeAlertSql([], 'alerts@palmadev.test');
+  it('loguea el motivo cuando el servicio devuelve el aviso bloqueado (sin destinatarios o sin remitente)', async () => {
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
-    const sendAlert = makeFakeSendAlert();
+    const sendAlert = vi.fn(async () => ({
+      status: 'ok',
+      blocked_reason: 'sin destinatarios (notify_to vacío y branding.admin_email sin cargar)',
+    }));
 
     await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
 
-    expect(sendAlert).not.toHaveBeenCalled();
-    expect(logger.info).toHaveBeenCalled();
-  });
-
-  it('does not send when email_from is empty, and warns explicitly', async () => {
-    const sql = makeFakeAlertSql(['ops@palmadev.test'], null);
-    const redis = makeFakeRedis();
-    const logger = makeFakeLogger();
-    const sendAlert = makeFakeSendAlert();
-
-    await maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert);
-
-    expect(sendAlert).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining('email_from'),
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: expect.stringContaining('destinatarios') }),
+      expect.any(String),
     );
   });
 
-  it('does not propagate a sendAlert failure to the caller, and logs the rest of the recipients', async () => {
-    const sql = makeFakeAlertSql(['ops@palmadev.test', 'billing@palmadev.test'], 'alerts@palmadev.test');
+  it('does not propagate a sendAlert failure to the caller', async () => {
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
-    const sendAlert = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('provider down'))
-      .mockResolvedValueOnce({ status: 'sent' });
+    const sendAlert = vi.fn().mockRejectedValueOnce(new Error('provider down'));
 
     await expect(
       maybeAlert(sql, redis, logger, 'whatsapp', 'marketing', RESULT_80PCT, sendAlert),
     ).resolves.toBeUndefined();
 
-    expect(sendAlert).toHaveBeenCalledTimes(2);
     expect(logger.error).toHaveBeenCalled();
   });
 
   it('logs once at >=80% and is deduped via Redis SETNX for the rest of the month (no second send)', async () => {
-    const sql = makeFakeAlertSql(['ops@palmadev.test'], 'alerts@palmadev.test');
     const redis = makeFakeRedis();
     const logger = makeFakeLogger();
     const sendAlert = makeFakeSendAlert();

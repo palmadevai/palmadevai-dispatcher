@@ -282,67 +282,28 @@ export async function recordSendUsage(redis: Redis, logger: Logger, channel: str
 }
 
 /**
- * Un destinatario de la alerta, ya resuelto (a quién, con qué remitente). El
- * cuerpo (subject/text/html) y el `client_ref` los arma `maybeAlert` — acá
- * sólo entra el destino y el remitente porque son los dos únicos datos que
- * dependen de la DB.
+ * Inyectado por el caller (H2.3, reescrito en F7.5): manda el aviso y NUNCA
+ * tira. Sigue inyectado —y no importado— porque este archivo no puede importar
+ * `core/notify.ts` sin cerrar el ciclo `budget → notify → messaging → budget`
+ * (`messaging.ts` importa `maybeAlert` de acá). El caller lo cierra pasando
+ * `(req) => notify(notifyDeps, req)`.
+ *
+ * ⚠ Lo que este tipo YA NO lleva: `to`, `from` y `clientRef`. Los tres los
+ * resolvía `maybeAlert` con su propia query a `bot.notify_to`/`branding` — la
+ * cuarta copia de la misma mecánica. Ahora este archivo sólo dice QUÉ PASÓ.
  */
-export interface BudgetAlertRecipient {
-  to: string;
-  from: string;
+export type BudgetAlertSender = (req: {
+  feature: string;
+  aviso: string;
   subject: string;
   text: string;
   html: string;
-  clientRef: string;
-}
-
-/**
- * Inyectado por el caller (H2.3): manda un email de la alerta y NUNCA tira —
- * este archivo es domain-pure (sin Fastify, sin `postgres.js` en el
- * `sendMessage` real) y no puede importar `core/messaging.ts` sin crear un
- * ciclo (`messaging.ts` importa `maybeAlert` de acá). El caller cierra el
- * ciclo pasando `(recipient) => sendMessage(deps, {...})`.
- */
-export type BudgetAlertSender = (recipient: BudgetAlertRecipient) => Promise<{ status: string }>;
+  critical: boolean;
+  origin_ref: string;
+}) => Promise<{ status: string; blocked_reason?: string | null }>;
 
 function monthKeyCompact(now = new Date()): string {
   return monthKey(now).replace('-', '');
-}
-
-/**
- * Destinatarios + remitente de la alerta, en una sola consulta.
- *
- * Destinatarios: `bot.notify_to('messaging')` (mig apps `_platform/158`) —
- * NUNCA `bot.config['branding'].admin_email` directo (R14): esa función ya
- * encadena notify_to[messaging] → branding.admin_email → `{}`, así que leer
- * branding acá duplicaría la cadena y la dejaría desincronizada si mañana
- * cambia. Vacío = "el cliente no quiere este aviso", no un error.
- *
- * Remitente: `bot.config['branding'].email_from`, directo — no hay una
- * función equivalente para esto y es la misma fuente que usan los emisores
- * migrados (T9.4/T9.5).
- */
-async function resolveAlertRecipients(
-  sql: SqlOrTx,
-  logger: Logger,
-): Promise<{ recipients: string[]; emailFrom: string | null }> {
-  try {
-    const rows = await sql<Array<{ recipients: string[] | null; email_from: string | null }>>`
-      SELECT
-        bot.notify_to('messaging') AS recipients,
-        (SELECT value->>'email_from' FROM bot.config WHERE key = 'branding') AS email_from
-    `;
-    return {
-      recipients: rows[0]?.recipients ?? [],
-      emailFrom: rows[0]?.email_from?.trim() || null,
-    };
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'budget alert: notify_to()/branding.email_from lookup failed — not sending (fail-closed, same criteria as the guards)',
-    );
-    return { recipients: [], emailFrom: null };
-  }
 }
 
 /**
@@ -406,64 +367,37 @@ export async function maybeAlert(
   // sigue — la alerta es una conveniencia operativa, no parte del envío que
   // la disparó.
   try {
-    const { recipients, emailFrom } = await resolveAlertRecipients(sql, logger);
-    if (recipients.length === 0) {
-      logger.info(
-        { channel, category },
-        'budget alert: bot.notify_to(messaging) returned no recipients — not sending (client opted out of this alert)',
-      );
-      return;
-    }
-    if (!emailFrom) {
-      logger.warn(
-        { channel, category },
-        "budget alert: bot.config['branding'].email_from is empty — not sending without a verified sender",
-      );
-      return;
-    }
-
     const month = monthKeyCompact();
     const pctLabel = Math.round(result.pct * 100);
-    const subject = `⚠️ Presupuesto de mensajería al ${pctLabel}% (${channel}/${category})`;
-    const text =
-      `El gasto de mensajería de ${channel}/${category} llegó al ${pctLabel}% del tope mensual.\n\n` +
-      `Gastado: USD ${result.spent_usd}\n` +
-      `Tope: USD ${result.cap_usd}\n` +
-      `Mes: ${month}\n`;
-    const html =
-      `<p>El gasto de mensajería de <b>${channel}/${category}</b> llegó al <b>${pctLabel}%</b> del tope mensual.</p>` +
-      `<ul>` +
-      `<li>Gastado: USD ${result.spent_usd}</li>` +
-      `<li>Tope: USD ${result.cap_usd}</li>` +
-      `<li>Mes: ${month}</li>` +
-      `</ul>`;
-
-    for (const to of recipients) {
-      try {
-        const outcome = await sendAlert({
-          to,
-          from: `Alertas PalmaDev <${emailFrom}>`,
-          subject,
-          text,
-          html,
-          // Mes + destino: idempotencia de 24h por destinatario (misma clave
-          // (`client_ref`, to) que usa `sendMessage`) — un reintento del
-          // mismo tick no duplica el mail, y otro destinatario de la misma
-          // celda sí recibe el suyo.
-          clientRef: `budget-alert-${month}-${channel}-${category}-${to}`,
-        });
-        if (outcome.status !== 'sent' && outcome.status !== 'duplicate') {
-          logger.error(
-            { channel, category, outcome },
-            'budget alert: sendAlert rejected/failed for a recipient — continuing with the rest',
-          );
-        }
-      } catch (err) {
-        logger.error(
-          { err: (err as Error).message, channel, category },
-          'budget alert: sendAlert threw for a recipient — continuing with the rest',
-        );
-      }
+    const outcome = await sendAlert({
+      feature: 'messaging',
+      aviso: 'budget-80',
+      subject: `⚠️ Presupuesto de mensajería al ${pctLabel}% (${channel}/${category})`,
+      text:
+        `El gasto de mensajería de ${channel}/${category} llegó al ${pctLabel}% del tope mensual.\n\n` +
+        `Gastado: USD ${result.spent_usd}\n` +
+        `Tope: USD ${result.cap_usd}\n` +
+        `Mes: ${month}\n`,
+      html:
+        `<p>El gasto de mensajería de <b>${channel}/${category}</b> llegó al <b>${pctLabel}%</b> del tope mensual.</p>` +
+        `<ul>` +
+        `<li>Gastado: USD ${result.spent_usd}</li>` +
+        `<li>Tope: USD ${result.cap_usd}</li>` +
+        `<li>Mes: ${month}</li>` +
+        `</ul>`,
+      // La alerta del presupuesto no puede quedar bloqueada por el presupuesto
+      // que está avisando. El bypass es puntual para este emisor, no general.
+      critical: true,
+      // Mes + celda: dos meses o dos canales son dos avisos distintos. El
+      // destinatario NO va acá — la idempotencia es (client_ref, destino) y la
+      // compone el servicio.
+      origin_ref: `${month}-${channel}-${category}`,
+    });
+    if (outcome.blocked_reason) {
+      logger.info(
+        { channel, category, reason: outcome.blocked_reason },
+        'budget alert: no se envía (el cliente no cargó destinatarios, o falta branding.email_from)',
+      );
     }
   } catch (err) {
     logger.error(

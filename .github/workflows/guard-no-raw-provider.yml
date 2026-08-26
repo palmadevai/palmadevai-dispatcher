@@ -1,0 +1,34 @@
+name: Messaging Service guard (sin provider crudo)
+
+# F7.5 — falla el PR si algún .ts de src/ importa una función de ENVÍO de
+# `providers/*` fuera del port. Todo envío pasa por `core/messaging.ts
+# sendMessage()`: ahí viven la idempotencia (client_ref, destino), la guarda de
+# destino, el opt-out, la ventana de 24h y el presupuesto.
+#
+# No es hipotético: los dos avisos de campañas mandaban por `sendEmail` directo
+# desde que existen, o sea sin idempotencia y **sin contarse en el presupuesto**
+# (gasto invisible). Lo destapó la migración a `POST /notify`.
+#
+# Hermano de `campaign-site/.github/workflows/guard-no-graph.yml`. Barato a
+# propósito: un script node sin `npm ci` — sin instalar dependencias, el run
+# entero es el checkout (ver handbook/docs/analysis-costo-ci-actions.md).
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'scripts/check-provider-direct.mjs'
+      - '.github/workflows/guard-no-raw-provider.yml'
+  push:
+    branches: [main]
+    paths: ['src/**']
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: node scripts/check-provider-direct.mjs

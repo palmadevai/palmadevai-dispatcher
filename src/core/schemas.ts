@@ -162,3 +162,32 @@ export const MarkReadSchema = z.object({
   phone_number_id: z.string().min(1).optional(),
 });
 export type MarkRead = z.infer<typeof MarkReadSchema>;
+
+/**
+ * `POST /notify` — un aviso declarado (F7.5).
+ *
+ * Lo que NO tiene es el punto: no hay `to`, no hay `from`, no hay `client_ref`
+ * y no hay `channel`. Los cuatro los resuelve el servicio, y son exactamente
+ * los cuatro campos donde cada copia de la mecánica se equivocó de una forma
+ * distinta. Un emisor no puede elegir mal algo que no puede escribir.
+ *
+ * `feature` + `aviso` no son etiquetas: el par tiene que existir en la
+ * declaración `notify_to:` del manifest de la feature (`config.features.bom`) o
+ * el pedido se rechaza con 422. La declaración deja de ser documentación.
+ */
+export const NotifyRequestSchema = z
+  .object({
+    feature: z.string().min(1),
+    aviso: z.string().min(1),
+    subject: z.string().min(1),
+    text: z.string().min(1).optional(),
+    html: z.string().min(1).optional(),
+    critical: z.boolean().optional(),
+    /** Ref del EVENTO (mes, campaña, id del hecho). Sin destinatario. */
+    origin_ref: z.string().min(1).optional(),
+  })
+  .refine((r) => Boolean(r.text || r.html), {
+    message: 'el aviso necesita `text` o `html` (o los dos)',
+    path: ['text'],
+  });
+export type NotifyRequestBody = z.infer<typeof NotifyRequestSchema>;

@@ -18,10 +18,8 @@
 import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import type { GraphManagement, GraphTemplate } from '../providers/whatsapp-management.js';
-import type { EmailSendInput } from '../providers/email.js';
-import type { ProviderSendResult } from '../providers/types.js';
 import { readChannelWhatsAppConfig } from '../lib/providers.js';
-import { resolveNotifyTarget, notifyBlockedReason } from './notify-to.js';
+import { notify, type NotifyDeps } from './notify.js';
 
 export interface ManagementDeps {
   sql: SqlClient;
@@ -29,8 +27,13 @@ export interface ManagementDeps {
   graph: GraphManagement;
   /** `env.COCKPIT_URL` — link target in the auto-pause alert email. */
   cockpitUrl?: string;
-  /** Resend adapter (`providers/email.ts sendEmail`) — alert is best-effort. */
-  sendEmail: (input: EmailSendInput) => Promise<ProviderSendResult>;
+  /**
+   * F7.5 tanda 0 — el aviso de auto-pause sale por `core/notify.ts`, no por el
+   * provider crudo. Reemplaza a `sendEmail`: acá no se arma más ni el
+   * destinatario, ni el remitente, ni el `client_ref`, ni el fan-out. El
+   * emisor dice qué pasó.
+   */
+  notify: NotifyDeps;
 }
 
 /**
@@ -375,30 +378,20 @@ async function upsertTemplate(
 }
 
 /**
- * Best-effort operator alert on auto-pause — same channel and copy as the
- * retired n8n cron: Resend email to `bot.config['branding'].admin_email`.
- * No admin_email configured → log + skip (never fails the sync).
+ * Aviso al operador del auto-pause. Un solo llamado: qué pasó.
+ *
+ * ⚠ Lo que ANTES vivía acá y ahora vive en `core/notify.ts`: la query de
+ * destinatarios, el remitente (que era `onboarding@resend.dev` HARDCODEADO —
+ * el sandbox de Resend, que entrega al DUEÑO DE LA CUENTA con un 200 limpio,
+ * o sea que esta alerta nunca le llegó a ningún cliente), el fan-out por
+ * destinatario, el `client_ref` con el destino pegado y la lectura del
+ * resultado. Cinco decisiones que este archivo ya no puede tomar mal.
+ *
+ * Best-effort sigue igual: `notify()` nunca tira, y un aviso que no sale no
+ * puede deshacer el auto-pause que lo disparó.
  */
 async function alertAutoPause(deps: ManagementDeps, events: TemplatePauseEvent[]): Promise<void> {
-  const { sql, logger } = deps;
-  // R1c / T4.5: destinatarios de la feature `campaigns`, con branding.admin_email
-  // de fallback y lista vacía = aviso apagado.
-  //
-  // ⚠ El remitente también cambia, y era un bug vivo: hasta acá era
-  // `onboarding@resend.dev` HARDCODEADO — el sandbox de Resend, que entrega al
-  // DUEÑO DE LA CUENTA con un 200 limpio. O sea que esta alerta no le llegaba al
-  // cliente y nada lo indicaba. Es el mismo defecto que T8.1 sacó de los seis
-  // workflows, sobreviviendo acá porque el inventario del plan miraba n8n y el
-  // cockpit. Ahora sale de `branding.email_from`, sin fallback.
-  const target = await resolveNotifyTarget(sql, logger, 'campaigns');
-  const blocked = notifyBlockedReason(target);
-  if (blocked) {
-    logger.warn(
-      { paused_templates: events.length, reason: blocked },
-      'template-sync auto-paused campaigns but the alert could not be sent',
-    );
-    return;
-  }
+  const { logger } = deps;
 
   const totalPaused = events.reduce((acc, e) => acc + e.campaignsPaused, 0);
   const cockpitLink = deps.cockpitUrl ? `${deps.cockpitUrl.replace(/\/$/, '')}/campaigns` : '';
@@ -417,32 +410,38 @@ async function alertAutoPause(deps: ManagementDeps, events: TemplatePauseEvent[]
     )
     .join(' ');
 
-  // Un envío POR DESTINATARIO, acumulando rechazos en vez de cortar en el
-  // primero: que a uno le rebote no es razón para que los otros no se enteren.
-  // El `biz_opaque_callback_data` lleva el destinatario para poder CORRELACIONAR
-  // qué evento del proveedor corresponde a qué persona: para email termina como
-  // un tag de Resend (`providers/email.ts`). ⚠ NO evita ninguna colisión de
-  // idempotencia —un tag no deduplica, y este camino ni siquiera pasa por
-  // `sendMessage`, que es donde vive la guarda—; la primera versión de este
-  // comentario decía eso y era falso.
-  for (const to of target.to) {
-    const result = await deps.sendEmail({
-      from: `Alertas PalmaDev <${target.from}>`,
-      to,
-      subject: `Template Meta bloqueante: ${totalPaused} campaña(s) pausada(s)`,
-      html:
-        htmlItems +
-        `<p>No se envían más mensajes de esas campañas hasta resolverlo.</p>` +
-        (cockpitLink ? `<p>Ver: ${cockpitLink}</p>` : ''),
-      text: `${textItems}${cockpitLink ? ` Ver: ${cockpitLink}` : ''}`,
-      biz_opaque_callback_data: `template-sync-alert-${events[0]?.templateDbId ?? 'unknown'}-${to}`,
-    });
-    if (!result.ok) {
-      logger.warn(
-        { to, error_code: result.error_code, error_message: result.error_message },
-        'template-sync: alert email returned non-ok (best-effort, continuing)',
-      );
-    }
+  const outcome = await notify(deps.notify, {
+    feature: 'campaigns',
+    aviso: 'template-auto-pause',
+    subject: `Template Meta bloqueante: ${totalPaused} campaña(s) pausada(s)`,
+    html:
+      htmlItems +
+      `<p>No se envían más mensajes de esas campañas hasta resolverlo.</p>` +
+      (cockpitLink ? `<p>Ver: ${cockpitLink}</p>` : ''),
+    text: `${textItems}${cockpitLink ? ` Ver: ${cockpitLink}` : ''}`,
+    // El template que disparó el pause: separa dos eventos distintos del mismo
+    // aviso. Sin esto, el segundo template bloqueante del día se deduplica
+    // contra el primero y nadie se entera.
+    origin_ref: events[0]?.templateDbId ?? 'unknown',
+    // Un aviso de «se pausaron campañas» no puede quedar mudo porque el tope de
+    // mensajería se llenó: hasta ahora salía por el provider crudo, sin pasar
+    // por el presupuesto, y perder el aviso al migrarlo sería una regresión
+    // silenciosa. Mismo criterio que `budget-80` (H2.3).
+    critical: true,
+  });
+
+  if (outcome.status === 'undeclared') {
+    logger.error(
+      { paused_templates: events.length, detail: outcome.detail },
+      'template-sync auto-paused campaigns but the alert is not declared by the feature',
+    );
+    return;
+  }
+  if (outcome.blocked_reason) {
+    logger.warn(
+      { paused_templates: events.length, reason: outcome.blocked_reason },
+      'template-sync auto-paused campaigns but the alert could not be sent',
+    );
   }
 }
 

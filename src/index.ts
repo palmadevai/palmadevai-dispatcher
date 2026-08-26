@@ -13,7 +13,6 @@ import { env } from './env.js';
 import { logger } from './lib/logger.js';
 import { bullmqConnection, rawRedis } from './lib/redis.js';
 import { sql } from './lib/postgres.js';
-import { createMetaApiClient } from './lib/meta-api.js';
 import { MetricsCollector } from './observability/metrics-collector.js';
 import { startDispatcher } from './workers/dispatcher.js';
 import { startRecovery } from './workers/recovery.js';
@@ -22,7 +21,10 @@ import { startCrmWebhookEmitter } from './workers/crm-webhook-emitter.js';
 import { startWakeupSubscriber } from './workers/wakeup-subscriber.js';
 import { startTemplateSync } from './workers/template-sync.js';
 import { graphManagement } from './providers/whatsapp-management.js';
-import { sendEmail } from './providers/email.js';
+import { sendMessage, type SendDeps } from './core/messaging.js';
+import type { NotifyDeps } from './core/notify.js';
+import { normalizeAllowlist } from './lib/phone.js';
+import { readChannelWhatsAppConfig } from './lib/providers.js';
 import type { ManagementDeps } from './core/management.js';
 import { startServer } from './server.js';
 
@@ -67,13 +69,55 @@ async function main(): Promise<void> {
   );
 
   const metricsCollector = new MetricsCollector();
-  // metaApi facade is preserved for non-hot-path callers and health/ping uses.
-  // The dispatcher hot path uses sendWhatsApp() directly.
-  const metaApi = createMetaApiClient(logger);
-  void metaApi;
 
   // 1. Asegurar stream + consumer group antes de levantar la lectura.
   await ensureStreamAndGroup();
+
+  // ── Envío y avisos, armados UNA vez ───────────────────────────────────────
+  // `sendDeps` estaba duplicado en `server.ts` (ruta /send + tools MCP). Se
+  // arma acá porque los avisos (`notifyDeps`) los necesitan tres consumidores
+  // que NO cuelgan del server: el template-sync, el DLQ y el recovery.
+  //
+  // La allowlist se normaliza sólo para AVISAR de lo que no normaliza: un valor
+  // que no es E.164 no va a matchear nunca, y dejarlo pasar en silencio es
+  // prometer una autorización que no existe. La comparación real vuelve a
+  // normalizar del lado de `sendMessage`.
+  const staffAllowlist = env.STAFF_NOTIFY_ALLOWLIST.split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+  {
+    const { allowed, invalid } = normalizeAllowlist(staffAllowlist);
+    if (invalid.length > 0) {
+      logger.warn(
+        { invalid_count: invalid.length, valid_count: allowed.length },
+        'STAFF_NOTIFY_ALLOWLIST: hay valores que no son un teléfono E.164 — nunca van a matchear',
+      );
+    }
+  }
+
+  // Resolver inyectado (no un valor baked al boot): DB
+  // `bot.config['channel_whatsapp'].default_phone_number_id` → env
+  // `META_WA_DEFAULT_PHONE_NUMBER_ID`, cacheado 30 s en `lib/providers.ts`. El
+  // cockpit puede cambiar el teléfono default sin redeploy.
+  const resolveDefaultPhoneNumberId = async (): Promise<string | null> =>
+    (await readChannelWhatsAppConfig()).defaultPhoneNumberId;
+
+  const sendDeps: SendDeps = {
+    sql,
+    redis: rawRedis,
+    logger,
+    metrics: metricsCollector,
+    staffAllowlist,
+    resolveDefaultPhoneNumberId,
+    defaultFromEmail: env.CAMPAIGNS_DEFAULT_FROM_EMAIL,
+  };
+
+  // F7.5 — la mecánica de los avisos, una sola instancia para todo el proceso.
+  const notifyDeps: NotifyDeps = {
+    sql,
+    logger,
+    send: (msg) => sendMessage(sendDeps, msg),
+  };
 
   // 2. Workers (real impl — F1.2.b).
   const dispatcherHandle = startDispatcher({
@@ -81,12 +125,14 @@ async function main(): Promise<void> {
     sql,
     logger,
     metricsCollector,
+    notify: notifyDeps,
   });
 
   const recoveryHandle = startRecovery({
     rawRedis,
     sql,
     logger,
+    notify: notifyDeps,
   });
 
   const metricsFlushHandle = startMetricsFlush({
@@ -118,7 +164,7 @@ async function main(): Promise<void> {
     logger,
     graph: graphManagement,
     cockpitUrl: env.COCKPIT_URL,
-    sendEmail,
+    notify: notifyDeps,
   };
 
   const templateSyncHandle = startTemplateSync(managementCore, {
@@ -134,6 +180,8 @@ async function main(): Promise<void> {
     logger,
     metricsCollector,
     managementCore,
+    sendDeps,
+    notifyDeps,
   });
 
   // bullmqConnection is still passed to the HTTP server because Bull Board
