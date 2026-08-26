@@ -47,7 +47,33 @@ permissions:
   packages: write
 
 jobs:
+  # 👤 2026-08-26 — EL CANDADO. Un `main` con la suite rota no produce imagen, y
+  # por lo tanto no llega al VPS (el deploy referencia `:latest`; si no hay
+  # imagen nueva, sigue sirviendo la anterior, que es el comportamiento correcto
+  # ante un main roto).
+  #
+  # Va acá y no en `tests.yml` porque GitHub no ofrece `required_status_checks`
+  # en repos privados del plan free: un check aparte se ve rojo pero no impide
+  # mergear. `needs:` es el único gate mecánico disponible en este plan — no
+  # depende de que alguien mire el PR.
+  #
+  # Corre el MISMO comando que `tests.yml`; no se comparte via `workflow_call`
+  # a propósito: la duplicación son 6 líneas, y acoplarlos haría que un cambio
+  # en el workflow del PR pueda romper el gate del deploy sin tocarlo.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   build-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

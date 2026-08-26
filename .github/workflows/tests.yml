@@ -1,0 +1,64 @@
+name: Tests (typecheck + vitest)
+
+# 👤 2026-08-26: "que los corra, necesarios para confirmar cualquier cambio".
+#
+# Hasta hoy este repo tenia 303 tests que NO corrian en CI: `build-image.yml`
+# solo buildea la imagen (`npm run build` = tsc), asi que la suite se ejecutaba
+# a mano o no se ejecutaba. Un PR podia mergear con tests rotos sin que nada lo
+# dijera.
+#
+# ⚠ ESTE JOB NO PUEDE BLOQUEAR UN MERGE POR SI SOLO. GitHub no ofrece
+# `required_status_checks` en repos privados del plan free (403 medido en los 4
+# repos de la org el 2026-08-26), asi que un PR en rojo se puede mergear igual.
+# Lo que hace este workflow es poner el resultado DELANTE de quien mergea, en el
+# momento en que decide.
+#
+# El gate mecanico de verdad esta en `build-image.yml`: su job `build-push`
+# declara `needs: test`, asi que un `main` con la suite rota NO produce imagen y
+# por lo tanto NO llega al VPS. Ese es el candado; esto es el aviso temprano.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.*'
+      - '.github/workflows/tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # node 22 = el mismo runtime que la imagen (Dockerfile: node:22-alpine).
+      # Testear en otra major seria probar algo que no es lo que corre.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # Los dos, y en este orden: `tsc` agarra lo que rompe el contrato de tipos
+      # y falla mas rapido que la suite. Sin `--if-present`: si el script
+      # desaparece, eso ES el problema.
+      - run: npm run typecheck
+      - run: npm test
