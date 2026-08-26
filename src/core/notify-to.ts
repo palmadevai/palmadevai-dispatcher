@@ -28,6 +28,17 @@ export interface NotifyTarget {
   to: string[];
   /** `bot.config['branding'].email_from`. Vacío = NO enviar. */
   from: string;
+  /**
+   * `bot.config['branding'].name` — el nombre visible del remitente.
+   *
+   * Viaja con el remitente y no es cosmética: los dos emisores firmaban
+   * «Alertas PalmaDev», un literal del LABORATORIO, así que en cada fork los
+   * avisos de ops del cliente salían firmados con el nombre de otra empresa
+   * desde su propio dominio. Es la misma clase de contaminación de template que
+   * el `onboarding@resend.dev` hardcodeado, sólo que en el nombre en vez de en
+   * la dirección. Vacío = se manda con la dirección pelada, que es correcto.
+   */
+  fromName: string;
 }
 
 /** Postgres: la función no existe todavía en esta base. */
@@ -61,41 +72,46 @@ export async function resolveNotifyTarget(
   logger: Logger,
   feature: string,
 ): Promise<NotifyTarget> {
-  const from = await resolveFrom(sql, logger);
+  const { from, fromName } = await resolveSender(sql, logger);
   try {
     const rows = await sql<Array<{ to: string[] | null }>>`
       SELECT bot.notify_to(${feature}) AS to
     `;
-    return { to: rows[0]?.to ?? [], from };
+    return { to: rows[0]?.to ?? [], from, fromName };
   } catch (err) {
     if (isUndefinedFunction(err)) {
       logger.warn(
         { feature },
         'bot.notify_to() no existe todavía (mig _platform/158 sin aplicar) — cayendo a branding.admin_email',
       );
-      return { to: await resolveAdminEmail(sql, logger), from };
+      return { to: await resolveAdminEmail(sql, logger), from, fromName };
     }
     logger.warn(
       { err: (err as Error).message, feature },
       'notify_to lookup failed — el aviso no se envía',
     );
-    return { to: [], from };
+    return { to: [], from, fromName };
   }
 }
 
-async function resolveFrom(sql: SqlClient, logger: Logger): Promise<string> {
+/** Dirección + nombre visible, en UNA vuelta: los dos salen de la misma fila. */
+async function resolveSender(
+  sql: SqlClient,
+  logger: Logger,
+): Promise<{ from: string; fromName: string }> {
   try {
-    const rows = await sql<Array<{ email_from: string | null }>>`
-      SELECT btrim(COALESCE(value->>'email_from', '')) AS email_from
+    const rows = await sql<Array<{ email_from: string | null; name: string | null }>>`
+      SELECT btrim(COALESCE(value->>'email_from', '')) AS email_from,
+             btrim(COALESCE(value->>'name', ''))       AS name
       FROM bot.config WHERE key = 'branding'
     `;
-    return rows[0]?.email_from ?? '';
+    return { from: rows[0]?.email_from ?? '', fromName: rows[0]?.name ?? '' };
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },
       'branding.email_from lookup failed',
     );
-    return '';
+    return { from: '', fromName: '' };
   }
 }
 

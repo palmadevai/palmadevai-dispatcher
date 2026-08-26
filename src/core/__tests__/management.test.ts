@@ -1,13 +1,19 @@
 /**
  * F3 — core/management. Fake sql (sequential responses) + fake Graph adapter
- * + fake email sender: no real Meta/Resend/PG ever touched. The auto-pause
+ * + fake `NotifyDeps`: no real Meta/Resend/PG ever touched. The auto-pause
  * flow is the critical absorbed behavior (was the n8n template-sync cron).
+ *
+ * F7.5 — el aviso ya no se arma acá, así que estos tests dejaron de mirar el
+ * mail y miran el LLAMADO: qué feature, qué aviso, con qué `origin_ref`. El
+ * destinatario, el remitente y el ref completo son responsabilidad de
+ * `core/notify.ts` y se testean ahí (`notify.test.ts`) — duplicar esas
+ * aserciones acá volvería a atar este archivo a una mecánica que ya no tiene.
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { SqlClient } from '../../lib/postgres.js';
 import type { Logger } from '../../lib/logger.js';
 import type { GraphManagement } from '../../providers/whatsapp-management.js';
-import type { ProviderSendResult } from '../../providers/types.js';
+import type { NotifyDeps } from '../notify.js';
 
 // `resolveWabaId()` en management.ts llama a `readChannelWhatsAppConfig()`
 // (DB real vía lib/postgres.js) — se mockea acá, no la DB, mismo criterio que
@@ -56,20 +62,41 @@ function makeFakeLogger(): Logger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
 }
 
-const okSend: ProviderSendResult = { ok: true, message_id: 'resend-1', http_status: 200 };
+/**
+ * `NotifyDeps` de test. Su `sql` responde, en el orden en que `notify()`
+ * pregunta: (1) la declaración del aviso en `config.features.bom`, (2) el
+ * branding (remitente + nombre visible), (3) `bot.notify_to(feature)`.
+ */
+function makeFakeNotify(opts: {
+  declared?: boolean;
+  emailFrom?: string;
+  brandName?: string;
+  to?: string[];
+} = {}): { notify: NotifyDeps; send: ReturnType<typeof vi.fn> } {
+  const send = vi.fn(async () => ({ status: 'sent' as const, message_id: 'resend-1' }));
+  const { sql } = makeFakeSql([
+    [{ declared: opts.declared ?? true }],
+    [{ email_from: opts.emailFrom ?? 'noreply@cliente.test', name: opts.brandName ?? 'Cliente SA' }],
+    [{ to: opts.to ?? ['admin@example.com'] }],
+  ]);
+  return {
+    notify: { sql, logger: makeFakeLogger(), send } as unknown as NotifyDeps,
+    send,
+  };
+}
 
 function makeDeps(overrides: {
   sqlResponses?: unknown[][];
   graph?: Partial<GraphManagement>;
-  sendEmail?: (input: unknown) => Promise<ProviderSendResult>;
+  notify?: Parameters<typeof makeFakeNotify>[0];
 }): {
   deps: ManagementDeps;
   calls: string[];
   values: unknown[][];
-  sendEmail: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>;
 } {
   const { sql, calls, values } = makeFakeSql(overrides.sqlResponses ?? []);
-  const sendEmail = vi.fn(overrides.sendEmail ?? (async () => okSend));
+  const { notify, send } = makeFakeNotify(overrides.notify);
   const graph: GraphManagement = {
     fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [] })),
     createTemplate: vi.fn(async () => ({ ok: true as const, id: 'meta-1', status: 'PENDING' })),
@@ -84,11 +111,11 @@ function makeDeps(overrides: {
       logger: makeFakeLogger(),
       graph,
       cockpitUrl: 'https://cockpit.example.com',
-      sendEmail: sendEmail as unknown as ManagementDeps['sendEmail'],
+      notify,
     },
     calls,
     values,
-    sendEmail,
+    send,
   };
 }
 
@@ -163,13 +190,13 @@ describe('syncTemplates', () => {
     expect(r.errors).toEqual([]);
   });
 
-  it('auto-pauses sending campaigns when a template lands rejected, audits and emails the operator', async () => {
+  it('auto-pauses sending campaigns when a template lands rejected, audits and notifies the operator', async () => {
     const rejected = {
       ...approvedTemplate,
       status: 'REJECTED',
       rejected_reason: 'INVALID_FORMAT',
     };
-    const { deps, sendEmail, calls } = makeDeps({
+    const { deps, send, calls } = makeDeps({
       sqlResponses: [
         [], // outbound_endpoints WABAs
         [{ id: 'tpl-1', status: 'approved' }], // prev lookup
@@ -177,8 +204,6 @@ describe('syncTemplates', () => {
         [{ id: 'camp-1' }, { id: 'camp-2' }], // auto-pause RETURNING
         [], // audit insert camp-1
         [], // audit insert camp-2
-        [{ email_from: 'noreply@cliente.test' }], // branding.email_from (T4.5)
-        [{ to: ['admin@example.com'] }], // bot.notify_to('campaigns')
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
@@ -186,95 +211,99 @@ describe('syncTemplates', () => {
     });
     const r = await syncTemplates(deps);
     expect(r.campaigns_paused).toBe(2);
-    expect(sendEmail).toHaveBeenCalledTimes(1);
-    const emailInput = sendEmail.mock.calls[0][0] as {
+
+    // Un solo destinatario en el fake → un solo envío. Lo que este test cuida
+    // NO es el fan-out (eso es de notify.ts) sino que el aviso salga con la
+    // identidad correcta: la feature dueña y el id declarado en su manifest.
+    expect(send).toHaveBeenCalledTimes(1);
+    const msg = send.mock.calls[0][0] as {
       to: string;
       from: string;
-      subject: string;
+      content: { subject: string };
+      context: { feature: string; client_ref: string; critical?: boolean };
     };
-    expect(emailInput.to).toBe('admin@example.com');
-    expect(emailInput.subject).toContain('2 campaña(s) pausada(s)');
-    // El remitente sale del branding del cliente. Hasta T4.5 era
-    // `onboarding@resend.dev` HARDCODEADO — el sandbox de Resend, que entrega al
-    // dueño de la cuenta con un 200 limpio: la alerta no le llegaba al cliente y
-    // nada lo indicaba.
-    expect(emailInput.from).toBe('Alertas PalmaDev <noreply@cliente.test>');
-    expect(emailInput.from).not.toContain('resend.dev');
+    expect(msg.to).toBe('admin@example.com');
+    expect(msg.content.subject).toContain('2 campaña(s) pausada(s)');
+    // El remitente sale del branding del CLIENTE. Hasta T4.5 era
+    // `onboarding@resend.dev` HARDCODEADO (el sandbox de Resend, que entrega al
+    // dueño de la cuenta con un 200 limpio) y hasta F7.5 el nombre visible era
+    // «Alertas PalmaDev», el literal del LABORATORIO firmando los avisos de
+    // cada fork desde su propio dominio.
+    expect(msg.from).toBe('Cliente SA <noreply@cliente.test>');
+    expect(msg.from).not.toContain('resend.dev');
+    expect(msg.from).not.toContain('PalmaDev');
+    expect(msg.context.feature).toBe('campaigns');
+    // El ref lo compone el servicio a partir del aviso declarado + el template
+    // que lo disparó. El destinatario NO está adentro: la idempotencia es
+    // (client_ref, destino) y pegarlo acá rompía justo el dedup que importa.
+    expect(msg.context.client_ref).toBe('notify-campaigns-template-auto-pause-tpl-1');
+    expect(msg.context.client_ref).not.toContain('admin@example.com');
     expect(calls.some((c) => c.includes('campaign_launches_audit'))).toBe(true);
   });
 
-  // T4.5: la lista es del cliente y puede tener más de uno. Un envío por
-  // destinatario — el rechazo de uno no puede dejar sin aviso a los otros.
-  it('manda UN mail por destinatario cuando notify_to tiene varios', async () => {
+  // El aviso tiene que estar declarado en el manifest de la feature. No
+  // declarado = no hay dónde configurar quién lo recibe, así que mandarlo es
+  // prometer una configuración que no existe.
+  it('no manda el aviso si la feature no lo declaró en su manifest', async () => {
     const rejected = { ...approvedTemplate, status: 'REJECTED' };
-    const { deps, sendEmail } = makeDeps({
+    const { deps, send } = makeDeps({
       sqlResponses: [
         [],
         [{ id: 'tpl-1', status: 'approved' }],
         [{ id: 'tpl-1', inserted: false }],
         [{ id: 'camp-1' }],
         [], // audit
-        [{ email_from: 'noreply@cliente.test' }],
-        [{ to: ['ops@cliente.test', 'conta@cliente.test'] }],
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
       },
+      notify: { declared: false },
     });
-    await syncTemplates(deps);
-    expect(sendEmail).toHaveBeenCalledTimes(2);
-    const destinos = sendEmail.mock.calls.map((c) => (c[0] as { to: string }).to);
-    expect(destinos).toEqual(['ops@cliente.test', 'conta@cliente.test']);
-    // El callback data lleva el destinatario: sin eso los dos envíos del mismo
-    // evento colisionan en la idempotencia del proveedor y el segundo se pierde.
-    const refs = sendEmail.mock.calls.map(
-      (c) => (c[0] as { biz_opaque_callback_data: string }).biz_opaque_callback_data,
-    );
-    expect(new Set(refs).size).toBe(2);
+    const r = await syncTemplates(deps);
+    expect(r.campaigns_paused).toBe(1);
+    expect(send).not.toHaveBeenCalled();
   });
 
   // Sin remitente NO se manda, aunque haya destinatarios: mandar desde un
   // remitente equivocado entrega al lugar equivocado con un 200 limpio.
   it('no manda si falta branding.email_from, aunque haya destinatarios', async () => {
     const rejected = { ...approvedTemplate, status: 'REJECTED' };
-    const { deps, sendEmail } = makeDeps({
+    const { deps, send } = makeDeps({
       sqlResponses: [
         [],
         [{ id: 'tpl-1', status: 'approved' }],
         [{ id: 'tpl-1', inserted: false }],
         [{ id: 'camp-1' }],
         [], // audit
-        [{ email_from: '' }],
-        [{ to: ['ops@cliente.test'] }],
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
       },
+      notify: { emailFrom: '' },
     });
     const r = await syncTemplates(deps);
     expect(r.campaigns_paused).toBe(1);
-    expect(sendEmail).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
-  it('skips the alert (with a warning) when admin_email is not configured', async () => {
+  it('skips the alert when notify_to comes back empty (aviso apagado)', async () => {
     const rejected = { ...approvedTemplate, status: 'REJECTED' };
-    const { deps, sendEmail } = makeDeps({
+    const { deps, send } = makeDeps({
       sqlResponses: [
         [],
         [{ id: 'tpl-1', status: 'approved' }],
         [{ id: 'tpl-1', inserted: false }],
         [{ id: 'camp-1' }],
         [], // audit
-        [{ email_from: 'noreply@cliente.test' }],
-        [{ to: [] }], // bot.notify_to devuelve vacío: aviso apagado / sin cargar
       ],
       graph: {
         fetchTemplates: vi.fn(async () => ({ ok: true as const, templates: [rejected] })),
       },
+      notify: { to: [] },
     });
     const r = await syncTemplates(deps);
     expect(r.campaigns_paused).toBe(1);
-    expect(sendEmail).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('persists language RAW (es_AR) — lowercasing it duplicated rows against the UNIQUE', async () => {

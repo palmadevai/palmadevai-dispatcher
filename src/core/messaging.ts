@@ -29,6 +29,7 @@ import type { Redis } from 'ioredis';
 import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import { checkBudget, recordSendUsage, maybeAlert } from './budget.js';
+import { notify } from './notify.js';
 import { providerForChannel, recordProviderOutcome } from './provider-status.js';
 import { toE164, normalizeAllowlist } from '../lib/phone.js';
 import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
@@ -527,16 +528,30 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
   const category = await resolveCategory(deps.sql, deps.logger, msg);
   const budgetResult = await checkBudget(deps.sql, deps.redis, deps.logger, msg.channel, category);
   // H2.3 — el sender cierra el ciclo `sendMessage → checkBudget → maybeAlert →
-  // sendMessage` de vuelta: es una llamada recursiva a esta misma función, y
-  // el dedup SETNX de `maybeAlert` es lo que la corta (ver comentario ahí).
-  await maybeAlert(deps.sql, deps.redis, deps.logger, msg.channel, category, budgetResult, (recipient) =>
-    sendMessage(deps, {
-      channel: 'email',
-      to: recipient.to,
-      from: recipient.from,
-      content: { type: 'mail', subject: recipient.subject, text: recipient.text, html: recipient.html },
-      context: { feature: 'messaging', client_ref: recipient.clientRef, kind: 'notification', critical: true },
-    }),
+  // notify → sendMessage` de vuelta: es una llamada recursiva a esta misma
+  // función, y el dedup SETNX de `maybeAlert` es lo que la corta (ver
+  // comentario ahí).
+  //
+  // F7.5 — el sender ya no arma el mensaje: se lo pasa a `notify()`, que
+  // resuelve destinatarios/remitente/ref y fan-outea. Se arma acá y no en el
+  // boot porque `notify()` necesita el `send` de ESTE `deps` (el MCP arma el
+  // suyo), y el `NotifyDeps` completo cerraría el ciclo de imports.
+  await maybeAlert(
+    deps.sql,
+    deps.redis,
+    deps.logger,
+    msg.channel,
+    category,
+    budgetResult,
+    async (req) => {
+      const outcome = await notify(
+        { sql: deps.sql, logger: deps.logger, send: (m) => sendMessage(deps, m) },
+        req,
+      );
+      return outcome.status === 'undeclared'
+        ? { status: 'undeclared', blocked_reason: outcome.detail }
+        : { status: 'ok', blocked_reason: outcome.blocked_reason };
+    },
   );
 
   const criticalBypass = kind === 'notification' && msg.context.critical === true;

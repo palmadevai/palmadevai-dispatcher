@@ -17,9 +17,8 @@ import type { Sql } from 'postgres';
 import type { Logger } from '../lib/logger.js';
 import type { ErrorCategory } from '../classify/error-classifier.js';
 import { env } from '../env.js';
-import { sendEmail } from '../providers/email.js';
 import { resolveProviderKey } from '../lib/providers.js';
-import { resolveNotifyTarget, notifyBlockedReason } from '../core/notify-to.js';
+import { notify, type NotifyDeps } from '../core/notify.js';
 
 const AUTO_PAUSE_RATIO = 0.2; // 20 %
 const AUTO_PAUSE_WINDOW_MIN = 1; // last 1 minute of attempts
@@ -46,6 +45,7 @@ export interface DLQEntry {
 export async function moveToDLQ(
   sql: Sql,
   logger: Logger,
+  notifyDeps: NotifyDeps,
   entry: DLQEntry,
 ): Promise<void> {
   // 1. INSERT DLQ. Idempotency note: bot.campaign_dlq has no unique constraint
@@ -133,68 +133,60 @@ export async function moveToDLQ(
           },
           'auto-paused campaign — DLQ rate exceeded threshold',
         );
-        // Aviso al operador por email (Resend), best-effort: que NO se entere por
-        // sorpresa al entrar al cockpit. Antes esto era solo un logger.warn que
-        // nadie ve (y el POST a /api/notifications apuntaba a un endpoint
-        // inexistente). El destinatario vive en bot.config['branding'].admin_email
-        // (config de negocio no-secreta, no env var — criterio secreto-vs-config
-        // del handbook, 2026-06-16; mismo patrón que llm-gateway-alerts /
-        // facturacion-abonos-cron). Si falta admin_email o credencial, no-op.
+        // Aviso al operador, best-effort: que NO se entere por sorpresa al
+        // entrar al cockpit. Antes esto era sólo un logger.warn que nadie ve.
         //
-        // El gate pregunta por el RESOLVER, no por env.RESEND_API_KEY: con el
-        // cliente en `owned` (BYOK, F3) la env queda vacía a propósito y un
-        // gate por env apagaba esta alerta en silencio — la credencial real
-        // puede estar cifrada en la base. sendEmail() resuelve igual; esto
-        // sólo decide si hay con qué mandar.
+        // F7.5 tanda 0 — la mecánica ya no está acá. Lo que este archivo
+        // escribía y ahora no puede escribir mal: destinatarios, remitente
+        // (que era `CAMPAIGNS_DEFAULT_FROM_EMAIL`, o sea la identidad de
+        // MARKETING del cliente firmando un aviso de ops), fan-out, y el
+        // `client_ref` con el destinatario pegado que rompía la idempotencia
+        // real. `notify()` resuelve los cuatro.
+        //
+        // El gate sigue preguntando por el RESOLVER, no por `env.RESEND_API_KEY`:
+        // con el cliente en `owned` (BYOK, F3) la env queda vacía a propósito y
+        // un gate por env apagaba esta alerta en silencio.
         if ((await resolveProviderKey('resend')).ok) {
-          // R1c / T4.5: los destinatarios salen de bot.notify_to('campaigns') —
-          // la lista propia de la feature, con branding.admin_email de fallback y
-          // lista vacía = aviso apagado. El remitente viene del mismo lugar; antes
-          // salía de `env.CAMPAIGNS_DEFAULT_FROM_EMAIL`, que es el remitente de
-          // las CAMPAÑAS: un aviso de ops saliendo con la identidad de marketing
-          // del cliente.
-          const target = await resolveNotifyTarget(sql, logger, 'campaigns');
-          const blocked = notifyBlockedReason(target);
-          if (blocked) {
+          const name = pauseResult[0].name ?? entry.campaignId;
+          const ratePct = Math.round(
+            (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
+          );
+          const link = env.COCKPIT_URL
+            ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
+            : '';
+          const outcome = await notify(notifyDeps, {
+            feature: 'campaigns',
+            aviso: 'calidad-degradada',
+            subject: `Campaña pausada automáticamente: ${name}`,
+            html:
+              `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
+              `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
+              `(${stats.recent_failures}/${stats.recent_total}).</p>` +
+              `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
+              (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
+            text:
+              `Campaña pausada automáticamente: ${name}\n` +
+              `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
+              `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
+              (link ? `\n${link}` : ''),
+            // La campaña pausada: dos campañas distintas son dos avisos
+            // distintos y no se deduplican entre sí.
+            origin_ref: entry.campaignId,
+            // Misma razón que el auto-pause de templates: antes salía por el
+            // provider crudo (sin pasar por el presupuesto) y migrarlo no puede
+            // introducir una forma nueva de que el aviso quede mudo.
+            critical: true,
+          });
+          if (outcome.status === 'undeclared') {
+            logger.error(
+              { campaign_id: entry.campaignId, detail: outcome.detail },
+              'auto-pause por calidad: el aviso no está declarado por la feature',
+            );
+          } else if (outcome.blocked_reason) {
             logger.warn(
-              { campaign_id: entry.campaignId, reason: blocked },
+              { campaign_id: entry.campaignId, reason: outcome.blocked_reason },
               'auto-pause por calidad: el aviso no se envía',
             );
-          } else {
-            const name = pauseResult[0].name ?? entry.campaignId;
-            const ratePct = Math.round(
-              (stats.recent_failures / Math.max(stats.recent_total, 1)) * 100,
-            );
-            const link = env.COCKPIT_URL
-              ? `${env.COCKPIT_URL}/campaigns/${entry.campaignId}`
-              : '';
-            // Un envío POR DESTINATARIO. Sin remitente no se manda ni la
-            // alerta —mandar desde un remitente equivocado es peor que no
-            // avisar—, y de eso se encarga el gate de arriba.
-            for (const alertEmail of target.to) {
-              void sendEmail({
-                from: target.from,
-                to: alertEmail,
-                subject: `Campaña pausada automáticamente: ${name}`,
-                html:
-                  `<p>La campaña <b>${escapeHtml(name)}</b> se <b>pausó automáticamente</b> por ` +
-                  `calidad degradada: ${ratePct}% de fallos en el último minuto ` +
-                  `(${stats.recent_failures}/${stats.recent_total}).</p>` +
-                  `<p>No se enviaron más mensajes. Revisá el motivo en el DLQ antes de reanudar.</p>` +
-                  (link ? `<p>Campaña: <a href="${link}">${link}</a></p>` : ''),
-                text:
-                  `Campaña pausada automáticamente: ${name}\n` +
-                  `Calidad degradada: ${ratePct}% de fallos (${stats.recent_failures}/${stats.recent_total}) en el último minuto.\n` +
-                  `No se enviaron más mensajes. Revisá el DLQ antes de reanudar.` +
-                  (link ? `\n${link}` : ''),
-                biz_opaque_callback_data: `ops-alert:auto_quality_degraded:${entry.campaignId}:${alertEmail}`,
-              }).catch((err: unknown) =>
-                logger.error(
-                  { err: (err as Error).message, campaign_id: entry.campaignId, to: alertEmail },
-                  'auto-pause email notify failed',
-                ),
-              );
-            }
           }
         }
       }
