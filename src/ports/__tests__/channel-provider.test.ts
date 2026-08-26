@@ -199,7 +199,13 @@ describe('prepareEmail', () => {
     const ctx = makeCtx({
       templateBody: { subject: 'Hola', html: '<p>Hola</p>' },
     });
-    const outcome = await prepareEmail(fakeTx, ctx, {});
+    // Deps inyectadas en null: sin endpoints (F7.4) ni config (F7.3), la cadena
+    // entera queda vacía — el ladder completo se fija en email-from-resolution.test.ts.
+    const outcome = await prepareEmail(fakeTx, ctx, {}, {
+      resolvePinnedEmailEndpoint: async () => null,
+      pickEmailEndpoint: async () => null,
+      readCampaignsEmailFrom: async () => null,
+    });
     expect(outcome.kind).toBe('terminal');
     if (outcome.kind !== 'terminal') throw new Error('unreachable');
     expect(outcome.error_code).toBe('email_from_missing');
