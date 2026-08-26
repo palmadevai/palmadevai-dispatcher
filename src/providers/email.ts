@@ -28,6 +28,7 @@ import { env } from '../env.js';
 import { resolveProviderKey } from '../lib/providers.js';
 import { logger } from '../lib/logger.js';
 import { classifyResendError } from '../classify/email-error-classifier.js';
+import type { TransactionSql } from 'postgres';
 import type { DeliveryContext } from '../dispatch/audience-resolver.js';
 import type { ChannelProvider, PrepareOutcome } from '../ports/channel-provider.js';
 import type { CredentialCheck, ProviderSendResult } from './types.js';
@@ -389,13 +390,93 @@ export function renderEmailBody(input: RenderEmailInput): RenderEmailOutput {
 /**
  * Moved from `workers/dispatcher.ts` (the old `ctx.delivery.channel ===
  * 'email'` branch, pre-`acquireToken()` half): destination validation +
- * body rendering. Email has no `bot.outbound_endpoints` row (no picker), so
- * `prepare()` needs no injectable deps and ignores `tx`.
+ * emisor resolution + body rendering.
+ *
+ * F7.4 (2026-08-25, aprobado 👤): el email dejó de ser el único canal sin
+ * noción de emisor — `bot.outbound_endpoints` acepta `channel='email'` (mig
+ * 161) y una fila = una identidad de envío (`endpoint_id` = dirección from;
+ * la credencial la sigue poniendo el servicio: `RESEND_API_KEY`, managed o
+ * BYOK). La cadena de resolución del remitente, en orden:
+ *
+ *   1. endpoint PINNEADO por la campaña (`campaigns.outbound_endpoint_id`,
+ *      channel email) — elección explícita del operador en el wizard, gana
+ *      sobre todo lo demás (mismo criterio que el emisor WA de Fase 9).
+ *   2. `template.body.from` — override por template, documentado desde F5.
+ *   3. endpoint email AUTO-PICKED (priority DESC, sent_today ASC, cap-aware)
+ *      — el default del modelo F7.4 cuando el cliente ya registró emisores.
+ *   4. `bot.config['campaigns'].email_from` — default cliente-wide editable
+ *      en la página Configuración de campaign-site (F7.3; config, no secreto).
+ *   5. `env.CAMPAIGNS_DEFAULT_FROM_EMAIL` — fallback transitorio
+ *      (expand/contract; F7.3 lo vacía de los `.env`).
+ *
+ * Si un endpoint (1 ó 3) es la identidad usada, `endpointRowId` se setea y el
+ * worker bumpea su `sent_today` — el accounting por emisor queda parejo con
+ * WA/FB/IG. Con from de template/config/env no hay fila que contar.
  */
+export interface EmailEndpointRow {
+  id: string;
+  /** La dirección from — `endpoint_id` ES la identidad de envío (F7.4). */
+  endpoint_id: string;
+}
+
+const NO_CAP_SENTINEL = 2_147_483_647; // mismo sentinel que pick-endpoint.ts (int4 max)
+
+/** Endpoint email pinneado por la campaña. NULL si no existe/inactivo/otro canal. */
+export async function resolvePinnedEmailEndpoint(
+  tx: TransactionSql,
+  endpointRowId: string,
+): Promise<EmailEndpointRow | null> {
+  const rows = await tx<Array<{ id: string; endpoint_id: string; status: string }>>`
+    SELECT id, endpoint_id, status
+    FROM bot.outbound_endpoints
+    WHERE id = ${endpointRowId} AND channel = 'email'
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row || row.status !== 'active') return null;
+  return { id: row.id, endpoint_id: row.endpoint_id };
+}
+
+/** Auto-pick del emisor email: mismo criterio que pickEndpointForChannel, sin exigir access_token. */
+export async function pickEmailEndpoint(tx: TransactionSql): Promise<EmailEndpointRow | null> {
+  const rows = await tx<Array<{ id: string; endpoint_id: string }>>`
+    SELECT id, endpoint_id
+    FROM bot.outbound_endpoints
+    WHERE channel = 'email'
+      AND status = 'active'
+      AND sent_today < COALESCE(daily_cap_override, ${NO_CAP_SENTINEL})
+    ORDER BY priority DESC, sent_today ASC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+/** `bot.config['campaigns'].email_from` — remitente default de CAMPAÑAS (F7.3). */
+export async function readCampaignsEmailFrom(tx: TransactionSql): Promise<string | null> {
+  const rows = await tx<Array<{ email_from: string | null }>>`
+    SELECT value ->> 'email_from' AS email_from FROM bot.config WHERE key = 'campaigns'
+  `;
+  const v = rows[0]?.email_from;
+  return typeof v === 'string' && v.trim() !== '' ? v : null;
+}
+
+export interface EmailPrepareDeps {
+  resolvePinnedEmailEndpoint: typeof resolvePinnedEmailEndpoint;
+  pickEmailEndpoint: typeof pickEmailEndpoint;
+  readCampaignsEmailFrom: typeof readCampaignsEmailFrom;
+}
+
+const defaultEmailPrepareDeps: EmailPrepareDeps = {
+  resolvePinnedEmailEndpoint,
+  pickEmailEndpoint,
+  readCampaignsEmailFrom,
+};
+
 export async function prepareEmail(
-  _tx: unknown,
+  tx: TransactionSql,
   ctx: DeliveryContext,
   aiResolvedBindings: Record<string, unknown>,
+  deps: EmailPrepareDeps = defaultEmailPrepareDeps,
 ): Promise<PrepareOutcome> {
   if (!ctx.contact.email) {
     return {
@@ -417,28 +498,60 @@ export async function prepareEmail(
     unsubscribeBaseUrl: unsubBase,
   });
 
-  // Remitente de CAMPAÑAS: lo define la aplicación (el template, o el default
-  // configurado de campañas), no el messaging service. Sin remitente no se
-  // manda: el sandbox de Resend entregaba al dueño de la cuenta, así que una
-  // campaña se reportaba enviada y no llegaba a nadie.
-  const fromOverride =
-    typeof ctx.template.body.from === 'string'
-      ? (ctx.template.body.from as string)
-      : env.CAMPAIGNS_DEFAULT_FROM_EMAIL;
+  // Remitente de CAMPAÑAS: lo define la aplicación, no el messaging service.
+  // Sin remitente no se manda: el sandbox de Resend entregaba al dueño de la
+  // cuenta, así que una campaña se reportaba enviada y no llegaba a nadie.
+  // Cadena F7.3/F7.4 (ver doc-comment de arriba): pin → template → auto-pick
+  // → config → env.
+  let from: string | null = null;
+  let endpointRowId: string | null = null;
 
-  if (!fromOverride) {
+  if (ctx.campaign.outbound_endpoint_id) {
+    const pinned = await deps.resolvePinnedEmailEndpoint(tx, ctx.campaign.outbound_endpoint_id);
+    if (pinned) {
+      from = pinned.endpoint_id;
+      endpointRowId = pinned.id;
+    } else {
+      logger.warn(
+        {
+          deliveryId: ctx.delivery.id,
+          campaign_id: ctx.delivery.campaign_id,
+          outbound_endpoint_id: ctx.campaign.outbound_endpoint_id,
+        },
+        'pinned outbound_endpoint email no usable (missing/inactive) — fallback a la cadena',
+      );
+    }
+  }
+
+  if (!from && typeof ctx.template.body.from === 'string' && ctx.template.body.from.trim() !== '') {
+    from = ctx.template.body.from as string;
+  }
+
+  if (!from) {
+    const picked = await deps.pickEmailEndpoint(tx);
+    if (picked) {
+      from = picked.endpoint_id;
+      endpointRowId = picked.id;
+    }
+  }
+
+  if (!from) from = await deps.readCampaignsEmailFrom(tx);
+  if (!from) from = env.CAMPAIGNS_DEFAULT_FROM_EMAIL ?? null;
+
+  if (!from) {
     // Terminal, no retry: reintentar sin remitente da exactamente lo mismo.
     return {
       kind: 'terminal',
       error_code: 'email_from_missing',
       error_message:
-        'sin remitente: ni template.body.from, ni bot.config[branding].email_from, ni CAMPAIGNS_DEFAULT_FROM_EMAIL',
+        'sin remitente: ni endpoint email activo, ni template.body.from, ni ' +
+        "bot.config['campaigns'].email_from, ni CAMPAIGNS_DEFAULT_FROM_EMAIL",
       failure_reason: 'payload_invalid',
     };
   }
 
   const sendInput: EmailSendInput = {
-    from: fromOverride,
+    from,
     to: ctx.contact.email,
     subject: rendered.subject,
     html: rendered.html,
@@ -449,7 +562,7 @@ export async function prepareEmail(
   return {
     kind: 'ready',
     sendInput,
-    endpointRowId: null,
+    endpointRowId,
     acceptedExtra: {},
     errorLogFields: { to_domain: ctx.contact.email.split('@')[1] },
   };
