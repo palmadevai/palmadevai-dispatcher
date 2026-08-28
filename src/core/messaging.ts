@@ -303,7 +303,7 @@ export async function isWithin24hWindow(
     const rows = await sql<Array<{ last_inbound_at: Date | null }>>`
       SELECT ch.last_inbound_at
       FROM bot.audience_contact_channels ch
-      JOIN bot.audience_contacts c ON c.id = ch.audience_contact_id
+      JOIN bot.personas c ON c.id = ch.audience_contact_id
       WHERE ch.channel = ${channel}
         AND (CASE WHEN c.phone LIKE '+549%' THEN '+54' || substring(c.phone FROM 5) ELSE c.phone END)
           = (CASE WHEN ${to} LIKE '+549%' THEN '+54' || substring(${to} FROM 5) ELSE ${to} END)
@@ -467,11 +467,11 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       const rows =
         msg.channel === 'email'
           ? await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
-              SELECT unsubscribed_at FROM bot.audience_contacts
+              SELECT unsubscribed_at FROM bot.personas
                WHERE lower(email) = lower(${msg.to}) LIMIT 1
             `
           : await deps.sql<Array<{ unsubscribed_at: Date | null }>>`
-              SELECT unsubscribed_at FROM bot.audience_contacts WHERE phone = ${msg.to} LIMIT 1
+              SELECT unsubscribed_at FROM bot.personas WHERE phone = ${msg.to} LIMIT 1
             `;
       if (rows[0]?.unsubscribed_at) {
         return {
@@ -484,16 +484,17 @@ export async function sendMessage(deps: SendDeps, msg: OutboundMessage): Promise
       // dieron de alta como audience contacts).
     } catch (err) {
       if (isMissingRelation(err)) {
-        // Cliente sin la feature `campaigns`: no hay BUC, así que no hay dónde
+        // Cliente todavía sin la BUC (`bot.personas` es canónica del modelo
+        // nuevo, pero llega a cada cliente con su nivelación): no hay dónde
         // registrar una baja — y por lo tanto no hay ninguna que respetar. No
         // se está ignorando el opt-out de nadie: el mecanismo no existe en este
-        // cliente. El día que contrate campañas, la tabla aparece y esta guarda
+        // cliente. El día que se nivele, la tabla aparece y esta guarda
         // empieza a funcionar sola, sin tocar código.
         announceOnce(
           deps.logger,
-          'missing:audience_contacts:optout',
+          'missing:personas:optout',
           { feature },
-          'sin bot.audience_contacts (cliente sin la feature campaigns): no hay BUC, así que no hay baja que chequear. Estado esperado, se dice una vez.',
+          'sin bot.personas (cliente aún sin la BUC): no hay baja que chequear. Estado esperado, se dice una vez.',
         );
       } else {
         deps.logger.error(

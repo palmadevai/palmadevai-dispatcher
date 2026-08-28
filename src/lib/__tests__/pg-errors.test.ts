@@ -21,14 +21,14 @@ function makeLogger() {
 
 describe('isMissingRelation', () => {
   it('reconoce 42P01 (undefined_table)', () => {
-    const err = Object.assign(new Error('relation "bot.audience_contacts" does not exist'), {
+    const err = Object.assign(new Error('relation "bot.personas" does not exist'), {
       code: '42P01',
     });
     expect(isMissingRelation(err)).toBe(true);
   });
 
   it('NO se traga otros errores de Postgres — un permiso revocado sigue siendo un error', () => {
-    const permiso = Object.assign(new Error('permission denied for table audience_contacts'), {
+    const permiso = Object.assign(new Error('permission denied for table personas'), {
       code: '42501',
     });
     const conexion = Object.assign(new Error('connection terminated'), { code: '08006' });
@@ -54,16 +54,16 @@ describe('announceOnce', () => {
   it('dice el estado UNA sola vez por key, aunque se lo llame en cada envío', () => {
     const logger = makeLogger();
     for (let i = 0; i < 50; i += 1) {
-      announceOnce(logger, 'missing:audience_contacts:optout', { feature: 'reports' }, 'sin BUC');
+      announceOnce(logger, 'missing:personas:optout', { feature: 'reports' }, 'sin BUC');
     }
     expect(logger.info).toHaveBeenCalledTimes(1);
   });
 
   it('cada key se anuncia por separado: el opt-out y el safety-net son dos hechos distintos', () => {
     const logger = makeLogger();
-    announceOnce(logger, 'missing:audience_contacts:optout', {}, 'a');
+    announceOnce(logger, 'missing:personas:optout', {}, 'a');
     announceOnce(logger, 'missing:campaign_deliveries:safety-net', {}, 'b');
-    announceOnce(logger, 'missing:audience_contacts:optout', {}, 'a');
+    announceOnce(logger, 'missing:personas:optout', {}, 'a');
     expect(logger.info).toHaveBeenCalledTimes(2);
   });
 
