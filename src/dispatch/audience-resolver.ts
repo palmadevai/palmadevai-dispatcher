@@ -174,7 +174,7 @@ export async function resolveDeliveryContext(
       cm.language_routing                AS cm_language_routing,
       cm.outbound_endpoint_id::text      AS cm_outbound_endpoint_id
     FROM bot.campaign_deliveries d
-    JOIN bot.audience_contacts ac ON ac.id = d.audience_contact_id
+    JOIN bot.personas ac ON ac.id = d.audience_contact_id
     JOIN bot.campaigns cm ON cm.id = d.campaign_id
     JOIN bot.message_templates t ON t.id = cm.template_id
     WHERE d.id = ${deliveryId}

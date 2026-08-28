@@ -1,14 +1,15 @@
 /**
  * Errores de Postgres que NO son fallas: el cliente no tiene esa feature.
  *
- * POR QUE EXISTE. Las tablas de la BUC y de campañas —`bot.audience_contacts`,
- * `bot.audience_contact_channels`, `bot.campaign_deliveries`— las crea la
- * feature `campaigns`. Un cliente que no la tiene contratada NO las tiene, y
- * eso es lo correcto: la tabla vive con su feature, no se instala "por las
- * dudas". Pero el dispatcher las consultaba igual y trataba su ausencia como
- * una falla: un `logger.error` por CADA envío, y uno cada 5 minutos desde el
- * recovery worker, para decir algo que ya sabíamos y que no se arregla desde
- * el runtime.
+ * POR QUE EXISTE. Las tablas de la BUC y de campañas —`bot.personas`,
+ * `bot.audience_contact_channels`, `bot.campaign_deliveries`— no existen en
+ * todo cliente: las de campañas las crea esa feature, y la BUC —canónica de
+ * `chat-bot` desde el refactor persona (F1, mig 169/175)— llega a cada
+ * cliente recién con su nivelación. Un cliente que todavía no las tiene NO
+ * las tiene, y eso es lo correcto. Pero el dispatcher las consultaba igual y
+ * trataba su ausencia como una falla: un `logger.error` por CADA envío, y uno
+ * cada 5 minutos desde el recovery worker, para decir algo que ya sabíamos y
+ * que no se arregla desde el runtime.
  *
  * El ruido no es cosmético. Una alerta por nivel de log queda gritando para
  * siempre en esos clientes, y lo que grita todo el tiempo deja de leerse: el

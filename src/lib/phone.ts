@@ -2,7 +2,7 @@
  * Normalización a E.164 — la forma canónica de un teléfono en toda la flota.
  *
  * E.164 estricto es `+` seguido de 8 a 15 dígitos. Es lo que enforcean las
- * constraints `leads_phone_e164` / `audience_contacts_phone_e164` en la base y
+ * constraints `leads_phone_e164` / `personas_phone_e164` en la base y
  * lo que valida el ingest del cockpit (`normalizePhoneE164` en
  * `cockpit/src/lib/external-api.ts`). Acá se replica el mismo criterio.
  *

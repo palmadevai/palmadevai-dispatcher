@@ -57,7 +57,7 @@ function makeThrowingSql(): SqlClient {
 /** Postgres cuando la tabla no existe: SQLSTATE 42P01 (cliente sin `campaigns`). */
 function makeMissingRelationSql(): SqlClient {
   return (async () => {
-    throw Object.assign(new Error('relation "bot.audience_contacts" does not exist'), {
+    throw Object.assign(new Error('relation "bot.personas" does not exist'), {
       code: '42P01',
     });
   }) as unknown as SqlClient;
@@ -613,7 +613,7 @@ describe('sendMessage — opt-out', () => {
     // El anuncio va en info y una sola vez. Se filtra por mensaje porque
     // `sendMessage` loguea otras cosas en info durante un envío normal.
     const anuncios = logger.info.mock.calls.filter(([, msg]) =>
-      String(msg).includes('sin bot.audience_contacts'),
+      String(msg).includes('sin bot.personas'),
     );
     expect(anuncios).toHaveLength(1);
   });
