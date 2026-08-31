@@ -127,5 +127,15 @@ jobs:
           # El arreglo NO es bumpear buildkitd: ahí ese cache SOBRA. buildkitd
           # guarda el suyo en un volumen, o sea que persiste entre jobs y entre
           # reinicios; `type=gha` existe porque los runners hosted son efímeros.
-          cache-from: ${{ vars.BUILD_RUNNER && '' || 'type=gha' }}
-          cache-to: ${{ vars.BUILD_RUNNER && '' || 'type=gha,mode=max' }}
+          #
+          # ⚠ LA CONDICIÓN VA AL REVÉS A PROPÓSITO, y cuesta una corrida entender por qué.
+          # La forma «natural» —`vars.BUILD_RUNNER && '' || 'type=gha'`— está MAL: en las
+          # expresiones de GitHub `a && b || c` devuelve VALORES, no booleanos, y cuando la
+          # rama verdadera es `''` (falsy) el `||` se la come y cae siempre en `c`. O sea que
+          # esa forma deja `type=gha` prendido SIEMPRE, incluso en el box. Medido:
+          # palmadevai-arca-svc run 33385823088 — la imagen se buildeo y se pusheo bien, y el
+          # job se puso en rojo recién en «exporting to GitHub Actions Cache».
+          # Por eso se pregunta por el caso VACÍO, que deja el valor no-vacío del lado
+          # verdadero: `X == '' && 'type=gha' || ''` sí hace lo que dice.
+          cache-from: ${{ vars.BUILD_RUNNER == '' && 'type=gha' || '' }}
+          cache-to: ${{ vars.BUILD_RUNNER == '' && 'type=gha,mode=max' || '' }}
