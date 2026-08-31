@@ -74,7 +74,17 @@ jobs:
 
   build-push:
     needs: test
-    runs-on: ubuntu-latest
+    # DÓNDE CORRE (F1a.P3, 2ª mitad — 2026-08-31): con la variable de repo
+    # `BUILD_RUNNER=contolab` el build va al runner self-hosted del box, que NO
+    # tiene daemon Docker: buildx le habla al buildkitd rootless (F1a.C6) por el
+    # socket, con el driver `remote`. Sin la variable vuelve a `ubuntu-latest` con
+    # el driver de siempre. Una receta, dos destinos — ver los dos steps de abajo.
+    # Variable PROPIA, separada de GATES_RUNNER a propósito: si un build da
+    # problema en el box se lo devuelve a hosted sin arrastrar los gates con él.
+    # En el runner del box los minutos NO se facturan.
+    # ESCAPE si el box cae, SIN PR:
+    #   gh variable delete BUILD_RUNNER --repo palmadevai/<repo>
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -92,6 +102,13 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          # En el box no hay daemon Docker: el driver `remote` habla directo con
+          # el socket de buildkitd. En hosted queda el driver de siempre.
+          # Verificado en el laboratorio antes de tocar este repo: contolab
+          # `build-image-smoke` run 33385130672, con `billable: {}`.
+          driver: ${{ vars.BUILD_RUNNER && 'remote' || 'docker-container' }}
+          endpoint: ${{ vars.BUILD_RUNNER && 'unix:///run/buildkit/buildkitd.sock' || '' }}
 
       - name: Build & push
         uses: docker/build-push-action@v7
@@ -103,5 +120,22 @@ jobs:
             ghcr.io/${{ steps.img.outputs.name }}:${{ github.sha }}
             ghcr.io/palmadevai/palmadev-dispatcher:latest
             ghcr.io/palmadevai/palmadev-dispatcher:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `type=gha` SÓLO en hosted. En el box no sirve y además rompe: el
+          # buildkitd del box es v0.18.2 y le pega al endpoint v1 del cache de
+          # Actions, que GitHub ya apagó — se come una página HTML de error
+          # donde espera JSON (medido: contolab run 33384854847).
+          # El arreglo NO es bumpear buildkitd: ahí ese cache SOBRA. buildkitd
+          # guarda el suyo en un volumen, o sea que persiste entre jobs y entre
+          # reinicios; `type=gha` existe porque los runners hosted son efímeros.
+          #
+          # ⚠ LA CONDICIÓN VA AL REVÉS A PROPÓSITO, y cuesta una corrida entender por qué.
+          # La forma «natural» —`vars.BUILD_RUNNER && '' || 'type=gha'`— está MAL: en las
+          # expresiones de GitHub `a && b || c` devuelve VALORES, no booleanos, y cuando la
+          # rama verdadera es `''` (falsy) el `||` se la come y cae siempre en `c`. O sea que
+          # esa forma deja `type=gha` prendido SIEMPRE, incluso en el box. Medido:
+          # palmadevai-arca-svc run 33385823088 — la imagen se buildeo y se pusheo bien, y el
+          # job se puso en rojo recién en «exporting to GitHub Actions Cache».
+          # Por eso se pregunta por el caso VACÍO, que deja el valor no-vacío del lado
+          # verdadero: `X == '' && 'type=gha' || ''` sí hace lo que dice.
+          cache-from: ${{ vars.BUILD_RUNNER == '' && 'type=gha' || '' }}
+          cache-to: ${{ vars.BUILD_RUNNER == '' && 'type=gha,mode=max' || '' }}
