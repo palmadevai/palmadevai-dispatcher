@@ -104,7 +104,11 @@ let callOrder: string[] = [];
  * `provider-credentials.test.ts`, extendido con `config.v_client_providers` y
  * `config.client_providers` (lo que agrega el cutover).
  */
-function fakeSql(seed: Partial<ProviderState> = {}) {
+function fakeSql(seed: Partial<ProviderState> = {}, clientRow = true) {
+  // ¿Existe la fila en `config.client_providers`? La vista resuelve el default
+  // del catálogo cuando no está, así que «sin fila» es un estado normal y no un
+  // caso raro: es el de todo cliente que nunca configuró ese proveedor (F6.11).
+  let hasClientRow = clientRow;
   const providersCatalog = new Set(['resend', 'meta', 'openai', 'arca']);
   const secrets = new Map<string, Record<string, unknown>>();
   const stateWrites: StateWrite[] = [];
@@ -123,11 +127,30 @@ function fakeSql(seed: Partial<ProviderState> = {}) {
     if (q.includes('FROM config.v_client_providers')) {
       return Promise.resolve(String(vals[0]) === providerState.id ? [{ ...providerState }] : []);
     }
-    // El outcome de un chequeo FALLIDO escribe estado sin audit, y por eso su
-    // SQL lleva `'failed'` literal en vez de pasarlo como parámetro. Va antes
-    // del write genérico: los dos son INSERT sobre la misma tabla.
+    // Los DOS outcomes de un chequeo escriben estado sin audit, y por eso su SQL
+    // lleva el status literal en vez de pasarlo como parámetro. Van antes del
+    // write genérico: los tres son INSERT sobre la misma tabla.
+    //
+    // El EXITOSO va primero porque su SQL nombra los dos literales — `'ok'` al
+    // insertar y `'failed'` dentro del CASE—, así que la rama del fallo se lo
+    // llevaría si fuese antes.
+    if (q.includes('INSERT INTO config.client_providers') && q.includes("'ok'")) {
+      // F6.11: upsert acotado. Si NO hay fila la crea con `ok`; si la hay sólo
+      // promueve desde `failed` — `pending_verification` es del cutover y un
+      // botón de prueba no lo completa.
+      callOrder.push('state:clear');
+      if (!hasClientRow) {
+        hasClientRow = true;
+        providerState.status = 'ok';
+      } else if (providerState.status === 'failed') {
+        providerState.status = 'ok';
+      }
+      providerState.statusDetail = null;
+      return Promise.resolve([]);
+    }
     if (q.includes('INSERT INTO config.client_providers') && q.includes("'failed'")) {
       callOrder.push('state:check-failed');
+      hasClientRow = true;
       providerState.status = 'failed';
       providerState.statusDetail = String(vals[2]);
       return Promise.resolve([]);
@@ -136,16 +159,9 @@ function fakeSql(seed: Partial<ProviderState> = {}) {
       const [provider_id, ownership, status, statusDetail, changedBy, changedFrom, notes] = vals;
       stateWrites.push({ provider_id, ownership, status, statusDetail, changedBy, changedFrom, notes });
       callOrder.push(`state:${String(status)}`);
+      hasClientRow = true;
       providerState.ownership = String(ownership);
       providerState.status = String(status);
-      return Promise.resolve([]);
-    }
-    if (q.includes('UPDATE config.client_providers')) {
-      // El update acotado del check exitoso: limpia el fallo anterior y NO
-      // toca el audit (`changed_by`/`changed_from` son del último cambio real).
-      callOrder.push('state:clear');
-      if (providerState.status === 'failed') providerState.status = 'ok';
-      providerState.statusDetail = null;
       return Promise.resolve([]);
     }
     if (q.includes('FROM config.providers')) {
@@ -242,6 +258,27 @@ describe('checkProviderCredential (T7.3) — no toca ownership', () => {
     // Y no escribe audit: probar no es un cambio de titularidad, así que
     // `changed_by`/`changed_from` tienen que seguir siendo los del último
     // cambio real.
+    expect(stateWrites).toHaveLength(0);
+  });
+
+  it('el chequeo que sale bien CREA la fila si el cliente nunca configuró el proveedor', async () => {
+    // F6.11 (plan WABA). Era un `UPDATE` pelado con el mismo agujero que
+    // `writeState` documenta: sin fila afecta 0 filas y devuelve éxito. Y la
+    // fila puede no existir — sin ella el proveedor se lee con el default del
+    // catálogo, así que un cliente que nunca configuró ese proveedor no tiene
+    // fila. Medido el 2026-09-03 en lab y palmawebs con Meta: se cargó el
+    // token, el check devolvió «autenticó contra Meta y accede a la WABA», y
+    // la card siguió diciendo `pending` sobre algo recién verificado.
+    const { sql, providerState, stateWrites } = fakeSql({ status: 'pending' }, false);
+    vi.mocked(verifyEmailCredential).mockResolvedValue({ ok: true, detail: 'autenticó' });
+    await seedCredential(sql);
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'resend');
+
+    expect(r).toMatchObject({ ok: true });
+    expect(providerState.status).toBe('ok');
+    // Sigue sin tocar el audit: crear la fila por un chequeo no es un cambio
+    // de titularidad.
     expect(stateWrites).toHaveLength(0);
   });
 });
