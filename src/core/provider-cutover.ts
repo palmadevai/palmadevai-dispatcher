@@ -314,15 +314,42 @@ export async function checkProviderCredential(
   // operador arregla la key, prueba, ve «ok» en la respuesta — y la card sigue
   // en rojo con el error viejo, que es peor que no haber mostrado nada.
   //
-  // Update acotado y no el `writeState` de arriba: acá no hay transición de
+  // F6.8/F6.11 (plan WABA, 2026-09-03): era un `UPDATE` pelado y tenía el mismo
+  // agujero que `writeState` documenta dos funciones más arriba — **sin fila,
+  // afecta 0 filas y devuelve éxito**. La fila puede no existir: sin ella el
+  // proveedor se lee con el default del catálogo, así que un cliente que NUNCA
+  // configuró ese proveedor no tiene fila. El camino de FALLO ya lo hacía bien
+  // (`writeCheckOutcome` upsertea); el de éxito no, y la asimetría se paga
+  // justo en el caso bueno: medido el 2026-09-03 en lab y palmawebs, se cargó
+  // el token de Meta, el check devolvió *«la credencial autenticó contra Meta y
+  // accede a la WABA»* — y la card siguió diciendo `pending` / «falta
+  // configurar» sobre algo que acababa de verificarse contra el proveedor.
+  //
+  // Upsert acotado y NO el `writeState` de arriba: acá no hay transición de
   // titularidad que auditar, así que pisar `changed_by`/`changed_from` con los
-  // de un botón de prueba borraría quién hizo el último cambio real.
+  // de un botón de prueba borraría quién hizo el último cambio real. En el
+  // INSERT el audit nace vacío, que es correcto: probar no es cambiar.
+  //
+  // `ownership` en el INSERT sale de la fila del catálogo, no de un default:
+  // crear la fila NO puede cambiar de titularidad al proveedor.
+  //
+  // El `status` es lo único asimétrico entre crear y actualizar, y es a
+  // propósito. Al CREAR va `ok`: no hay fila, o sea que no hay ninguna máquina
+  // de estados en vuelo, y lo que se acaba de comprobar es exactamente eso. Al
+  // ACTUALIZAR sigue promoviendo sólo desde `failed`, porque `pending_verification`
+  // es un estado del cutover que un botón de prueba no puede completar — el flip
+  // necesita evidencia de un envío real (T7.1 / T9.8.3), no un test de conexión.
   await deps.sql`
-    UPDATE config.client_providers
-       SET last_checked_at = now(),
-           status_detail   = NULL,
-           status          = CASE WHEN status = 'failed' THEN 'ok' ELSE status END
-     WHERE provider_id = ${providerId}
+    INSERT INTO config.client_providers
+      (provider_id, ownership, status, status_detail, last_checked_at)
+    SELECT ${providerId}, p.ownership, 'ok', NULL, now()
+      FROM config.providers p
+     WHERE p.id = ${providerId}
+    ON CONFLICT (provider_id) DO UPDATE
+      SET last_checked_at = now(),
+          status_detail   = NULL,
+          status          = CASE WHEN config.client_providers.status = 'failed'
+                                 THEN 'ok' ELSE config.client_providers.status END
   `;
 
   return { ok: true, detail: check.detail };
