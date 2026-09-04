@@ -36,6 +36,7 @@ import type { MetricsCollector } from './observability/metrics-collector.js';
 import { registerSendRoute } from './transports/http/send-route.js';
 import { registerNotifyRoute } from './transports/http/notify-route.js';
 import { registerMarkReadRoute } from './transports/http/mark-read-route.js';
+import { resolveWaEndpointAccessToken } from './dispatch/pick-phone.js';
 import { registerManagementRoutes } from './transports/http/management-routes.js';
 import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
@@ -148,6 +149,8 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     logger,
     sendBearer: env.DISPATCHER_SEND_BEARER,
     resolveDefaultPhoneNumberId: sendDeps.resolveDefaultPhoneNumberId,
+    // F8.6 — token por endpoint (multi-WABA); NULL → piso 1, como el envío.
+    resolveEndpointAccessToken: (phoneNumberId) => resolveWaEndpointAccessToken(sql, phoneNumberId),
   });
 
   // ── /management/* (Messaging Service F3) ────────────────────────────────

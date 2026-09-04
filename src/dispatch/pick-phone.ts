@@ -60,6 +60,36 @@ export async function resolvePinnedWaEndpoint(
   return { id: row.id, phone_number_id: row.phone_number_id, access_token: row.access_token };
 }
 
+/**
+ * F8.6 (plan WABA) — token propio del endpoint WhatsApp identificado por su
+ * `phone_number_id` (= `endpoint_id`), para los caminos que NO vienen de una
+ * campaña fijada y por eso no pasan por `resolvePinnedWaEndpoint`: hoy el
+ * `mark-read` (F6.8.b). Misma semántica que allá: el token por endpoint existe
+ * sólo en multi-app / multi-WABA; `null` (sin fila, sin token, o endpoint
+ * `disabled`) → el caller resuelve el bearer global por el piso 1.
+ *
+ * PUEDE LANZAR, a propósito: `bot.outbound_endpoints` es de la familia outbound
+ * (gateada por `MODULES_OUTBOUND_ENGINE`) y en un cliente sin esa familia la
+ * tabla puede no existir. El caller decide qué hacer con eso — para un tilde
+ * azul, avisar y caer al global; tragarse el error acá sería el patrón «falla
+ * en silencio» que este plan lleva cuatro nodos corrigiendo.
+ */
+export async function resolveWaEndpointAccessToken(
+  sql: SqlOrTx,
+  phoneNumberId: string,
+): Promise<string | null> {
+  const rows = await sql<Array<{ access_token: string | null; status: string }>>`
+    SELECT access_token, status
+    FROM bot.outbound_endpoints
+    WHERE channel = 'whatsapp' AND endpoint_id = ${phoneNumberId}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row || row.status === 'disabled') return null;
+  const token = row.access_token?.trim() ?? '';
+  return token === '' ? null : token;
+}
+
 interface PhoneRow {
   id: string;
   phone_number_id: string;
