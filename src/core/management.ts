@@ -570,6 +570,11 @@ export interface SyncEndpointsResult {
  * GET /{WABA}/phone_numbers → UPSERT `bot.outbound_endpoints`
  * (channel='whatsapp'). No pisa overrides manuales (priority/daily_cap).
  */
+/** F8.2.b — `bot.outbound_endpoints` no existe: la familia outbound no está instalada. */
+export const OUTBOUND_NOT_INSTALLED =
+  'bot.outbound_endpoints no existe en este cliente: la familia outbound (feature `campaigns`) ' +
+  'no está instalada, así que el sync de números no aplica. Se activa con la feature, no a mano.';
+
 export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpointsResult> {
   const wabaId = await resolveWabaId();
   if (!wabaId) {
@@ -604,6 +609,20 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
       if (r[0]?.inserted) inserted++;
       else updated++;
     } catch (err) {
+      // F8.2.b (plan WABA) — tabla ausente ≠ error por número. La familia
+      // outbound está gateada (`MODULES_OUTBOUND_ENGINE`) y en un cliente sin
+      // `campaigns` la tabla NO existe (medido en palmawebs, 2026-09-04). Eso
+      // es un estado declarado por su `client.yaml`: se dice con la causa y
+      // sin un «OK: 0 nuevos» al lado, que es el falso verde de siempre.
+      if ((err as { code?: string })?.code === '42P01') {
+        return {
+          ok: false,
+          message: OUTBOUND_NOT_INSTALLED,
+          inserted,
+          updated,
+          errors: [],
+        };
+      }
       errors.push(`${p.display_phone_number}: ${err instanceof Error ? err.message : 'error'}`);
     }
   }

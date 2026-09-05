@@ -35,6 +35,8 @@ import {
   endpointStatusFromQuality,
   parseMessagingTier,
   syncTemplates,
+  syncEndpoints,
+  OUTBOUND_NOT_INSTALLED,
   deleteWaTemplate,
   createWaTemplate,
   type ManagementDeps,
@@ -338,6 +340,47 @@ describe('syncTemplates', () => {
     expect(r.ok).toBe(true);
     expect(r.errors).toEqual(['WABA waba-global: HTTP 401: bad token']);
     expect(r.total_fetched).toBe(0);
+  });
+});
+
+describe('syncEndpoints — F8.2.b: tabla ausente (familia outbound no instalada)', () => {
+  const phone = { id: '1084221031440213', display_phone_number: '+54 9 11 2737-0802', quality_rating: 'GREEN' };
+
+  it('upserts los números de la WABA y cuenta', async () => {
+    const { deps } = makeDeps({
+      sqlResponses: [[{ inserted: true }]],
+      graph: { fetchPhoneNumbers: vi.fn(async () => ({ ok: true as const, phones: [phone] })) },
+    });
+    const r = await syncEndpoints(deps);
+    expect(r.ok).toBe(true);
+    expect(r.inserted).toBe(1);
+    expect(r.errors).toEqual([]);
+  });
+
+  it('42P01 (bot.outbound_endpoints no existe) → ok:false con la causa, NUNCA «OK: 0 nuevos»', async () => {
+    const { deps } = makeDeps({
+      graph: { fetchPhoneNumbers: vi.fn(async () => ({ ok: true as const, phones: [phone] })) },
+    });
+    deps.sql = (() => {
+      throw Object.assign(new Error('relation "bot.outbound_endpoints" does not exist'), { code: '42P01' });
+    }) as unknown as SqlClient;
+    const r = await syncEndpoints(deps);
+    expect(r.ok).toBe(false);
+    expect(r.message).toBe(OUTBOUND_NOT_INSTALLED);
+    expect(r.message).toContain('campaigns');
+    expect(r.errors).toEqual([]);
+  });
+
+  it('otro error de SQL sigue siendo por número (errors[]) y el sync termina', async () => {
+    const { deps } = makeDeps({
+      graph: { fetchPhoneNumbers: vi.fn(async () => ({ ok: true as const, phones: [phone] })) },
+    });
+    deps.sql = (() => {
+      throw new Error('deadlock detected');
+    }) as unknown as SqlClient;
+    const r = await syncEndpoints(deps);
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual(['+54 9 11 2737-0802: deadlock detected']);
   });
 });
 
