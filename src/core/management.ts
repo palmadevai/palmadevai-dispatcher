@@ -572,8 +572,9 @@ export interface SyncEndpointsResult {
  */
 /** F8.2.b — `bot.outbound_endpoints` no existe: la familia outbound no está instalada. */
 export const OUTBOUND_NOT_INSTALLED =
-  'bot.outbound_endpoints no existe en este cliente: la familia outbound (feature `campaigns`) ' +
-  'no está instalada, así que el sync de números no aplica. Se activa con la feature, no a mano.';
+  'bot.outbound_endpoints no existe en este cliente: el sustrato de datos del dispatcher ' +
+  '(migraciones gateadas por MODULES_OUTBOUND_ENGINE) no está provisionado. No es un dato a cargar: ' +
+  'es una migración pendiente — plan WABA F8.2.b.';
 
 export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpointsResult> {
   const wabaId = await resolveWabaId();
@@ -609,11 +610,13 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
       if (r[0]?.inserted) inserted++;
       else updated++;
     } catch (err) {
-      // F8.2.b (plan WABA) — tabla ausente ≠ error por número. La familia
-      // outbound está gateada (`MODULES_OUTBOUND_ENGINE`) y en un cliente sin
-      // `campaigns` la tabla NO existe (medido en palmawebs, 2026-09-04). Eso
-      // es un estado declarado por su `client.yaml`: se dice con la causa y
-      // sin un «OK: 0 nuevos» al lado, que es el falso verde de siempre.
+      // F8.2.b (plan WABA) — tabla ausente ≠ error por número. El registro de
+      // endpoints es sustrato DEL DISPATCHER (n endpoints, canal-agnóstico; lo
+      // usan campañas, staff, notify), pero sus migraciones nacieron gateadas
+      // por `MODULES_OUTBOUND_ENGINE` y en palmawebs ese flag no está
+      // (medido 2026-09-04): la tabla no existe aunque el dispatcher corra.
+      // Se dice con la causa real y sin un «OK: 0 nuevos» al lado, que es el
+      // falso verde de siempre.
       if ((err as { code?: string })?.code === '42P01') {
         return {
           ok: false,

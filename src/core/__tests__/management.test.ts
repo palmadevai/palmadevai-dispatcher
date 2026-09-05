@@ -367,7 +367,7 @@ describe('syncEndpoints — F8.2.b: tabla ausente (familia outbound no instalada
     const r = await syncEndpoints(deps);
     expect(r.ok).toBe(false);
     expect(r.message).toBe(OUTBOUND_NOT_INSTALLED);
-    expect(r.message).toContain('campaigns');
+    expect(r.message).toContain('MODULES_OUTBOUND_ENGINE');
     expect(r.errors).toEqual([]);
   });
 

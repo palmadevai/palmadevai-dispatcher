@@ -68,12 +68,13 @@ export async function resolvePinnedWaEndpoint(
  * sólo en multi-app / multi-WABA; `null` (sin fila, sin token, o endpoint
  * `disabled`) → el caller resuelve el bearer global por el piso 1.
  *
- * TABLA AUSENTE ≠ FALLA. `bot.outbound_endpoints` es de la familia outbound
- * (gateada por `MODULES_OUTBOUND_ENGINE`) y en un cliente sin esa familia la
- * tabla NO existe — medido en palmawebs el 2026-09-04. Ahí no hay token por
- * endpoint por construcción, así que `42P01` (undefined_table) devuelve `null`
- * en silencio: es un estado declarado por el `client.yaml`, no un incidente, y
- * avisarlo en cada mensaje entrante sería ruido sin acción posible. Cualquier
+ * TABLA AUSENTE ≠ FALLA DE ESTE REQUEST. El registro de endpoints es sustrato
+ * del dispatcher, pero sus migraciones nacieron gateadas por
+ * `MODULES_OUTBOUND_ENGINE` y en un cliente sin ese flag la tabla NO existe —
+ * medido en palmawebs el 2026-09-04 (plan WABA F8.2.b). Ahí no puede haber
+ * token por endpoint, así que `42P01` (undefined_table) devuelve `null` sin
+ * ruido: el hueco es de provisioning y lo vigila F8.2.b, no un warn por cada
+ * mensaje entrante, que no le da a nadie una acción posible. Cualquier
  * OTRO error sí lanza: el caller decide (para un tilde azul, avisar y caer al
  * global) — tragárselo acá sería el patrón «falla en silencio» que este plan
  * lleva cuatro nodos corrigiendo.
