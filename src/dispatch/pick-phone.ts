@@ -17,6 +17,7 @@
  * available pool below operator's intent.
  */
 import type { Sql, TransactionSql } from 'postgres';
+import { isMissingRelation } from '../lib/pg-errors.js';
 
 type SqlOrTx = Sql | TransactionSql;
 
@@ -92,7 +93,7 @@ export async function resolveWaEndpointAccessToken(
       LIMIT 1
     `;
   } catch (e) {
-    if ((e as { code?: string })?.code === '42P01') return null;
+    if (isMissingRelation(e)) return null;
     throw e;
   }
   const row = rows[0];

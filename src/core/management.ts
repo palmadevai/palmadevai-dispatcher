@@ -19,6 +19,7 @@ import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import type { GraphManagement, GraphTemplate } from '../providers/whatsapp-management.js';
 import { readChannelWhatsAppConfig } from '../lib/providers.js';
+import { isMissingRelation } from '../lib/pg-errors.js';
 import { notify, type NotifyDeps } from './notify.js';
 
 export interface ManagementDeps {
@@ -617,7 +618,7 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
       // (medido 2026-09-04): la tabla no existe aunque el dispatcher corra.
       // Se dice con la causa real y sin un «OK: 0 nuevos» al lado, que es el
       // falso verde de siempre.
-      if ((err as { code?: string })?.code === '42P01') {
+      if (isMissingRelation(err)) {
         return {
           ok: false,
           message: OUTBOUND_NOT_INSTALLED,
