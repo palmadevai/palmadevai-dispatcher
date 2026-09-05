@@ -33,6 +33,14 @@ export interface MarkReadRouteDeps {
    * 502 con las DOS fuentes nombradas.
    */
   resolveDefaultPhoneNumberId: () => Promise<string | null>;
+  /**
+   * F8.6 / F6.8.b — token PROPIO del endpoint (`bot.outbound_endpoints.access_token`
+   * de la fila con ese `phone_number_id`), el mismo que usa el envío de una
+   * campaña fijada. `null` → el provider resuelve el bearer global por el
+   * piso 1. Si LANZA (p. ej. la tabla no existe en un cliente sin la familia
+   * outbound) se avisa y se cae al global: un tilde azul no justifica un 500.
+   */
+  resolveEndpointAccessToken: (phoneNumberId: string) => Promise<string | null>;
 }
 
 export function registerMarkReadRoute(app: FastifyInstance, deps: MarkReadRouteDeps): void {
@@ -64,13 +72,25 @@ export function registerMarkReadRoute(app: FastifyInstance, deps: MarkReadRouteD
       });
     }
 
+    // F8.6 — el token fijado al número, si existe (multi-app / multi-WABA).
+    let accessToken: string | null = null;
+    try {
+      accessToken = await deps.resolveEndpointAccessToken(phoneNumberId);
+    } catch (e) {
+      deps.logger.warn(
+        { phone_number_id: phoneNumberId, err: e instanceof Error ? e.message : String(e) },
+        'mark-read: no se pudo leer el token del endpoint — se usa el bearer global',
+      );
+    }
+
     const result = await markReadWhatsApp({
       phone_number_id: phoneNumberId,
       message_id: parsed.data.message_id,
+      ...(accessToken ? { access_token: accessToken } : {}),
     });
 
     if (result.ok) {
-      return reply.code(200).send({ status: 'read' });
+      return reply.code(200).send({ status: 'read', token_source: result.token_source });
     }
 
     // 502 y no un 200 optimista: el llamador se enteró de que no se marcó. Que
@@ -81,6 +101,7 @@ export function registerMarkReadRoute(app: FastifyInstance, deps: MarkReadRouteD
       status: 'failed',
       error_code: result.error_code,
       error_message: result.error_message,
+      token_source: result.token_source,
     });
   });
 }

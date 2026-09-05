@@ -19,6 +19,7 @@ import type { SqlClient } from '../lib/postgres.js';
 import type { Logger } from '../lib/logger.js';
 import type { GraphManagement, GraphTemplate } from '../providers/whatsapp-management.js';
 import { readChannelWhatsAppConfig } from '../lib/providers.js';
+import { isMissingRelation } from '../lib/pg-errors.js';
 import { notify, type NotifyDeps } from './notify.js';
 
 export interface ManagementDeps {
@@ -570,6 +571,12 @@ export interface SyncEndpointsResult {
  * GET /{WABA}/phone_numbers → UPSERT `bot.outbound_endpoints`
  * (channel='whatsapp'). No pisa overrides manuales (priority/daily_cap).
  */
+/** F8.2.b — `bot.outbound_endpoints` no existe: la familia outbound no está instalada. */
+export const OUTBOUND_NOT_INSTALLED =
+  'bot.outbound_endpoints no existe en este cliente: el sustrato de datos del dispatcher ' +
+  '(migraciones gateadas por MODULES_OUTBOUND_ENGINE) no está provisionado. No es un dato a cargar: ' +
+  'es una migración pendiente — plan WABA F8.2.b.';
+
 export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpointsResult> {
   const wabaId = await resolveWabaId();
   if (!wabaId) {
@@ -604,6 +611,22 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
       if (r[0]?.inserted) inserted++;
       else updated++;
     } catch (err) {
+      // F8.2.b (plan WABA) — tabla ausente ≠ error por número. El registro de
+      // endpoints es sustrato DEL DISPATCHER (n endpoints, canal-agnóstico; lo
+      // usan campañas, staff, notify), pero sus migraciones nacieron gateadas
+      // por `MODULES_OUTBOUND_ENGINE` y en palmawebs ese flag no está
+      // (medido 2026-09-04): la tabla no existe aunque el dispatcher corra.
+      // Se dice con la causa real y sin un «OK: 0 nuevos» al lado, que es el
+      // falso verde de siempre.
+      if (isMissingRelation(err)) {
+        return {
+          ok: false,
+          message: OUTBOUND_NOT_INSTALLED,
+          inserted,
+          updated,
+          errors: [],
+        };
+      }
       errors.push(`${p.display_phone_number}: ${err instanceof Error ? err.message : 'error'}`);
     }
   }

@@ -87,6 +87,19 @@ curl http://localhost:8080/health
 
 503 si Redis o Postgres no responden en <2s.
 
+**Tres estados desde F9.6 (plan WABA, 2026-09-05)** — `lib/health.ts`:
+
+| `status` | HTTP | qué significa |
+|---|---|---|
+| `healthy` | 200 | Redis y Postgres responden; el esquema está completo para lo que el cliente contrató |
+| `degraded` | **200** | Redis y Postgres responden pero falta el **sustrato de messaging** (`bot.outbound_endpoints`, `bot.message_templates` — mig 230). `/send` y `/notify` siguen; el sync de números, el mirror de plantillas y el token por endpoint no. `reasons[]` nombra la causa. Es 200 a propósito: un 503 haría que Docker reinicie el container en loop por un hueco de provisioning que el runtime no puede arreglar |
+| `unhealthy` | 503 | Redis o Postgres no responden |
+
+El body trae además `schema: { messaging, campaigns, missing[] }`. `campaigns: false` **no**
+degrada: es lo esperado en un cliente sin esa feature, y en ese caso los workers de campañas
+(stream, recovery, wakeup, emisor CRM) **no arrancan** (`lib/schema-probe.ts`, sondeo único al
+boot con `to_regclass`; `bullmq_workers_count` refleja los que arrancaron).
+
 ### Bull Board
 
 `http://localhost:8080/admin/queues` — UI para inspeccionar jobs active,
@@ -164,6 +177,8 @@ src/
 | Container restart loop, `Cannot connect to Redis` | `15-redis` down o pwd mismatch | Verificar `REDIS_PASSWORD` matches el del stack 15-redis |
 | `XGROUP CREATE` BUSYGROUP en logs | Stream + group ya existen — esperado | Es idempotente; log info, no error |
 | `/health` retorna 503 con `postgres_ok: false` | Pool no conecta o credenciales mal | Verificar `APPDB_PASSWORD` + `appdb_user` existe |
+| `/health` retorna 200 con `status: degraded` | Falta el sustrato de messaging en la base del cliente (mig 230 no aplicada) | Es provisioning, no runtime: el cliente tiene que tener `messaging` en la clausura de su `client.yaml`; el próximo ciclo de GitOps aplica la 230 y el próximo boot la ve |
+| Log `sin esquema de campañas — los workers de campañas no arrancan` al boot | El cliente no contrata `campaigns` | Esperado; no es error. `schema.campaigns: false` en `/health` |
 | `OOM command not allowed` | Redis lleno con `noeviction` (config canónica) | Subir `REDIS_MAXMEMORY` o inspect bigkeys; NO bajar a `allkeys-lru` (ADR-001) |
 | Jobs stuck en PEL >5min | Recovery worker no está corriendo | Ver logs del container; en F1.2.a recovery es STUB y solo loguea |
 

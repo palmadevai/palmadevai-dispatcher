@@ -17,6 +17,7 @@
  * available pool below operator's intent.
  */
 import type { Sql, TransactionSql } from 'postgres';
+import { isMissingRelation } from '../lib/pg-errors.js';
 
 type SqlOrTx = Sql | TransactionSql;
 
@@ -58,6 +59,47 @@ export async function resolvePinnedWaEndpoint(
   const row = rows[0];
   if (!row || row.status === 'disabled') return null;
   return { id: row.id, phone_number_id: row.phone_number_id, access_token: row.access_token };
+}
+
+/**
+ * F8.6 (plan WABA) — token propio del endpoint WhatsApp identificado por su
+ * `phone_number_id` (= `endpoint_id`), para los caminos que NO vienen de una
+ * campaña fijada y por eso no pasan por `resolvePinnedWaEndpoint`: hoy el
+ * `mark-read` (F6.8.b). Misma semántica que allá: el token por endpoint existe
+ * sólo en multi-app / multi-WABA; `null` (sin fila, sin token, o endpoint
+ * `disabled`) → el caller resuelve el bearer global por el piso 1.
+ *
+ * TABLA AUSENTE ≠ FALLA DE ESTE REQUEST. El registro de endpoints es sustrato
+ * del dispatcher, pero sus migraciones nacieron gateadas por
+ * `MODULES_OUTBOUND_ENGINE` y en un cliente sin ese flag la tabla NO existe —
+ * medido en palmawebs el 2026-09-04 (plan WABA F8.2.b). Ahí no puede haber
+ * token por endpoint, así que `42P01` (undefined_table) devuelve `null` sin
+ * ruido: el hueco es de provisioning y lo vigila F8.2.b, no un warn por cada
+ * mensaje entrante, que no le da a nadie una acción posible. Cualquier
+ * OTRO error sí lanza: el caller decide (para un tilde azul, avisar y caer al
+ * global) — tragárselo acá sería el patrón «falla en silencio» que este plan
+ * lleva cuatro nodos corrigiendo.
+ */
+export async function resolveWaEndpointAccessToken(
+  sql: SqlOrTx,
+  phoneNumberId: string,
+): Promise<string | null> {
+  let rows: Array<{ access_token: string | null; status: string }>;
+  try {
+    rows = await sql<Array<{ access_token: string | null; status: string }>>`
+      SELECT access_token, status
+      FROM bot.outbound_endpoints
+      WHERE channel = 'whatsapp' AND endpoint_id = ${phoneNumberId}
+      LIMIT 1
+    `;
+  } catch (e) {
+    if (isMissingRelation(e)) return null;
+    throw e;
+  }
+  const row = rows[0];
+  if (!row || row.status === 'disabled') return null;
+  const token = row.access_token?.trim() ?? '';
+  return token === '' ? null : token;
 }
 
 interface PhoneRow {

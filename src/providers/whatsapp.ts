@@ -344,11 +344,20 @@ export interface WhatsAppMarkReadInput {
   access_token?: string;
 }
 
+/**
+ * F8.6 — de dónde salió el bearer con el que se marcó: `endpoint` es el token
+ * propio de la fila de `bot.outbound_endpoints` (multi-app / multi-WABA); los
+ * otros tres son los pasos del resolver global del piso 1. Viaja en la
+ * respuesta HTTP para que el smoke lo pueda LEER en vez de inferirlo del log.
+ */
+export type MarkReadTokenSource = 'endpoint' | 'vault' | 'db' | 'env';
+
 export interface MarkReadResult {
   ok: boolean;
   http_status?: number;
   error_code?: string;
   error_message?: string;
+  token_source?: MarkReadTokenSource;
 }
 
 /**
@@ -372,7 +381,10 @@ export interface MarkReadResult {
  * que una caída de Meta ensuciara el log del bot por algo que no afecta a nadie.
  */
 export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<MarkReadResult> {
+  // F8.6 / F6.8.b — el token fijado al número gana, igual que en el envío
+  // (`prepareWhatsApp` → `resolvePinnedWaEndpoint`). Sin él, el global del piso 1.
   let bearer = input.access_token ?? null;
+  let tokenSource: MarkReadTokenSource = 'endpoint';
   if (!bearer) {
     const key = await resolveProviderKey('meta');
     if (!key.ok) {
@@ -383,6 +395,7 @@ export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<Ma
       return { ok: false, error_code: 'missing_credential', error_message: key.error };
     }
     bearer = key.apiKey;
+    tokenSource = key.source;
   }
 
   const url =
@@ -410,7 +423,7 @@ export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<Ma
       // El cuerpo se descarta a propósito (`{success:true}`), pero se CONSUME:
       // undici filtra si nadie lee el body y el socket queda colgado.
       await res.body.dump();
-      return { ok: true, http_status: status };
+      return { ok: true, http_status: status, token_source: tokenSource };
     }
 
     let body: unknown = null;
@@ -425,6 +438,7 @@ export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<Ma
       http_status: status,
       error_code: err?.code !== undefined ? String(err.code) : undefined,
       error_message: err?.message ?? `HTTP ${status}`,
+      token_source: tokenSource,
     };
     logger.warn(
       { phone_number_id: input.phone_number_id, ...result },
@@ -434,9 +448,9 @@ export async function markReadWhatsApp(input: WhatsAppMarkReadInput): Promise<Ma
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     logger.warn(
-      { phone_number_id: input.phone_number_id, err: message },
+      { phone_number_id: input.phone_number_id, token_source: tokenSource, err: message },
       'mark-read: error de red — sin retry (es cosmético)',
     );
-    return { ok: false, error_code: 'network_error', error_message: message };
+    return { ok: false, error_code: 'network_error', error_message: message, token_source: tokenSource };
   }
 }

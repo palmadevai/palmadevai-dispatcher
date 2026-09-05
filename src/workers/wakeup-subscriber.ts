@@ -17,6 +17,7 @@
  * SELECT FOR UPDATE SKIP LOCKED + skip si status!='pending'.
  */
 import type { Redis } from 'ioredis';
+import { isMissingRelation, announceOnce } from '../lib/pg-errors.js';
 import type { Sql } from 'postgres';
 import type { Logger } from '../lib/logger.js';
 import { env } from '../env.js';
@@ -77,6 +78,18 @@ export function startWakeupSubscriber(deps: WakeupSubscriberDeps): WakeupSubscri
         logger.info({ count: fresh.length, reason }, 'wakeup: enqueued fresh pending deliveries to stream');
       }
     } catch (err) {
+      // F9.6 — tabla ausente ≠ falla: sin `campaigns` este worker no arranca
+      // (index.ts), pero si arrancó y la relación desaparece o llega tarde,
+      // se dice UNA vez, no un error por ciclo (palmawebs, 2026-09-04).
+      if (isMissingRelation(err)) {
+        announceOnce(
+          logger,
+          'wakeup:missing-relation',
+          { err: (err as Error).message },
+          'wakeup: esquema de campañas ausente — el scan no corre hasta que la migración llegue',
+        );
+        return;
+      }
       logger.error({ err: (err as Error).message }, 'wakeup: scan failed');
     }
   }
