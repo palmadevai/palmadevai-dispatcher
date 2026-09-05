@@ -42,6 +42,8 @@ import { registerMcpRoutes } from './transports/mcp/routes.js';
 import type { ManagementDeps } from './core/management.js';
 import type { SendDeps } from './core/messaging.js';
 import type { NotifyDeps } from './core/notify.js';
+import type { SchemaState } from './lib/schema-probe.js';
+import { buildHealth } from './lib/health.js';
 
 export interface ServerDeps {
   bullmqConnection: ConnectionOptions;
@@ -60,6 +62,12 @@ export interface ServerDeps {
   sendDeps: SendDeps;
   /** F7.5 — la mecánica de los avisos, compartida con los emisores propios. */
   notifyDeps: NotifyDeps;
+  /** F9.6 — esquema sondeado al boot (null = no sondeado, p. ej. tests). */
+  schema?: SchemaState | null;
+  /** F9.6 — por qué el proceso está degradado (vacío = no lo está). */
+  degradedReasons?: string[];
+  /** F9.6 — workers efectivamente arrancados. */
+  workersCount?: number;
 }
 
 const HEALTHCHECK_PING_TIMEOUT_MS = 2000;
@@ -115,18 +123,17 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
       pingPostgres(sql),
     ]);
 
-    const healthy = redisOk && postgresOk;
-    const body = {
-      status: healthy ? 'healthy' : 'unhealthy',
-      redis_ok: redisOk,
-      postgres_ok: postgresOk,
-      // F1.2.b: contar workers vivos (los pasamos al server desde index.ts).
-      // Por ahora: hardcoded 3 (dispatcher + recovery + metrics-flush).
-      bullmq_workers_count: 3,
-      uptime_ms: Date.now() - startTimestamp,
-      stub_mode: env.STUB_MODE,
-    };
-    return reply.code(healthy ? 200 : 503).send(body);
+    // F9.6 — tres estados (healthy / degraded / unhealthy), ver lib/health.ts.
+    const { code, body } = buildHealth({
+      redisOk,
+      postgresOk,
+      schema: deps.schema ?? null,
+      degradedReasons: deps.degradedReasons ?? [],
+      uptimeMs: Date.now() - startTimestamp,
+      stubMode: env.STUB_MODE,
+      workersCount: deps.workersCount ?? 3,
+    });
+    return reply.code(code).send(body);
   });
 
   // ── /send (Messaging Service H2.1) ──────────────────────────────────────
