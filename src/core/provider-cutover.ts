@@ -57,7 +57,13 @@ import {
   gatewayOpenAiCompletion,
 } from '../providers/openai-byok.js';
 import type { CredentialCheck } from '../providers/types.js';
-import { invalidateProviderCache, resolveDefaultFrom, type ProviderId } from '../lib/providers.js';
+import {
+  invalidateProviderCache,
+  resolveDefaultFrom,
+  resolveProviderKey,
+  type ProviderId,
+  type ResolvedKey,
+} from '../lib/providers.js';
 
 /**
  * Dónde va el cliente a arreglar lo suyo (T7.7).
@@ -265,6 +271,63 @@ function rejectedDetail(row: ProviderRow, code: string, message: string): string
   return `${row.name} rechazó la credencial (${code}: ${message}). Se arregla ${where}.${stillOurs}`;
 }
 
+/** Inyectable para tests — el default real es `resolveProviderKey` (F6.10). */
+export interface CheckOpts {
+  resolveKey?: (id: ProviderId) => Promise<ResolvedKey>;
+}
+
+type CheckableCredential =
+  | { ok: true; credential: string; managed: boolean }
+  | { ok: false; code: 'no_credential' | 'undecryptable' | 'no_master_key'; message: string };
+
+/**
+ * La credencial que hay para probar (F6.10) — el ciphertext del cliente si
+ * está, y si no la nuestra.
+ *
+ * EL ORDEN IMPORTA, Y NO ES «según el ownership». La tentación era ramificar
+ * por `ownership`: `owned` → piso 1, resto → env. **Rompería el cutover**: el
+ * cliente carga su credencial con el proveedor todavía en `managed` (el flip
+ * llega después, con evidencia de un envío real — T7.1), así que el botón
+ * «probar» que filtra ese cutover corre justo en `managed` **sobre el
+ * ciphertext recién guardado**. Ramificar por ownership haría que ese botón
+ * validara NUESTRA key y diera verde sobre una credencial del cliente que
+ * nadie miró — el falso verde de siempre, en el peor lugar.
+ *
+ * Así que primero el ciphertext, y el fallback es sólo para su AUSENCIA
+ * (`absent`) con el proveedor fuera de `owned`: ese es el caso que F6.10
+ * describe —`managed` sin BYOK cargado— donde el chequeo respondía «sin
+ * credencial cargada» sobre un proveedor que está mandando bien con la
+ * nuestra. `undecryptable` / `no_master_key` NO caen al fallback: son fallas
+ * reales del piso 1 y taparlas con nuestra key sería esconderlas.
+ *
+ * `owned` sin ciphertext sigue fallando cerrado, como en el resolver de envío:
+ * la cuenta es del cliente y mandar con la nuestra es exactamente lo que el
+ * BYOK evita.
+ */
+async function loadCheckableCredential(
+  deps: CredentialDeps,
+  providerId: string,
+  ownership: string,
+  opts: CheckOpts,
+): Promise<CheckableCredential> {
+  const loaded = await loadProviderCredential(deps, providerId);
+  if (loaded.ok) return { ok: true, credential: loaded.credential, managed: false };
+
+  if (loaded.code !== 'absent' || ownership === 'owned') {
+    return {
+      ok: false,
+      code: loaded.code === 'absent' ? 'no_credential' : loaded.code,
+      message: loaded.message,
+    };
+  }
+
+  const resolve = opts.resolveKey ?? resolveProviderKey;
+  const key = await resolve(providerId as ProviderId);
+  if (key.ok) return { ok: true, credential: key.apiKey, managed: true };
+  // El resolver ya nombra la env concreta que falta — es lo único accionable.
+  return { ok: false, code: 'no_credential', message: key.error };
+}
+
 /**
  * T7.3 — test de conexión, sin mandar nada y sin tocar el `ownership`.
  *
@@ -276,6 +339,7 @@ function rejectedDetail(row: ProviderRow, code: string, message: string): string
 export async function checkProviderCredential(
   deps: CredentialDeps,
   providerId: string,
+  opts: CheckOpts = {},
 ): Promise<CheckResult> {
   const row = await readProvider(deps, providerId);
   if (!row) {
@@ -293,13 +357,25 @@ export async function checkProviderCredential(
     };
   }
 
-  const loaded = await loadProviderCredential(deps, providerId);
-  if (!loaded.ok) {
-    const code = loaded.code === 'absent' ? 'no_credential' : loaded.code;
-    return { ok: false, code, message: loaded.message };
+  // F6.10 (plan WABA) — el botón «probar» tiene que saber chequear una
+  // credencial `managed`, que es JUSTO cuando más falta hace: con `managed` no
+  // hay ciphertext en el piso 1, así que `loadProviderCredential` devuelve
+  // `absent` y el chequeo respondía «sin credencial cargada» sobre un proveedor
+  // que está mandando bien con NUESTRA key. No se disparó hasta hoy porque los
+  // tres clientes tienen `meta` en `owned` (F6.8, opción (a) de 👤).
+  //
+  // La credencial que se prueba es la que el proveedor USA, y de eso ya hay un
+  // único dueño: `resolveProviderKey` (vault → `key_ref` → env, §4.7 de
+  // `analysis-secretos-en-reposo.md`). Se lo llama SÓLO en la rama managed y no
+  // se toca la rama `owned`, que sigue por `loadProviderCredential` para
+  // conservar sus códigos (`undecryptable`, `no_master_key`) — un resolver que
+  // colapsa esos casos en «no hay key» sería peor diagnóstico, no mejor.
+  const credential = await loadCheckableCredential(deps, providerId, row.ownership, opts);
+  if (!credential.ok) {
+    return { ok: false, code: credential.code, message: credential.message };
   }
 
-  const check = await verify(loaded.credential);
+  const check = await verify(credential.credential);
   if (!check.ok) {
     const detail = rejectedDetail(row, check.error_code, check.error_message);
     await writeCheckOutcome(deps, providerId, row.ownership, detail);
@@ -352,7 +428,15 @@ export async function checkProviderCredential(
                                  THEN 'ok' ELSE config.client_providers.status END
   `;
 
-  return { ok: true, detail: check.detail };
+  // De quién era la credencial que se probó, dicho en el detalle: un «autenticó
+  // OK» que no distingue entre la del cliente y la nuestra es la mitad de la
+  // respuesta. Mismo criterio que el `token_source` de F8.6.
+  return {
+    ok: true,
+    detail: credential.managed
+      ? `${check.detail} (se probó la credencial administrada por nosotros: este cliente no tiene una propia cargada)`
+      : check.detail,
+  };
 }
 
 /**

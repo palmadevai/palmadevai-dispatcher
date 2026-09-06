@@ -571,11 +571,25 @@ export interface SyncEndpointsResult {
  * GET /{WABA}/phone_numbers → UPSERT `bot.outbound_endpoints`
  * (channel='whatsapp'). No pisa overrides manuales (priority/daily_cap).
  */
-/** F8.2.b — `bot.outbound_endpoints` no existe: la familia outbound no está instalada. */
+/**
+ * F8.2.b — `bot.outbound_endpoints` no existe en esta base.
+ *
+ * 🧭 **F9.8.b: este texto nombraba la causa equivocada.** Decía «migraciones
+ * gateadas por `MODULES_OUTBOUND_ENGINE`», que es la lectura que F8.2.b midió
+ * y descartó: el runner de producción **no lee `MODULES_*`** — gatea por
+ * features contratadas y toma el dueño del header `-- feature:`. El sustrato
+ * llevaba header `campaigns`, palmawebs no contrata campañas, y por eso no lo
+ * recibía. Desde la **mig 230** (F9.1) el sustrato es de `messaging` y llega a
+ * todo cliente que la contrate —incluida la clausura por `runtime_uses`, o sea
+ * cualquiera con `chat-bot`—, así que hoy la ausencia significa otra cosa: la
+ * 230 todavía no corrió en esta base. Un mensaje que manda al operador a
+ * buscar un flag inexistente cuesta más que no decir nada.
+ */
 export const OUTBOUND_NOT_INSTALLED =
-  'bot.outbound_endpoints no existe en este cliente: el sustrato de datos del dispatcher ' +
-  '(migraciones gateadas por MODULES_OUTBOUND_ENGINE) no está provisionado. No es un dato a cargar: ' +
-  'es una migración pendiente — plan WABA F8.2.b.';
+  'bot.outbound_endpoints no existe en este cliente: el sustrato del Messaging Service ' +
+  '(migración 230 de la feature `messaging`) todavía no se aplicó en esta base. No es un dato ' +
+  'a cargar: se resuelve solo en el próximo ciclo del deploy, que aplica las migraciones ' +
+  'pendientes — plan WABA F9.1.';
 
 export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpointsResult> {
   const wabaId = await resolveWabaId();
@@ -612,12 +626,11 @@ export async function syncEndpoints(deps: ManagementDeps): Promise<SyncEndpoints
       else updated++;
     } catch (err) {
       // F8.2.b (plan WABA) — tabla ausente ≠ error por número. El registro de
-      // endpoints es sustrato DEL DISPATCHER (n endpoints, canal-agnóstico; lo
-      // usan campañas, staff, notify), pero sus migraciones nacieron gateadas
-      // por `MODULES_OUTBOUND_ENGINE` y en palmawebs ese flag no está
-      // (medido 2026-09-04): la tabla no existe aunque el dispatcher corra.
-      // Se dice con la causa real y sin un «OK: 0 nuevos» al lado, que es el
-      // falso verde de siempre.
+      // endpoints es sustrato DEL SERVICIO (n endpoints, canal-agnóstico; lo
+      // usan campañas, staff, notify) y desde la mig 230 su dueña declarada es
+      // `messaging` (F9.1). Que falte significa que esa migración todavía no
+      // corrió en esta base — no un flag apagado (F9.8.b). Se dice con la causa
+      // real y sin un «OK: 0 nuevos» al lado, que es el falso verde de siempre.
       if (isMissingRelation(err)) {
         return {
           ok: false,

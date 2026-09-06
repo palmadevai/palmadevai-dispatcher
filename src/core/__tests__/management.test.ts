@@ -367,7 +367,10 @@ describe('syncEndpoints — F8.2.b: tabla ausente (familia outbound no instalada
     const r = await syncEndpoints(deps);
     expect(r.ok).toBe(false);
     expect(r.message).toBe(OUTBOUND_NOT_INSTALLED);
-    expect(r.message).toContain('MODULES_OUTBOUND_ENGINE');
+    // F9.8.b — la causa que se le nombra al operador es la 230 de `messaging`,
+    // no un flag `MODULES_*` que el runner de producción nunca leyó.
+    expect(r.message).toContain('messaging');
+    expect(r.message).not.toContain('MODULES_');
     expect(r.errors).toEqual([]);
   });
 

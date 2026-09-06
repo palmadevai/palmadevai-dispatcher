@@ -629,6 +629,79 @@ describe('check per-proveedor (TD S5.1 → S1.1) — cada credencial contra SU p
     expect(verifyEmailCredential).not.toHaveBeenCalled();
   });
 
+  it('F6.10 — `managed` SIN credencial del cliente prueba la nuestra, y lo dice', async () => {
+    // La trampa que esperaba al día que un proveedor pasara a `managed`: sin
+    // ciphertext, `loadProviderCredential` devuelve `absent` y el botón
+    // respondía «sin credencial cargada» sobre un proveedor que manda bien con
+    // NUESTRA key — justo cuando más falta hace poder probarla.
+    const { sql, providerState } = fakeSql({ id: 'meta', name: 'Meta', ownership: 'managed' });
+    vi.mocked(verifyMetaCredential).mockResolvedValue({
+      ok: true,
+      detail: 'la credencial autenticó contra Meta y accede a la WABA «Lab»',
+    });
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'meta', {
+      resolveKey: async () => ({ ok: true, apiKey: 'EAAG_la_nuestra', source: 'env' }),
+    });
+
+    expect(r).toMatchObject({ ok: true });
+    expect(verifyMetaCredential).toHaveBeenCalledWith('EAAG_la_nuestra');
+    // El detalle dice de quién es la credencial que se probó: un «autenticó OK»
+    // que no distingue es la mitad de la respuesta.
+    expect((r as { detail: string }).detail).toContain('administrada por nosotros');
+    expect(providerState.status).toBe('ok');
+  });
+
+  it('F6.10 — con ciphertext cargado se prueba EL DEL CLIENTE aunque siga en `managed`', async () => {
+    // El caso que rompería ramificar por ownership: el cliente carga su
+    // credencial y el proveedor sigue en `managed` hasta que el cutover tenga
+    // evidencia de un envío real. Si el botón probara la nuestra acá, daría
+    // verde sobre una key del cliente que nadie miró.
+    const { sql } = fakeSql({ id: 'meta', name: 'Meta', ownership: 'managed' });
+    await seedCredential(sql, 'EAAG_la_del_cliente', 'meta');
+    vi.mocked(verifyMetaCredential).mockResolvedValue({ ok: true, detail: 'autenticó' });
+    const resolveKey = vi.fn();
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'meta', {
+      resolveKey: resolveKey as never,
+    });
+
+    expect(r).toMatchObject({ ok: true });
+    expect(verifyMetaCredential).toHaveBeenCalledWith('EAAG_la_del_cliente');
+    expect(resolveKey).not.toHaveBeenCalled();
+    expect((r as { detail: string }).detail).not.toContain('administrada por nosotros');
+  });
+
+  it('F6.10 — `owned` sin ciphertext NO cae a la nuestra: falla cerrado', async () => {
+    // Misma regla que el resolver de envío: la cuenta es del cliente, y mandar
+    // (o «probar») con la nuestra es justo lo que el BYOK evita.
+    const { sql } = fakeSql({ id: 'meta', name: 'Meta', ownership: 'owned' });
+    const resolveKey = vi.fn();
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'meta', {
+      resolveKey: resolveKey as never,
+    });
+
+    expect(r).toMatchObject({ ok: false, code: 'no_credential' });
+    expect(resolveKey).not.toHaveBeenCalled();
+    expect(verifyMetaCredential).not.toHaveBeenCalled();
+  });
+
+  it('F6.10 — `managed` sin credencial NUESTRA tampoco: nombra la env que falta', async () => {
+    const { sql } = fakeSql({ id: 'meta', name: 'Meta', ownership: 'managed' });
+
+    const r = await checkProviderCredential({ sql, logger, clientSlug: 'palmadevai' }, 'meta', {
+      resolveKey: async () => ({
+        ok: false,
+        error: 'meta: falta la credencial (META_WA_BEARER_TOKEN sin valor)',
+      }),
+    });
+
+    expect(r).toMatchObject({ ok: false, code: 'no_credential' });
+    expect((r as { message: string }).message).toContain('META_WA_BEARER_TOKEN');
+    expect(verifyMetaCredential).not.toHaveBeenCalled();
+  });
+
   it('16. proveedor sin verificador propio → check_unsupported, sin red y sin escrituras', async () => {
     const { sql, stateWrites, providerState } = fakeSql({ id: 'arca', name: 'ARCA' });
 
