@@ -28,6 +28,7 @@ import { readChannelWhatsAppConfig } from './lib/providers.js';
 import type { ManagementDeps } from './core/management.js';
 import { startServer } from './server.js';
 import { probeSchemaState, decideBoot } from './lib/schema-probe.js';
+import { startSchemaWatch } from './lib/schema-watch.js';
 import { announceOnce } from './lib/pg-errors.js';
 
 async function ensureStreamAndGroup(): Promise<void> {
@@ -137,6 +138,18 @@ async function main(): Promise<void> {
     logger.warn({ missing: schema.missing }, `boot DEGRADADO — ${reason}`);
   }
 
+  // F9.6.b — mientras el proceso esté degradado, se vuelve a mirar el esquema
+  // cada tanto: una migración que llega DESPUÉS del arranque tiene que poder
+  // sacar a `/health` del rojo sin un reinicio a mano. Se apaga solo al
+  // recuperarse (ver lib/schema-watch.ts).
+  const schemaWatch = startSchemaWatch({
+    sql,
+    logger,
+    initial: schema,
+    campaignsWorkersStarted: boot.campaignsWorkers,
+    intervalMs: env.DISPATCHER_SCHEMA_REPROBE_MINUTES * 60_000,
+  });
+
   // 2. Workers (real impl — F1.2.b). Los de campañas, sólo con su esquema.
   const dispatcherHandle = boot.campaignsWorkers
     ? startDispatcher({
@@ -208,9 +221,11 @@ async function main(): Promise<void> {
     managementCore,
     sendDeps,
     notifyDeps,
-    // F9.6 — lo que /health tiene que decir del esquema y del estado del proceso.
-    schema,
-    degradedReasons: boot.degradedReasons,
+    // F9.6 — lo que /health tiene que decir del esquema y del estado del
+    // proceso. Va como LECTURA y no como valor: F9.6.b re-sondea mientras esté
+    // degradado, así que un snapshot del boot volvería a mentir en cuanto la
+    // migración llegue (que es exactamente lo que pasó en palmawebs).
+    readSchemaStatus: () => schemaWatch.current(),
     workersCount: (boot.campaignsWorkers ? 4 : 0) + 2,
   });
 
@@ -227,6 +242,7 @@ async function main(): Promise<void> {
   // 4. Graceful shutdown.
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'shutdown signal received — closing workers + connections');
+    schemaWatch.stop();
     try {
       if (recoveryHandle) clearInterval(recoveryHandle);
       clearInterval(metricsFlushHandle);
