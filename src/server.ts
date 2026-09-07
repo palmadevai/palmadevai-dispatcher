@@ -62,10 +62,14 @@ export interface ServerDeps {
   sendDeps: SendDeps;
   /** F7.5 — la mecánica de los avisos, compartida con los emisores propios. */
   notifyDeps: NotifyDeps;
-  /** F9.6 — esquema sondeado al boot (null = no sondeado, p. ej. tests). */
-  schema?: SchemaState | null;
-  /** F9.6 — por qué el proceso está degradado (vacío = no lo está). */
-  degradedReasons?: string[];
+  /**
+   * F9.6 + F9.6.b — el estado del esquema, LEÍDO en cada `/health` y no
+   * capturado al arrancar. Antes eran dos campos por valor (`schema` +
+   * `degradedReasons`) y por eso el proceso seguía diciendo `degraded` después
+   * de que la migración lo arreglara (medido en palmawebs, 2026-09-05).
+   * Ausente = sin sondeo, que es el caso de los tests.
+   */
+  readSchemaStatus?: () => { schema: SchemaState | null; degradedReasons: string[] };
   /** F9.6 — workers efectivamente arrancados. */
   workersCount?: number;
 }
@@ -124,11 +128,13 @@ export async function startServer(deps: ServerDeps): Promise<FastifyInstance> {
     ]);
 
     // F9.6 — tres estados (healthy / degraded / unhealthy), ver lib/health.ts.
+    // F9.6.b — se lee AHORA: el esquema pudo cambiar desde el arranque.
+    const status = deps.readSchemaStatus?.() ?? { schema: null, degradedReasons: [] };
     const { code, body } = buildHealth({
       redisOk,
       postgresOk,
-      schema: deps.schema ?? null,
-      degradedReasons: deps.degradedReasons ?? [],
+      schema: status.schema,
+      degradedReasons: status.degradedReasons,
       uptimeMs: Date.now() - startTimestamp,
       stubMode: env.STUB_MODE,
       workersCount: deps.workersCount ?? 3,

@@ -199,6 +199,27 @@ describe('POST /management/endpoints/:id/quality-refresh', () => {
   });
 });
 
+describe('GET /management/config/channels (F8.2.c)', () => {
+  it('devuelve el valor EFECTIVO con su fuente — no lo que hay en la base', async () => {
+    // El caso medido en el lab: la fila `channel_whatsapp` no existe y la WABA
+    // vive en el `.env`. La card leia la base y mostraba «sin configurar» sobre
+    // un canal que atiende, con el boton de sync en gris. Preguntarle al
+    // servicio es lo unico que devuelve la verdad.
+    const app = await buildApp({});
+    const res = await app.inject({ method: 'GET', url: '/management/config/channels', headers: auth });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      whatsapp: { waba_id: 'waba-global', default_phone_number_id: null, source: 'env' },
+    });
+  });
+
+  it('exige auth como todo /management/*', async () => {
+    const app = await buildApp({});
+    const res = await app.inject({ method: 'GET', url: '/management/config/channels' });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 describe('GET /management/providers/resend/domains (S4.4)', () => {
   it('siempre 200 con el DomainsResult en el body — el contrato viaja en ok/reason', async () => {
     const app = await buildApp({

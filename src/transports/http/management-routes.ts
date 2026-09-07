@@ -46,6 +46,8 @@ import {
   type ConfirmFailureCode,
 } from '../../core/provider-cutover.js';
 import { listResendDomains, type DomainsDeps } from '../../core/provider-domains.js';
+// F8.2.c — el resolver DB→env del canal, que es el que sabe la verdad.
+import { readChannelWhatsAppConfig } from '../../lib/providers.js';
 
 export interface ManagementRouteDeps {
   core: ManagementDeps;
@@ -166,6 +168,33 @@ export function registerManagementRoutes(app: FastifyInstance, deps: ManagementR
   app.get('/management/providers/resend/domains', async (_req, reply) => {
     const result = await listResendDomains(deps.domains);
     return reply.code(200).send(result);
+  });
+
+  // ── F8.2.c — la configuración EFECTIVA del canal, con su fuente ───────────
+  //
+  // POR QUÉ EXISTE. La card Meta del cockpit leía `bot.config['channel_whatsapp']`
+  // directo, y en el lab esa fila no existía: la WABA y el teléfono viven en el
+  // `.env`, el dispatcher resuelve DB→env y por eso todo funciona. Resultado
+  // medido el 2026-09-05: la card mostraba los dos campos VACÍOS —«sin
+  // configurar» sobre un canal que atiende— y «Sincronizar números» nacía gris.
+  //
+  // La respuesta no es que el cockpit lea el `.env` (no lo tiene, y no debería):
+  // es preguntarle al SERVICIO, que es el que resuelve. Mismo criterio que el
+  // resto de F9: la configuración del canal es del Messaging Service y las
+  // features la CONSUMEN, no la re-derivan.
+  //
+  // `source` viaja en la respuesta y no es decoración: «lo estás viendo del
+  // env» y «esto está guardado en la base» son dos estados distintos para el
+  // operador — uno se pierde en el próximo cliente, el otro no.
+  app.get('/management/config/channels', async (_req, reply) => {
+    const wa = await readChannelWhatsAppConfig();
+    return reply.code(200).send({
+      whatsapp: {
+        waba_id: wa.wabaId,
+        default_phone_number_id: wa.defaultPhoneNumberId,
+        source: wa.source,
+      },
+    });
   });
 
   //

@@ -215,6 +215,14 @@ const schema = z.object({
   // POST /management/templates/sync stays available either way.
   DISPATCHER_TEMPLATE_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(0).default(360),
 
+  // F9.6.b (plan WABA) — cada cuánto se vuelve a mirar el esquema MIENTRAS el
+  // proceso está degradado (le falta el sustrato del servicio, mig 230). No es
+  // un sondeo permanente: el watch se apaga solo apenas el sustrato aparece
+  // (lib/schema-watch.ts). 5 minutos ≈ el ciclo del GitOps del VPS (3-4 min),
+  // así que una migración recién aplicada saca a /health del rojo en el ciclo
+  // siguiente sin que nadie reinicie nada. 0 = desactivado (sondeo único).
+  DISPATCHER_SCHEMA_REPROBE_MINUTES: z.coerce.number().int().min(0).default(5),
+
   // ── Messaging Service — MCP Tier 1 (Fase 4, H4.1) ────────────────────────
   // Bearer PROPIO del MCP read-only (patrón *_MCP_BEARER, BW runtime-env).
   // Deliberadamente distinto de DISPATCHER_SEND_BEARER: el consumidor del MCP
